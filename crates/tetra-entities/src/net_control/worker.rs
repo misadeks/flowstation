@@ -15,7 +15,7 @@ use crate::{
     net_control::{
         channel::CommandDispatcher,
         codec::ControlCodecJson,
-        commands::{ControlCommand, ControlResponse},
+        commands::{ControlCommand, ControlResponse, route_control_command},
     },
     network::transports::NetworkTransport,
 };
@@ -97,7 +97,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
     /// Route a command to the correct entity's dispatcher.
     /// Override this mapping as real command variants are added.
     fn dispatch_command(&self, command: ControlCommand) {
-        let target = Self::route_control_command(&command);
+        let target = route_control_command(&command);
         match self.dispatchers.get(&target) {
             Some(dispatcher) => {
                 tracing::debug!("dispatching command to {:?}", target);
@@ -106,26 +106,6 @@ impl<T: NetworkTransport> ControlWorker<T> {
             None => {
                 tracing::warn!("no dispatcher registered for {:?}, dropping command", target);
             }
-        }
-    }
-
-    /// Determine which entity should handle a given command.
-    /// Placeholder routing — will be extended as real commands are defined.
-    fn route_control_command(command: &ControlCommand) -> TetraEntity {
-        match command {
-            ControlCommand::SendSds { .. } => TetraEntity::Cmce,
-            ControlCommand::KickMs { .. } => TetraEntity::Cmce,
-            // DGNA is a Mobility Management procedure: group attach/detach state and the
-            // D-ATTACH/DETACH GROUP IDENTITY send path both live in the MM entity.
-            ControlCommand::Dgna { .. } => TetraEntity::Mm,
-            ControlCommand::RestartService => TetraEntity::Cmce,
-            ControlCommand::ShutdownService => TetraEntity::Cmce,
-            ControlCommand::AddLiveSds { .. } => TetraEntity::Cmce,
-            ControlCommand::DeleteLiveSds { .. } => TetraEntity::Cmce,
-            ControlCommand::ClearLiveSds => TetraEntity::Cmce,
-            ControlCommand::ClearEmergency { .. } => TetraEntity::Cmce,
-            ControlCommand::CommandA { .. } => TetraEntity::Mm,
-            ControlCommand::TestCmdB { .. } => TetraEntity::Cmce,
         }
     }
 
@@ -183,13 +163,19 @@ mod tests {
 
     #[test]
     fn test_route_command_a_to_mm() {
-        let target = ControlWorker::<MockTransport>::route_control_command(&ControlCommand::CommandA { handle: 1, parameter: 1 });
+        let target = route_control_command(&ControlCommand::CommandA { handle: 1, parameter: 1 });
+        assert_eq!(target, TetraEntity::Mm);
+    }
+
+    #[test]
+    fn test_route_kick_ms_to_mm() {
+        let target = route_control_command(&ControlCommand::KickMs { issi: 2200699 });
         assert_eq!(target, TetraEntity::Mm);
     }
 
     #[test]
     fn test_route_command_b_to_cmce() {
-        let target = ControlWorker::<MockTransport>::route_control_command(&ControlCommand::TestCmdB {
+        let target = route_control_command(&ControlCommand::TestCmdB {
             handle: 2,
             source_ssi: 12345,
             is_group: false,

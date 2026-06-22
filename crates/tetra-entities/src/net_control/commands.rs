@@ -7,6 +7,7 @@
 
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
+use tetra_core::tetra_entities::TetraEntity;
 
 /// Command received from the remote command server.
 #[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
@@ -74,6 +75,25 @@ pub enum ControlCommand {
         is_group: bool,
         payload: Vec<u8>,
     },
+}
+
+/// Determine which entity should handle a given command.
+pub fn route_control_command(command: &ControlCommand) -> TetraEntity {
+    match command {
+        ControlCommand::SendSds { .. } => TetraEntity::Cmce,
+        ControlCommand::KickMs { .. } => TetraEntity::Mm,
+        // DGNA is a Mobility Management procedure: group attach/detach state and the
+        // D-ATTACH/DETACH GROUP IDENTITY send path both live in the MM entity.
+        ControlCommand::Dgna { .. } => TetraEntity::Mm,
+        ControlCommand::RestartService => TetraEntity::Cmce,
+        ControlCommand::ShutdownService => TetraEntity::Cmce,
+        ControlCommand::AddLiveSds { .. } => TetraEntity::Cmce,
+        ControlCommand::DeleteLiveSds { .. } => TetraEntity::Cmce,
+        ControlCommand::ClearLiveSds => TetraEntity::Cmce,
+        ControlCommand::ClearEmergency { .. } => TetraEntity::Cmce,
+        ControlCommand::CommandA { .. } => TetraEntity::Mm,
+        ControlCommand::TestCmdB { .. } => TetraEntity::Cmce,
+    }
 }
 
 /// Response sent back after processing a [`ControlCommand`].

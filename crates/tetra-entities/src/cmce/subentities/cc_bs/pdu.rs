@@ -299,14 +299,19 @@ impl CcBsSubentity {
         let to_drop: Vec<(u16, CallOrigin)> = self
             .active_calls
             .iter()
+            // FH-BUG-044: if the last local listener deaffiliates during a live
+            // Brew-originated transmission, keep the network call up until TX ends.
             .filter(|(_, call)| call.dest_gssi == gssi)
+            .filter(|(_, call)| !(matches!(call.origin, CallOrigin::Network { .. }) && call.is_tx_active()))
             .map(|(call_id, call)| (*call_id, call.origin.clone()))
             .collect();
 
         for (call_id, origin) in to_drop {
             tracing::info!("CMCE: dropping call_id={} gssi={} (no listeners)", call_id, gssi);
             if let CallOrigin::Network { brew_uuid } = origin {
-                if brew::is_brew_gssi_routable(&self.config, gssi) {
+                // Mirror the inbound admission predicate so an admitted foreign/non-whitelisted
+                // GSSI can still tell Brew the call ended.
+                if brew::is_brew_inbound_allowed(&self.config, gssi) {
                     self.notify_network_call_end(queue, brew_uuid);
                 };
             };

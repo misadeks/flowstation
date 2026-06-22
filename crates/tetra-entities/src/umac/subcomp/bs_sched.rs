@@ -1087,6 +1087,7 @@ impl BsChannelScheduler {
     /// Return first queued grant.
     /// If none; return first in-progress fragmented message.
     /// If none; return first to-be-transmitted resource.
+    /// If none; return stealing so non-traffic slots can discard it explicitly.
     /// If none, return None.
     pub fn dl_take_prioritized_sched_item(&mut self, ts: TdmaTime) -> Option<DlSchedElem> {
         if ts.f == 18 {
@@ -1118,6 +1119,12 @@ impl BsChannelScheduler {
 
         // Return Resources last
         if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Resource(_, _, _))) {
+            return Some(q.remove(i));
+        }
+
+        // Return Stealing last so signalling-only slots can discard it instead of
+        // leaving it stuck in the queue forever.
+        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Stealing(..))) {
             return Some(q.remove(i));
         }
 

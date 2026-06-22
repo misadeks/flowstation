@@ -14,7 +14,7 @@ use tetra_core::{TdmaTime, debug};
 use tetra_entities::MessageRouter;
 use tetra_entities::net_brew::entity::BrewEntity;
 use tetra_entities::net_brew::new_websocket_transport;
-use tetra_entities::net_dashboard::DashboardServer;
+use tetra_entities::net_dashboard::{DashboardCmdSender, DashboardServer};
 use tetra_entities::net_telegram::{TelegramAlerter, telegram_alert_channel};
 use tetra_entities::net_telemetry::worker::TelemetryWorker;
 use tetra_entities::net_telemetry::{
@@ -376,15 +376,7 @@ fn main() {
             // Propagate SharedConfig so the dashboard can read live SDS queue state.
             dashboard.set_shared_config(cfg.clone());
 
-            // Create a control link so dashboard can send commands to CMCE
-            let dash_cmd_tx = {
-                use tetra_core::tetra_entities::TetraEntity;
-                cdispatchers.get(&TetraEntity::Cmce).map(|d| d.clone_sender())
-            };
-
-            if let Some(tx) = dash_cmd_tx {
-                dashboard.set_cmd_sender(tx);
-            }
+            dashboard.set_cmd_sender(DashboardCmdSender::from_dispatchers(&cdispatchers));
 
             // start() must be called before Arc::new() because it takes &mut self
             dashboard.start(&dash_cfg.bind, dash_cfg.port);

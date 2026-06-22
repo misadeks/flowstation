@@ -5,13 +5,40 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use tungstenite::{accept_hdr, handshake::server::{Request, Response}, Message};
+use tetra_core::tetra_entities::TetraEntity;
 
 use crate::net_dashboard::html::DASHBOARD_HTML;
 use crate::net_dashboard::state::{DashboardState, DashboardStateInner, MsEntry, CallEntry};
 use crate::net_telemetry::TelemetryEvent;
-use crate::net_control::commands::ControlCommand;
+use crate::net_control::{
+    channel::CommandDispatcher,
+    commands::{ControlCommand, route_control_command},
+};
 
-type CmdSender = crossbeam_channel::Sender<ControlCommand>;
+#[derive(Clone)]
+pub struct DashboardCmdSender {
+    routes: HashMap<TetraEntity, crossbeam_channel::Sender<ControlCommand>>,
+}
+
+impl DashboardCmdSender {
+    pub fn from_dispatchers(dispatchers: &HashMap<TetraEntity, CommandDispatcher>) -> Self {
+        let routes = dispatchers
+            .iter()
+            .map(|(entity, dispatcher)| (*entity, dispatcher.clone_sender()))
+            .collect();
+        Self { routes }
+    }
+
+    fn send(&self, command: ControlCommand) -> bool {
+        let target = route_control_command(&command);
+        match self.routes.get(&target) {
+            Some(tx) => tx.send(command).is_ok(),
+            None => false,
+        }
+    }
+}
+
+type CmdSender = DashboardCmdSender;
 
 // Each WS connection registers a Sender here.
 // broadcast() sends to all of them; dead connections are pruned automatically.
@@ -1071,7 +1098,7 @@ fn http_response_401(mut stream: TcpStream) {
     let _ = stream.write_all(resp.as_bytes());
 }
 
-/// Send a ControlCommand through the dashboard → CMCE channel, best-effort.
+/// Send a ControlCommand through the dashboard control router, best-effort.
 fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand) {
     if let Ok(guard) = cmd_tx.lock() {
         if let Some(ref tx) = *guard {
@@ -1847,7 +1874,7 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
     let send_cmd = |cmd: ControlCommand| -> bool {
         if let Ok(guard) = cmd_tx.lock() {
             if let Some(ref tx) = *guard {
-                return tx.send(cmd).is_ok();
+                return tx.send(cmd);
             }
         }
         false
@@ -3061,7 +3088,15 @@ fn serve_login_page(mut stream: TcpStream) {
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_built_from, DashboardServer};
+    use std::collections::HashMap;
+
+    use tetra_core::tetra_entities::TetraEntity;
+
+    use super::{DashboardCmdSender, binary_built_from, DashboardServer};
+    use crate::net_control::{
+        channel::make_control_link,
+        commands::ControlCommand,
+    };
     use crate::net_telemetry::TelemetryEvent;
 
     /// FH-BUG (brew shown as v0): the transport reports version 0 ("unknown") on every (re)connect
@@ -3096,5 +3131,20 @@ mod tests {
         // No usable hash baked in -> cannot tell.
         assert_eq!(binary_built_from("unknown", head), None);
         assert_eq!(binary_built_from("", head), None);
+    }
+
+    #[test]
+    fn dashboard_routes_kick_ms_to_mm() {
+        let (mm_dispatcher, mm_endpoint) = make_control_link();
+        let (cmce_dispatcher, cmce_endpoint) = make_control_link();
+        let dispatchers = HashMap::from([
+            (TetraEntity::Mm, mm_dispatcher),
+            (TetraEntity::Cmce, cmce_dispatcher),
+        ]);
+        let sender = DashboardCmdSender::from_dispatchers(&dispatchers);
+
+        assert!(sender.send(ControlCommand::KickMs { issi: 2200699 }));
+        assert!(matches!(mm_endpoint.try_recv(), Some(ControlCommand::KickMs { issi: 2200699 })));
+        assert!(cmce_endpoint.try_recv().is_none());
     }
 }

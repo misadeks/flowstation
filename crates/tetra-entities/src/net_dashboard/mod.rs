@@ -8,5 +8,5 @@ pub mod update_check;
 pub mod whitelist;
 pub mod wx_service;
 
-pub use server::DashboardServer;
+pub use server::{DashboardCmdSender, DashboardServer};
 pub use state::{DashboardState, DashboardStateInner};
