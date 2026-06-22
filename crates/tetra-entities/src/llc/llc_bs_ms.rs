@@ -364,12 +364,6 @@ impl Llc {
             tracing::debug!(ts=%self.dltime, "-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
         }
 
-        // Derive the timeslot from chan_alloc (first set timeslot in [bool;4]), defaulting to 1.
-        // Must be done before chan_alloc is moved into TmaUnitdataReq below.
-        let derived_ts: u8 = prim.chan_alloc.as_ref()
-            .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
-            .unwrap_or(1);
-
         // Either take tx_reporter passed down or create a new one
         let tx_reporter = prim.tx_reporter.take().unwrap_or_else(|| TxReporter::new());
 
@@ -381,7 +375,7 @@ impl Llc {
                 req_handle: prim.req_handle,
                 pdu: pdu_buf,
                 main_address: prim.main_address,
-                link_id: 0,
+                link_id: prim.link_id,
                 endpoint_id: prim.endpoint_id,
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: prim.subscriber_class,
@@ -393,12 +387,13 @@ impl Llc {
             }),
         };
 
-        // Register that we expect an ACK for this message on the derived timeslot
-        tracing::trace!("setting expected ack for ts{}", derived_ts);
+        // Keep expected basic-link ACK tracking on ts1 for now. The normal downlink
+        // signalling path still rides the MCCH during setup, and older radios are
+        // sensitive to the caller-side setup exchange staying on that context.
         self.outbound_messages.push_back(ExpectedInAck {
             ns,
             addr: prim.main_address,
-            ts: derived_ts,
+            ts: 1,
             bl_type: Layer2Service::Acknowledged,
             tx_reporter,
             t_first: self.dltime,
@@ -632,7 +627,7 @@ impl Llc {
             let m = TlaTlDataIndBl {
                 // address_type: 0, // TODO FIXME
                 main_address: prim.main_address,
-                link_id: prim.link_id,
+                link_id: 0,
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,

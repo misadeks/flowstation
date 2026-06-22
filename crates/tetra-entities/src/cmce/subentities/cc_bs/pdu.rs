@@ -452,6 +452,7 @@ impl CcBsSubentity {
         call_id: u16,
         setup_timeout: CallTimeoutSetupPhase,
         hook_method_selection: bool,
+        layer2service: Layer2Service,
     ) {
         tracing::trace!("send_d_call_proceeding");
 
@@ -485,7 +486,7 @@ impl CcBsSubentity {
                 handle: prim.handle,
                 endpoint_id: prim.endpoint_id,
                 link_id: prim.link_id,
-                layer2service: Layer2Service::Todo,
+                layer2service,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,

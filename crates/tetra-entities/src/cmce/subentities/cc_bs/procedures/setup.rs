@@ -144,6 +144,7 @@ impl CcBsSubentity {
             circuit.call_id,
             CallTimeoutSetupPhase::T10s,
             pdu.hook_method_selection,
+            Layer2Service::Unacknowledged,
         );
 
         // 2) D-CONNECT to caller.
@@ -177,7 +178,11 @@ impl CcBsSubentity {
                 handle: ul_handle,
                 endpoint_id: ul_endpoint_id,
                 link_id: ul_link_id,
-                layer2service: Layer2Service::Todo,
+                // Older radios often miss the first caller-side MCCH setup exchange if
+                // it is gated behind LLC acknowledgements. Keep the local-origin group
+                // setup responses fire-and-forget so D-CONNECT cannot be blocked behind
+                // an unacknowledged D-CALL-PROCEEDING.
+                layer2service: Layer2Service::Unacknowledged,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -439,7 +444,15 @@ impl CcBsSubentity {
         );
 
         // Do not open traffic channel yet. Let called MS respond on MCCH.
-        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T60s, pdu.hook_method_selection);
+        self.send_d_call_proceeding(
+            queue,
+            message,
+            pdu,
+            call_id,
+            CallTimeoutSetupPhase::T60s,
+            pdu.hook_method_selection,
+            Layer2Service::Todo,
+        );
 
         let d_setup = DSetup {
             call_identifier: call_id,
@@ -699,7 +712,15 @@ impl CcBsSubentity {
             brew_uuid
         );
 
-        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T60s, pdu.hook_method_selection);
+        self.send_d_call_proceeding(
+            queue,
+            message,
+            pdu,
+            call_id,
+            CallTimeoutSetupPhase::T60s,
+            pdu.hook_method_selection,
+            Layer2Service::Todo,
+        );
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
