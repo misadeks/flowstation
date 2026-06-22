@@ -24,6 +24,10 @@ pub struct CmceBs {
 
 impl CmceBs {
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
+        let mut cc = CcBsSubentity::new(config.clone());
+        if let Some(ref sink) = telemetry {
+            cc.set_telemetry(sink.clone());
+        }
         let mut sds = SdsBsSubentity::new(config.clone());
         if let Some(ref sink) = telemetry {
             sds.set_telemetry(sink.clone());
@@ -35,7 +39,7 @@ impl CmceBs {
             control,
             pc: PcBs::new(),
             sds,
-            cc: CcBsSubentity::new(config.clone()),
+            cc,
             ss: SsBsSubentity::new(),
         }
     }

@@ -226,6 +226,9 @@ impl CcBsSubentity {
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
             call.activate(self.dltime);
         }
+        if let Some(call) = self.individual_calls.get(&call_id) {
+            self.emit_individual_call_started(call_id, call);
+        }
         Ok(())
     }
 

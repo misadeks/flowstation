@@ -188,6 +188,7 @@ impl CcBsSubentity {
             true,
             BrewNotification::IfGroupRoutable(dest_ssi),
         );
+        self.emit_group_call_speaker_changed(call_id, dest_ssi, requesting_party.ssi);
 
         Ok(())
     }
@@ -245,6 +246,7 @@ impl CcBsSubentity {
                 true,
                 BrewNotification::IfGroupRoutable(dest_ssi),
             );
+            self.emit_group_call_speaker_changed(call_id, dest_ssi, requester.ssi);
             return Ok(());
         }
 
@@ -305,6 +307,7 @@ impl CcBsSubentity {
         self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts);
 
         self.notify_remote_floor_granted(queue, CallTimeslot { call_id, ts });
+        self.emit_group_call_speaker_changed(call_id, dest_gssi, source_issi);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,

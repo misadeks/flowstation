@@ -204,7 +204,10 @@ fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> (MessageRouter, 
 
     // Add remaining components
     let lmac = LmacBs::new(cfg.clone());
-    let umac = UmacBs::new(cfg.clone());
+    let mut umac = UmacBs::new(cfg.clone());
+    if let Some(ref sink) = tsink {
+        umac.set_telemetry(sink.clone());
+    }
     let llc = Llc::new(cfg.clone());
     let mle = MleBs::new(cfg.clone());
     let mut mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));

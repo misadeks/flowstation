@@ -204,6 +204,7 @@ impl CcBsSubentity {
                 called_ts: ts,
                 calling_usage: usage,
                 called_usage: usage,
+                priority: call.priority,
                 simplex_duplex,
                 state: IndividualCallState::IncomingSetupPending,
                 formal_state: CcFormalState::Idle.after(CcFormalEvent::SetupRequest),
@@ -644,7 +645,7 @@ impl CcBsSubentity {
         brew_uuid: uuid::Uuid,
         source_issi: u32,
         dest_gssi: u32,
-        _priority: u8,
+        priority: u8,
     ) {
         assert!(brew::is_brew_gssi_routable(&self.config, dest_gssi));
 
@@ -826,8 +827,11 @@ impl CcBsSubentity {
 
         self.active_calls.insert(
             call_id,
-            ActiveCall::new_network(brew_uuid, dest_gssi, source_issi, ts, usage, self.dltime, CallTimeout::T5m),
+            ActiveCall::new_network(brew_uuid, dest_gssi, source_issi, priority, ts, usage, self.dltime, CallTimeout::T5m),
         );
+        if let Some(call) = self.active_calls.get(&call_id) {
+            self.emit_group_call_started(call_id, call);
+        }
 
         queue.push_back(SapMsg {
             sap: Sap::Control,

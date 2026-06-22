@@ -30,6 +30,7 @@ use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::lmac::components::scrambler;
+use crate::net_telemetry::{TelemetryEvent, TelemetrySink};
 use crate::umac::subcomp::bs_frag::BsFragger;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
@@ -40,6 +41,7 @@ use super::subcomp::bs_defrag::BsDefrag;
 pub struct UmacBs {
     self_component: TetraEntity,
     config: SharedConfig,
+    telemetry: Option<TelemetrySink>,
     dltime: TdmaTime,
     system_wide_services: bool,
 
@@ -89,6 +91,7 @@ impl UmacBs {
         Self {
             self_component: TetraEntity::Umac,
             config,
+            telemetry: None,
             dltime: TdmaTime::default(),
             system_wide_services,
             endpoint_id: 1,
@@ -100,6 +103,10 @@ impl UmacBs {
             ul_signal_owner: [None; 4],
             pending_circuit_closes: [PendingCircuitClose::default(); 4],
         }
+    }
+
+    pub fn set_telemetry(&mut self, sink: TelemetrySink) {
+        self.telemetry = Some(sink);
     }
 
     /// Precomputes SYNC, SYSINFO messages (and subfield variants) for faster TX msg building
@@ -1373,6 +1380,10 @@ impl UmacBs {
                 // Track last UL voice frame time for inactivity detection
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                }
+
+                if let Some(sink) = &self.telemetry {
+                    sink.send(TelemetryEvent::TsVoiceActivity { ts });
                 }
 
                 // Forward UL voice to Brew (User plane) if loaded

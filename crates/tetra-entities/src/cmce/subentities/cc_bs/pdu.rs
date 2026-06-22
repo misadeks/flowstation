@@ -11,11 +11,66 @@ impl CcBsSubentity {
             individual_calls: HashMap::new(),
             subscriber_groups: HashMap::new(),
             group_listeners: HashMap::new(),
+            telemetry: None,
         }
     }
 
     pub fn set_config(&mut self, config: SharedConfig) {
         self.config = config;
+    }
+
+    pub fn set_telemetry(&mut self, sink: TelemetrySink) {
+        self.telemetry = Some(sink);
+    }
+
+    fn emit(&self, event: TelemetryEvent) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(event);
+        }
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn emit_group_call_started(&self, call_id: u16, call: &ActiveCall) {
+        self.emit(TelemetryEvent::GroupCallStarted {
+            call_id,
+            gssi: call.dest_gssi,
+            caller_issi: call.source_issi,
+            ts: call.ts,
+            priority: call.priority,
+        });
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn emit_group_call_speaker_changed(&self, call_id: u16, gssi: u32, speaker_issi: u32) {
+        self.emit(TelemetryEvent::GroupCallSpeakerChanged {
+            call_id,
+            gssi,
+            speaker_issi,
+        });
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn emit_group_call_ended(&self, call_id: u16, gssi: u32) {
+        self.emit(TelemetryEvent::GroupCallEnded { call_id, gssi });
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn emit_individual_call_started(&self, call_id: u16, call: &IndividualCall) {
+        let emit_for_ts = |this: &Self, ts: u8| {
+            this.emit(TelemetryEvent::IndividualCallStarted {
+                call_id,
+                calling_issi: call.calling_addr.ssi,
+                called_issi: call.called_addr.ssi,
+                simplex: call.is_simplex(),
+                ts,
+                priority: call.priority,
+            });
+        };
+
+        emit_for_ts(self, call.calling_ts);
+        if call.called_ts != call.calling_ts {
+            emit_for_ts(self, call.called_ts);
+        }
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn emit_individual_call_ended(&self, call_id: u16) {
+        self.emit(TelemetryEvent::IndividualCallEnded { call_id });
     }
 
     pub(super) fn is_locally_registered_issi(&self, issi: u32) -> bool {
@@ -738,6 +793,7 @@ impl CcBsSubentity {
 
     /// Release a group call: send D-RELEASE, close circuits, clean up state
     pub(super) fn release_group_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
+        let ended_gssi = self.active_calls.get(&call_id).map(|call| call.dest_gssi);
         if let Some(call) = self.active_calls.get_mut(&call_id) {
             call.begin_release(disconnect_cause);
         }
@@ -781,6 +837,9 @@ impl CcBsSubentity {
         // Clean up
         self.cached_setups.remove(&call_id);
         self.active_calls.remove(&call_id);
+        if let Some(gssi) = ended_gssi {
+            self.emit_group_call_ended(call_id, gssi);
+        }
     }
 
     /// Release an individual call: send D-RELEASE to both parties, close circuits, clean up state
@@ -805,6 +864,7 @@ impl CcBsSubentity {
         disconnect_cause: DisconnectCause,
         _disconnecting_issi: Option<u32>,
     ) {
+        let emit_end = self.individual_calls.contains_key(&call_id);
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
             call.begin_release(disconnect_cause);
         }
@@ -899,6 +959,10 @@ impl CcBsSubentity {
             if let Some(brew_uuid) = call.brew_uuid {
                 self.notify_network_circuit_release(queue, brew_uuid, disconnect_cause);
             }
+        }
+
+        if emit_end {
+            self.emit_individual_call_ended(call_id);
         }
     }
 

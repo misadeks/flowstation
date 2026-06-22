@@ -146,6 +146,7 @@ pub(super) struct ActiveCall {
     pub(super) origin: CallOrigin,
     pub(super) dest_gssi: u32,   // Destination group
     pub(super) source_issi: u32, // Current speaker
+    pub(super) priority: u8,
     pub(super) created_at: TdmaTime,
     pub(super) call_timeout: CallTimeout,
     pub(super) ts: u8,
@@ -168,6 +169,7 @@ impl ActiveCall {
         caller_addr: TetraAddress,
         dest_gssi: u32,
         source_issi: u32,
+        priority: u8,
         ts: u8,
         usage: u8,
         created_at: TdmaTime,
@@ -177,6 +179,7 @@ impl ActiveCall {
             origin: CallOrigin::Local { caller_addr },
             dest_gssi,
             source_issi,
+            priority,
             created_at,
             call_timeout,
             ts,
@@ -195,6 +198,7 @@ impl ActiveCall {
         brew_uuid: uuid::Uuid,
         dest_gssi: u32,
         source_issi: u32,
+        priority: u8,
         ts: u8,
         usage: u8,
         created_at: TdmaTime,
@@ -204,6 +208,7 @@ impl ActiveCall {
             origin: CallOrigin::Network { brew_uuid },
             dest_gssi,
             source_issi,
+            priority,
             created_at,
             call_timeout,
             ts,
@@ -364,6 +369,7 @@ pub(super) struct IndividualCall {
     pub(super) called_ts: u8,
     pub(super) calling_usage: u8,
     pub(super) called_usage: u8,
+    pub(super) priority: u8,
     pub(super) simplex_duplex: bool,
     pub(super) state: IndividualCallState,
     /// Formal CMCE CC state for this call leg. Absence from individual_calls means Idle.

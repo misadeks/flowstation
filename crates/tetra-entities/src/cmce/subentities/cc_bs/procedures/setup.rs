@@ -237,12 +237,16 @@ impl CcBsSubentity {
                 calling_party,
                 dest_gssi,
                 calling_party.ssi,
+                pdu.call_priority,
                 circuit.ts,
                 circuit.usage,
                 self.dltime,
                 CallTimeout::T5m,
             ),
         );
+        if let Some(call) = self.active_calls.get(&circuit.call_id) {
+            self.emit_group_call_started(circuit.call_id, call);
+        }
 
         self.notify_floor_granted(
             queue,
@@ -493,6 +497,7 @@ impl CcBsSubentity {
                 called_ts,
                 calling_usage,
                 called_usage,
+                priority: pdu.call_priority,
                 simplex_duplex: pdu.simplex_duplex_selection,
                 state: IndividualCallState::CallSetupPending,
                 formal_state: CcFormalState::Idle.after(CcFormalEvent::SetupRequest),
@@ -721,6 +726,7 @@ impl CcBsSubentity {
                 called_ts: ts,
                 calling_usage: usage,
                 called_usage: usage,
+                priority: pdu.call_priority,
                 simplex_duplex: pdu.simplex_duplex_selection,
                 state: IndividualCallState::CallSetupPending,
                 formal_state: CcFormalState::Idle.after(CcFormalEvent::SetupRequest),

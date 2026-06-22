@@ -37,6 +37,7 @@ use tetra_saps::{
 };
 
 use crate::net_brew as brew;
+use crate::net_telemetry::{TelemetryEvent, TelemetrySink};
 use crate::{
     MessageQueue,
     cmce::components::circuit_mgr::{CircuitMgr, CircuitMgrCmd},
@@ -72,4 +73,6 @@ pub struct CcBsSubentity {
     subscriber_groups: HashMap<u32, HashSet<u32>>,
     /// Listener counts per GSSI
     group_listeners: HashMap<u32, usize>,
+    /// Dashboard / telemetry feed for active call state.
+    telemetry: Option<TelemetrySink>,
 }
