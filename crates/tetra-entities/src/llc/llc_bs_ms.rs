@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, unimplemented_log};
+use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -19,6 +19,30 @@ use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
+
+// ── Advanced Link imports ────────────────────────────────────────────────────
+use tetra_pdus::llc::al::error::SegmentationError;
+use tetra_pdus::llc::al::reassembler::{Reassembler, ReassemblerFeed, UnackReassembler, UnackReassemblerFeed};
+use tetra_pdus::llc::al::segmenter::{SegmenterConfig, segment_sdu};
+use tetra_pdus::llc::consts::consts::{
+    N262_AL_MAX_CONNECTION_SETUP_RETRIES, N263_AL_MAX_DISCONNECTION_RETRIES,
+    N265_AL_MAX_RECONNECTION_RETRIES, N273_AL_MAX_TLSDU_RETRANSMISSIONS,
+};
+use tetra_pdus::llc::consts::timers::{
+    T261_SETUP_WAITING_TIMER, T263_DISCONNECT_WAITING_TIMER, T265_RECONNECT_WAITING_TIMER,
+    T271_RECEIVER_NOT_READY_FOR_TX_TIMER, T272_RECEIVER_NOT_READY_FOR_RX_TIMER,
+};
+use tetra_pdus::llc::enums::advanced_link_service::AdvancedLinkService;
+use tetra_pdus::llc::enums::advanced_link_type::AdvancedLinkType;
+use tetra_pdus::llc::enums::al_disc_cause::AlDiscCause;
+use tetra_pdus::llc::enums::reconnect_report::ReconnectReport;
+use tetra_pdus::llc::enums::setup_report::SetupReport;
+use tetra_pdus::llc::pdus::al_ack::{AcknowledgementBlock, AckLength, AlAckAlRnr, AlAckAlRnrKind, SR};
+use tetra_pdus::llc::pdus::al_data::{AlDataAlFinal, AlDataVariant};
+use tetra_pdus::llc::pdus::al_disc::AlDisc;
+use tetra_pdus::llc::pdus::al_reconnect::AlReconnect;
+use tetra_pdus::llc::pdus::al_setup::AlSetup;
+use tetra_pdus::llc::pdus::al_udata::AlAlUdataAlUfinal;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -65,6 +89,136 @@ pub struct ScheduledOutAck {
     pub ts: u8,
 }
 
+// ─── Advanced Link types ─────────────────────────────────────────────────────
+
+/// Compact key that uniquely identifies one AL link.
+///
+/// NOTE: spec ambiguous — `ssi_type` is excluded from the hash key because in
+/// flowstation V1 AL links are always ISSI.  If GSSI AL links are ever needed,
+/// add `ssi_type` here and derive `Hash` for `TetraAddress`.
+///
+/// ETSI TS 100 392-2 v3.10.1 clause 21.4, N.261 = 2-bit link number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AlLinkKey {
+    /// SSI extracted from the peer's main address.
+    pub ssi: u32,
+    /// LLC link_id as carried by the TMA-UNITDATA primitive.
+    pub link_id: u32,
+    /// LLC endpoint_id.
+    pub endpoint_id: u32,
+    /// Two-bit link number (N.261), 0..=3.
+    pub n261: u8,
+}
+
+impl AlLinkKey {
+    /// Build a key from a raw TMA-UNITDATA address tuple plus the N.261 from the PDU.
+    pub fn from_prim(main_address: TetraAddress, link_id: u32, endpoint_id: u32, n261: u8) -> Self {
+        Self { ssi: main_address.ssi, link_id, endpoint_id, n261 }
+    }
+}
+
+/// Per-link AL state machine phase.
+///
+/// ETSI TS 100 392-2 v3.10.1 clause 21.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlPhase {
+    Idle,
+    /// Sent/received AL-SETUP proposal, awaiting the confirming AL-SETUP.
+    SetupPending,
+    Established,
+    /// Sent/received AL-RECONNECT proposal, awaiting confirmation.
+    ReconnectPending,
+    /// Sent AL-DISC, awaiting confirming AL-DISC from the peer.
+    DisconnectPending,
+    /// Peer sent AL-RNR; TX is frozen until T.272 expires or AL-ACK/non-RNR arrives.
+    FlowControlled,
+}
+
+/// One TL-SDU buffered in the acknowledged TX window.
+pub struct OutstandingSdu {
+    /// N(S) shared by every segment of this SDU.
+    pub n_s: u8,
+    /// Encoded AL-DATA / AL-FINAL PDUs in S(S) order.
+    pub pdus: Vec<AlDataAlFinal>,
+    /// Time this SDU was last (re-)submitted to UMAC; `None` = not yet sent.
+    pub sent_at: Option<TdmaTime>,
+    /// Per-segment ACK flag indexed by S(S).  `true` = peer confirmed receipt.
+    pub acked_segments: Vec<bool>,
+    /// Number of SDU-level retransmissions performed so far (vs N.273).
+    pub retx_count: u8,
+    /// When `true` the SDU is (re)sent on the very next `submit_al_activity_to_umac`
+    /// call regardless of the T.251 timer (set on peer-reported FCS failure).
+    pub force_retx: bool,
+}
+
+/// All state for one AL link.
+pub struct AlLink {
+    pub key: AlLinkKey,
+    /// Full peer `TetraAddress` (preserves `ssi_type`; used in outbound primitives).
+    pub main_address: TetraAddress,
+    pub phase: AlPhase,
+    // ── Negotiated parameters ─────────────────────────────────────────────────
+    pub service: AdvancedLinkService,
+    pub max_tl_sdu_octets: u16,
+    /// N.272 — window size; 1..=3 for original AL.
+    pub tx_window: u8,
+    /// N.273 — max SDU retransmissions.
+    pub max_sdu_retx: u8,
+    /// N.274 — max per-segment retransmissions.
+    pub max_segment_retx: u8,
+    // ── TX window ─────────────────────────────────────────────────────────────
+    /// Next N(S) value to assign when segmenting a new SDU; wraps mod (tx_window+1).
+    pub next_n_s: u8,
+    pub outstanding_sdus: VecDeque<OutstandingSdu>,
+    // ── RX reassembly ─────────────────────────────────────────────────────────
+    /// In-flight acknowledged reassemblers, keyed by peer N(S).
+    pub reassemblers: HashMap<u8, Reassembler>,
+    /// In-flight unacknowledged reassemblers, keyed by peer N(S).
+    pub unack_reassemblers: HashMap<u8, UnackReassembler>,
+    /// Unack SDU timeout start times (T.271), keyed by N(S).
+    pub unack_started_at: HashMap<u8, TdmaTime>,
+    // ── Timer start times ─────────────────────────────────────────────────────
+    /// T.261 start — set when an AL-SETUP is transmitted.
+    pub t_setup_start: Option<TdmaTime>,
+    /// T.263 start — set when an AL-DISC is transmitted.
+    pub t_disc_start: Option<TdmaTime>,
+    /// T.265 start — set when an AL-RECONNECT Propose is transmitted.
+    pub t_reconnect_start: Option<TdmaTime>,
+    /// T.272 start — set when an AL-RNR is received.
+    pub t_rnr_start: Option<TdmaTime>,
+    // ── Retry counters ────────────────────────────────────────────────────────
+    pub setup_retries: u8,
+    pub disc_retries: u8,
+    pub reconnect_retries: u8,
+    // ── Pending retransmission PDUs ───────────────────────────────────────────
+    /// Copy of the outgoing AL-SETUP for T.261 retransmission.
+    pub pending_setup_pdu: Option<AlSetup>,
+    /// Copy of the outgoing AL-RECONNECT for T.265 retransmission.
+    pub pending_reconnect_pdu: Option<AlReconnect>,
+    // ── Carrier ───────────────────────────────────────────────────────────────
+    /// Carrier on which all PDUs for this link are sent.
+    pub carrier_num: u16,
+    // ── Deferred ACK ──────────────────────────────────────────────────────────
+    /// When `true`, at least one non-AR segment has been received and a batched
+    /// AL-ACK will be flushed in `tick_end`.
+    pub needs_deferred_ack: bool,
+    // ── Test / inspection hook ────────────────────────────────────────────────
+    /// Populated every time a complete reassembled SDU arrives.
+    /// AL-4 will replace this with a proper `TlaTlDataIndAl` SapMsg push.
+    pub last_reassembled_sdu: Option<Vec<u8>>,
+}
+
+/// Error type for AL-layer operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlError {
+    UnknownLink(AlLinkKey),
+    WindowFull,
+    NotEstablished,
+    SduTooLarge { got: usize, max: u16 },
+    SegmentationFailed(SegmentationError),
+    InvalidState { expected: AlPhase, got: AlPhase },
+}
+
 pub struct Llc {
     config: SharedConfig,
     dltime: TdmaTime,
@@ -81,6 +235,14 @@ pub struct Llc {
 
     /// Per-link send sequence variable per SSI. Alternates between 0 and 1.
     link_send_seq: HashMap<u32, u8>,
+
+    // ── Advanced Link ─────────────────────────────────────────────────────────
+    /// All currently known AL links (Idle, SetupPending, Established, …).
+    pub al_links: HashMap<AlLinkKey, AlLink>,
+    /// Number of bits available for the `tl_sdu_segment` payload inside each
+    /// AL-DATA / AL-FINAL PDU.  Default = 400 bits (suitable for a single MAC
+    /// block minus header overhead).  AL-5 may make this configurable.
+    pub al_segment_payload_bits: usize,
 }
 
 impl Llc {
@@ -92,6 +254,8 @@ impl Llc {
             outbound_messages: VecDeque::new(),
             outbound_udata_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
+            al_links: HashMap::new(),
+            al_segment_payload_bits: 400,
         }
     }
 
@@ -509,7 +673,7 @@ impl Llc {
             | LlcPduType::AlAckAlRnr
             | LlcPduType::AlReconnect
             | LlcPduType::AlDisc => {
-                unimplemented_log!("LlcPduType Advanced Link: {}", pdu_type);
+                self.rx_tma_unitdata_ind_al(queue, message);
             }
 
             _ => {
@@ -934,6 +1098,1112 @@ impl Llc {
         }
         ret
     }
+
+    // ─── Advanced Link dispatcher ─────────────────────────────────────────────
+
+    /// Top-level dispatcher for inbound AL PDUs.
+    ///
+    /// Called by `rx_tma_unitdata_ind` after the PDU type is identified as an
+    /// AL variant.  Reads the 4-bit LLC type to advance the cursor, decodes the
+    /// PDU-specific payload, and routes to the appropriate handler.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clause 21.4.
+    fn rx_tma_unitdata_ind_al(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: rx_tma_unitdata_ind_al: not TmaUnitdataInd");
+            return;
+        };
+        let Some(mut pdu) = prim.pdu.take() else {
+            tracing::warn!("rx_tma_unitdata_ind_al: no PDU");
+            return;
+        };
+
+        let pdu_len_bits = pdu.get_len();
+        let Some(type_raw) = pdu.read_bits(4) else {
+            tracing::warn!("rx_tma_unitdata_ind_al: truncated PDU");
+            return;
+        };
+        let Ok(pdu_type) = LlcPduType::try_from(type_raw) else {
+            tracing::warn!("rx_tma_unitdata_ind_al: invalid PDU type {}", type_raw);
+            return;
+        };
+
+        let carrier_num = prim.carrier_num;
+        let main_address = prim.main_address;
+        let link_id = prim.link_id;
+        let endpoint_id = prim.endpoint_id;
+
+        match pdu_type {
+            LlcPduType::AlSetup => {
+                let Ok(setup) = AlSetup::from_bitbuf(&mut pdu) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: failed to parse AL-SETUP");
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- {}", setup);
+                let key = AlLinkKey::from_prim(main_address, link_id, endpoint_id, setup.advanced_link_number_n261);
+                self.on_al_setup(queue, key, carrier_num, main_address, setup);
+            }
+            LlcPduType::AlDataAlFinal => {
+                let Ok(data) = AlDataAlFinal::from_bitbuf(&mut pdu, pdu_len_bits) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: failed to parse AL-DATA/FINAL");
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- {}", data);
+                // AL-DATA does not carry N.261; resolve the link by (ssi, link_id, endpoint_id).
+                let Some(key) = self.find_al_link_for_data(main_address.ssi, link_id, endpoint_id) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: AL-DATA for unknown link ssi={}", main_address.ssi);
+                    return;
+                };
+                self.on_al_data(queue, key, data);
+            }
+            LlcPduType::AlAlUdataAlUfinal => {
+                let Ok(udata) = AlAlUdataAlUfinal::from_bitbuf(&mut pdu, pdu_len_bits) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: failed to parse AL-UDATA/UFINAL");
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- {}", udata);
+                let Some(key) = self.find_al_link_for_data(main_address.ssi, link_id, endpoint_id) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: AL-UDATA for unknown link ssi={}", main_address.ssi);
+                    return;
+                };
+                self.on_al_udata(queue, key, udata);
+            }
+            LlcPduType::AlAckAlRnr => {
+                let Ok(ack) = AlAckAlRnr::from_bitbuf(&mut pdu, pdu_len_bits) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: failed to parse AL-ACK/RNR");
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- {}", ack);
+                let Some(key) = self.find_al_link_for_data(main_address.ssi, link_id, endpoint_id) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: AL-ACK/RNR for unknown link ssi={}", main_address.ssi);
+                    return;
+                };
+                self.on_al_ack_rnr(queue, key, ack);
+            }
+            LlcPduType::AlReconnect => {
+                let Ok(reconnect) = AlReconnect::from_bitbuf(&mut pdu) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: failed to parse AL-RECONNECT");
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- {}", reconnect);
+                let key = AlLinkKey::from_prim(main_address, link_id, endpoint_id, reconnect.advanced_link_number_n261);
+                self.on_al_reconnect(queue, key, carrier_num, main_address, reconnect);
+            }
+            LlcPduType::AlDisc => {
+                let Ok(disc) = AlDisc::from_bitbuf(&mut pdu) else {
+                    tracing::warn!("rx_tma_unitdata_ind_al: failed to parse AL-DISC");
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- {}", disc);
+                let key = AlLinkKey::from_prim(main_address, link_id, endpoint_id, disc.advanced_link_number_n261);
+                self.on_al_disc(queue, key, carrier_num, main_address, disc);
+            }
+            _ => {
+                tracing::error!("BUG: rx_tma_unitdata_ind_al: unexpected pdu_type {:?}", pdu_type);
+            }
+        }
+    }
+
+    // ─── AL-SETUP ──────────────────────────────────────────────────────────────
+
+    /// Handle an inbound AL-SETUP PDU.
+    ///
+    /// Two-way handshake per ETSI TS 100 392-2 v3.10.1 clause 21.4.2.
+    ///
+    /// NOTE: spec ambiguous — V1 only accepts Ack service with original AL
+    /// (non-augmented or Original-type augmented window).  Extended-AL windows
+    /// are rejected with `SetupReport::Reset`.  Any `setup_report` other than
+    /// `Success` on an inbound PDU is treated as a new proposal from the peer.
+    fn on_al_setup(
+        &mut self,
+        queue: &mut MessageQueue,
+        key: AlLinkKey,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        pdu: AlSetup,
+    ) {
+        // Check if this is a confirming reply for our own pending SETUP.
+        let is_confirm = matches!(self.al_links.get(&key), Some(link) if link.phase == AlPhase::SetupPending)
+            && pdu.setup_report == SetupReport::Success;
+
+        if is_confirm {
+            // Peer accepted our SETUP proposal.
+            if let Some(link) = self.al_links.get_mut(&key) {
+                link.phase = AlPhase::Established;
+                link.t_setup_start = None;
+                tracing::info!(
+                    "AL link {:?} established (our proposal confirmed by peer)",
+                    key
+                );
+            }
+            return;
+        }
+
+        // Validate the proposal.
+        let supported = Self::is_setup_supported(&pdu);
+        if !supported {
+            // Reject.  NOTE: spec ambiguous — use Reset for extended-AL rejection,
+            // ServiceChange for service-type mismatch.
+            let reject_report = if pdu.advanced_link_service != AdvancedLinkService::Ack {
+                SetupReport::ServiceChange
+            } else {
+                SetupReport::Reset
+            };
+            let reject = Self::build_setup_echo(&pdu, reject_report);
+            let msg = Self::make_al_sap_msg_setup(reject, carrier_num, main_address, key.link_id, key.endpoint_id);
+            queue.push_back(msg);
+            tracing::info!("AL-SETUP from ssi={} rejected ({:?})", key.ssi, reject_report);
+            return;
+        }
+
+        // Derive negotiated parameters.
+        let tx_window = if pdu.tl_sdu_window_size_n272_n281 == 0 {
+            pdu.n272_n281_augmented.unwrap_or(1).min(3)
+        } else {
+            pdu.tl_sdu_window_size_n272_n281
+        };
+        let max_tl_sdu_octets = pdu.max_tl_sdu_length_n271.octets();
+
+        // Accept: create or update the link.
+        let link = self.al_links.entry(key).or_insert_with(|| AlLink {
+            key,
+            main_address,
+            phase: AlPhase::Idle,
+            service: pdu.advanced_link_service,
+            max_tl_sdu_octets,
+            tx_window,
+            max_sdu_retx: pdu.max_retx_n273_or_repetition_n282,
+            max_segment_retx: pdu.max_segment_retx_n274,
+            next_n_s: 0,
+            outstanding_sdus: VecDeque::new(),
+            reassemblers: HashMap::new(),
+            unack_reassemblers: HashMap::new(),
+            unack_started_at: HashMap::new(),
+            t_setup_start: None,
+            t_disc_start: None,
+            t_reconnect_start: None,
+            t_rnr_start: None,
+            setup_retries: 0,
+            disc_retries: 0,
+            reconnect_retries: 0,
+            pending_setup_pdu: None,
+            pending_reconnect_pdu: None,
+            carrier_num,
+            needs_deferred_ack: false,
+            last_reassembled_sdu: None,
+        });
+        link.phase = AlPhase::Established;
+        link.t_setup_start = None;
+        link.carrier_num = carrier_num;
+        link.service = pdu.advanced_link_service;
+        link.max_tl_sdu_octets = max_tl_sdu_octets;
+        link.tx_window = tx_window;
+        link.max_sdu_retx = pdu.max_retx_n273_or_repetition_n282;
+        link.max_segment_retx = pdu.max_segment_retx_n274;
+
+        tracing::info!("AL link {:?} established (peer proposal accepted)", key);
+
+        // Echo back with Success.
+        let echo = Self::build_setup_echo(&pdu, SetupReport::Success);
+        let msg = Self::make_al_sap_msg_setup(echo, carrier_num, main_address, key.link_id, key.endpoint_id);
+        queue.push_back(msg);
+    }
+
+    /// True if V1 supports the parameters carried in an AL-SETUP proposal.
+    ///
+    /// NOTE: spec ambiguous — V1 supports only Ack service and original AL
+    /// (window 1..3).  Extended-AL (tl_sdu_window_size == 0 with Extended type)
+    /// is rejected.
+    fn is_setup_supported(pdu: &AlSetup) -> bool {
+        if pdu.advanced_link_service != AdvancedLinkService::Ack {
+            return false;
+        }
+        if pdu.tl_sdu_window_size_n272_n281 == 0 {
+            if let Some(AdvancedLinkType::Extended) = pdu.advanced_link_type {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn build_setup_echo(pdu: &AlSetup, report: SetupReport) -> AlSetup {
+        AlSetup {
+            advanced_link_service: pdu.advanced_link_service,
+            advanced_link_number_n261: pdu.advanced_link_number_n261,
+            max_tl_sdu_length_n271: pdu.max_tl_sdu_length_n271,
+            connection_width: pdu.connection_width,
+            advanced_link_symmetry: pdu.advanced_link_symmetry,
+            n264_dqpsk_ts_uplink: pdu.n264_dqpsk_ts_uplink,
+            n264_dqpsk_ts_downlink: pdu.n264_dqpsk_ts_downlink,
+            data_transfer_throughput: pdu.data_transfer_throughput,
+            tl_sdu_window_size_n272_n281: pdu.tl_sdu_window_size_n272_n281,
+            max_retx_n273_or_repetition_n282: pdu.max_retx_n273_or_repetition_n282,
+            max_segment_retx_n274: pdu.max_segment_retx_n274,
+            setup_report: report,
+            n_s: pdu.n_s,
+            advanced_link_type: pdu.advanced_link_type,
+            n272_n281_augmented: pdu.n272_n281_augmented,
+            reserved: pdu.reserved,
+        }
+    }
+
+    // ─── AL-DISC ──────────────────────────────────────────────────────────────
+
+    /// Handle an inbound AL-DISC PDU.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clause 21.4.7.
+    fn on_al_disc(
+        &mut self,
+        queue: &mut MessageQueue,
+        key: AlLinkKey,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        pdu: AlDisc,
+    ) {
+        // Check if this is a confirming reply to our own AL-DISC.
+        let we_initiated = matches!(
+            self.al_links.get(&key),
+            Some(link) if link.phase == AlPhase::DisconnectPending
+        );
+
+        if we_initiated {
+            // Peer confirmed our DISC.
+            if let Some(link) = self.al_links.get_mut(&key) {
+                link.t_disc_start = None;
+            }
+            self.al_links.remove(&key);
+            tracing::info!("AL link {:?} disconnected (our DISC confirmed by peer)", key);
+            return;
+        }
+
+        // Peer is requesting disconnect; reply and remove link.
+        let reply = AlDisc {
+            advanced_link_service: pdu.advanced_link_service,
+            advanced_link_number_n261: pdu.advanced_link_number_n261,
+            report: AlDiscCause::Success,
+        };
+        let msg = Self::make_al_sap_msg_disc(reply, carrier_num, main_address, key.link_id, key.endpoint_id);
+        self.al_links.remove(&key);
+        queue.push_back(msg);
+        tracing::info!("AL link {:?} disconnected (peer-initiated)", key);
+    }
+
+    // ─── AL-DATA / AL-FINAL ──────────────────────────────────────────────────
+
+    /// Handle an inbound AL-DATA / AL-FINAL PDU.
+    ///
+    /// Feeds the segment into the per-(link, N(S)) reassembler and enqueues
+    /// an AL-ACK if the PDU carries the AR flag or reassembly completes/fails.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clause 21.4.3.
+    fn on_al_data(&mut self, queue: &mut MessageQueue, key: AlLinkKey, pdu: AlDataAlFinal) {
+        let ar_flag = matches!(pdu.variant, AlDataVariant::DataAr | AlDataVariant::FinalAr);
+        let n_s = pdu.n_s;
+
+        let (ack_block_opt, carrier, addr, link_id, endpoint_id) = {
+            let Some(link) = self.al_links.get_mut(&key) else {
+                tracing::warn!("on_al_data: link {:?} not found", key);
+                return;
+            };
+            if link.phase != AlPhase::Established && link.phase != AlPhase::FlowControlled {
+                tracing::warn!(
+                    "on_al_data: PDU in phase {:?} (expected Established), dropping",
+                    link.phase
+                );
+                return;
+            }
+
+            // Get or create reassembler for this N(S).
+            let reassembler = link.reassemblers.entry(n_s).or_insert_with(|| Reassembler::new(n_s));
+
+            let feed_result = reassembler.feed(&pdu);
+
+            let ack_block_opt: Option<AcknowledgementBlock> = match feed_result {
+                Ok(ReassemblerFeed::Complete { sdu }) => {
+                    tracing::info!(
+                        "AL link {:?} N(S)={} reassembly complete ({} bytes)",
+                        key, n_s, sdu.len()
+                    );
+                    link.last_reassembled_sdu = Some(sdu);
+                    link.reassemblers.remove(&n_s);
+                    Some(AcknowledgementBlock {
+                        n_r: n_s,
+                        ack_length: AckLength::EntireSduReceived,
+                        s_r: None,
+                        ack_bitmap: None,
+                    })
+                }
+                Ok(ReassemblerFeed::FcsFailure { .. }) => {
+                    tracing::warn!("AL link {:?} N(S)={} FCS failure", key, n_s);
+                    link.reassemblers.remove(&n_s);
+                    Some(AcknowledgementBlock {
+                        n_r: n_s,
+                        ack_length: AckLength::SduFcsFailure,
+                        s_r: None,
+                        ack_bitmap: None,
+                    })
+                }
+                Ok(ReassemblerFeed::NeedMore { received_count, missing_indices }) => {
+                    if ar_flag {
+                        // Immediate partial ACK.
+                        let sr = if missing_indices.is_empty() {
+                            SR::RestOfSduReceived
+                        } else {
+                            SR::OldestNotReceived(missing_indices[0])
+                        };
+                        // NOTE: spec ambiguous — we use Segments(1) with S(R) only
+                        // (no bitmap) for simplicity in V1; this encodes the oldest
+                        // missing segment with all prior segments implicitly received.
+                        let _ = received_count; // would normally go into Segments(N)
+                        Some(AcknowledgementBlock {
+                            n_r: n_s,
+                            ack_length: AckLength::Segments(1),
+                            s_r: Some(sr),
+                            ack_bitmap: None,
+                        })
+                    } else {
+                        // Defer ACK to tick_end.
+                        link.needs_deferred_ack = true;
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("on_al_data: reassembler error {:?}, dropping", e);
+                    // NOTE: spec ambiguous — ConflictingRetransmission: do not ACK.
+                    None
+                }
+            };
+
+            (ack_block_opt, link.carrier_num, link.main_address, key.link_id, key.endpoint_id)
+        };
+
+        if let Some(block) = ack_block_opt {
+            let ack_pdu = AlAckAlRnr {
+                kind: AlAckAlRnrKind::Ack,
+                first_block: block,
+                other_blocks: vec![],
+            };
+            let msg = Self::make_al_sap_msg_ack(ack_pdu, carrier, addr, link_id, endpoint_id);
+            queue.push_back(msg);
+        }
+    }
+
+    // ─── AL-UDATA / AL-UFINAL ────────────────────────────────────────────────
+
+    /// Handle an inbound AL-UDATA / AL-UFINAL PDU (unacknowledged service).
+    ///
+    /// No AL-ACK is generated.  An SDU-level T.271 timeout discards partially
+    /// received SDUs whose segments have not all arrived within the timer window.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clause 21.4.4.
+    fn on_al_udata(&mut self, queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAlUdataAlUfinal) {
+        let n_s = pdu.n_s;
+        let _ = queue; // No ACK for unack service.
+
+        let Some(link) = self.al_links.get_mut(&key) else {
+            tracing::warn!("on_al_udata: link {:?} not found", key);
+            return;
+        };
+        if link.phase != AlPhase::Established {
+            tracing::warn!("on_al_udata: PDU in phase {:?}, dropping", link.phase);
+            return;
+        }
+
+        // Record start time for the T.271 SDU timeout.
+        link.unack_started_at.entry(n_s).or_insert(self.dltime);
+
+        let reassembler =
+            link.unack_reassemblers.entry(n_s).or_insert_with(|| UnackReassembler::new(n_s));
+
+        match reassembler.feed(&pdu) {
+            Ok(UnackReassemblerFeed::Complete { sdu }) => {
+                tracing::info!(
+                    "AL link {:?} N(S)={} unack reassembly complete ({} bytes)",
+                    key, n_s, sdu.len()
+                );
+                link.last_reassembled_sdu = Some(sdu);
+                link.unack_reassemblers.remove(&n_s);
+                link.unack_started_at.remove(&n_s);
+            }
+            Ok(UnackReassemblerFeed::FcsFailure { .. }) => {
+                tracing::warn!("AL link {:?} N(S)={} unack FCS failure, discarding", key, n_s);
+                link.unack_reassemblers.remove(&n_s);
+                link.unack_started_at.remove(&n_s);
+            }
+            Ok(UnackReassemblerFeed::NeedMore { .. }) => {
+                // Continue accumulating segments.
+            }
+            Ok(UnackReassemblerFeed::Discarded { .. }) => {
+                // Already discarded by timeout; ignore stale segment.
+                link.unack_reassemblers.remove(&n_s);
+                link.unack_started_at.remove(&n_s);
+            }
+            Err(e) => {
+                tracing::warn!("on_al_udata: reassembler error {:?}, dropping", e);
+                link.unack_reassemblers.remove(&n_s);
+                link.unack_started_at.remove(&n_s);
+            }
+        }
+    }
+
+    // ─── AL-ACK / AL-RNR ─────────────────────────────────────────────────────
+
+    /// Handle an inbound AL-ACK or AL-RNR PDU.
+    ///
+    /// For AL-RNR: transitions the link to `FlowControlled` and starts T.272.
+    /// For both: processes acknowledgement blocks to advance the TX window.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clause 21.4.5.
+    fn on_al_ack_rnr(&mut self, _queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAckAlRnr) {
+        let Some(link) = self.al_links.get_mut(&key) else {
+            tracing::warn!("on_al_ack_rnr: link {:?} not found", key);
+            return;
+        };
+        if link.phase != AlPhase::Established && link.phase != AlPhase::FlowControlled {
+            tracing::warn!(
+                "on_al_ack_rnr: PDU in phase {:?} (expected Established/FlowControlled), dropping",
+                link.phase
+            );
+            return;
+        }
+
+        if pdu.kind == AlAckAlRnrKind::Rnr {
+            link.phase = AlPhase::FlowControlled;
+            link.t_rnr_start = Some(self.dltime);
+            tracing::debug!("AL link {:?} entering FlowControlled (peer RNR)", key);
+        } else if link.phase == AlPhase::FlowControlled {
+            link.phase = AlPhase::Established;
+            link.t_rnr_start = None;
+            tracing::debug!("AL link {:?} leaving FlowControlled (ACK received)", key);
+        }
+
+        // Process all acknowledgement blocks.
+        let all_blocks =
+            std::iter::once(&pdu.first_block).chain(pdu.other_blocks.iter());
+
+        for block in all_blocks {
+            Self::process_ack_block(link, block);
+        }
+    }
+
+    /// Apply one `AcknowledgementBlock` to the link's outstanding SDU window.
+    fn process_ack_block(link: &mut AlLink, block: &AcknowledgementBlock) {
+        let n_r = block.n_r;
+
+        match block.ack_length {
+            AckLength::EntireSduReceived => {
+                // Remove the matching SDU from the window.
+                link.outstanding_sdus.retain(|sdu| sdu.n_s != n_r);
+                tracing::debug!("AL N(S)={} fully acknowledged", n_r);
+            }
+            AckLength::SduFcsFailure => {
+                // Peer reports FCS failure; schedule immediate retransmission.
+                if let Some(sdu) = link.outstanding_sdus.iter_mut().find(|s| s.n_s == n_r) {
+                    sdu.force_retx = true;
+                    sdu.acked_segments.iter_mut().for_each(|a| *a = false);
+                    tracing::debug!("AL N(S)={} FCS failure, scheduling retx", n_r);
+                }
+            }
+            AckLength::Segments(n) => {
+                let Some(sdu) = link.outstanding_sdus.iter_mut().find(|s| s.n_s == n_r) else {
+                    return;
+                };
+                // All segments before S(R) are received.
+                let total = sdu.acked_segments.len();
+                match block.s_r {
+                    Some(SR::OldestNotReceived(sr)) => {
+                        for idx in 0..sr as usize {
+                            if idx < total {
+                                sdu.acked_segments[idx] = true;
+                            }
+                        }
+                        // sr itself is NOT received (leave false).
+                        // Process bitmap for segments after sr.
+                        if let Some(bm) = &block.ack_bitmap {
+                            let bm_len = bm.get_len();
+                            let mut bm_copy = BitBuffer::from_bitbuffer(bm);
+                            for k in 0..bm_len {
+                                let bit = bm_copy.read_bit().unwrap_or(0);
+                                let ss = sr as usize + 1 + k;
+                                if ss < total && bit == 1 {
+                                    sdu.acked_segments[ss] = true;
+                                }
+                            }
+                        }
+                        let _ = n; // `n` is the number of segments reported in the block
+                    }
+                    Some(SR::RestOfSduReceived) => {
+                        // All segments received.
+                        sdu.acked_segments.iter_mut().for_each(|a| *a = true);
+                    }
+                    _ => {}
+                }
+                // If all segments are now acked, remove from window.
+                if sdu.acked_segments.iter().all(|&a| a) {
+                    let ns = sdu.n_s;
+                    link.outstanding_sdus.retain(|s| s.n_s != ns);
+                    tracing::debug!("AL N(S)={} fully acknowledged (via segment bitmap)", ns);
+                }
+            }
+        }
+    }
+
+    // ─── AL-RECONNECT ────────────────────────────────────────────────────────
+
+    /// Handle an inbound AL-RECONNECT PDU.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clause 21.4.6.
+    fn on_al_reconnect(
+        &mut self,
+        queue: &mut MessageQueue,
+        key: AlLinkKey,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        pdu: AlReconnect,
+    ) {
+        match pdu.reconnect_report {
+            ReconnectReport::Propose => {
+                // Peer proposes reconnect; accept.
+                let reply = AlReconnect {
+                    advanced_link_service: pdu.advanced_link_service,
+                    advanced_link_number_n261: pdu.advanced_link_number_n261,
+                    reconnect_report: ReconnectReport::Accept,
+                };
+                if let Some(link) = self.al_links.get_mut(&key) {
+                    link.phase = AlPhase::Established;
+                    link.carrier_num = carrier_num;
+                } else {
+                    // Create a minimal link on reconnect if none exists.
+                    self.al_links.insert(key, AlLink {
+                        key,
+                        main_address,
+                        phase: AlPhase::Established,
+                        service: pdu.advanced_link_service,
+                        max_tl_sdu_octets: 256,
+                        tx_window: 3,
+                        max_sdu_retx: N273_AL_MAX_TLSDU_RETRANSMISSIONS as u8,
+                        max_segment_retx: 3,
+                        next_n_s: 0,
+                        outstanding_sdus: VecDeque::new(),
+                        reassemblers: HashMap::new(),
+                        unack_reassemblers: HashMap::new(),
+                        unack_started_at: HashMap::new(),
+                        t_setup_start: None,
+                        t_disc_start: None,
+                        t_reconnect_start: None,
+                        t_rnr_start: None,
+                        setup_retries: 0,
+                        disc_retries: 0,
+                        reconnect_retries: 0,
+                        pending_setup_pdu: None,
+                        pending_reconnect_pdu: None,
+                        carrier_num,
+                        needs_deferred_ack: false,
+                        last_reassembled_sdu: None,
+                    });
+                }
+                let msg = Self::make_al_sap_msg_reconnect(
+                    reply, carrier_num, main_address, key.link_id, key.endpoint_id,
+                );
+                queue.push_back(msg);
+                tracing::info!("AL link {:?} reconnected (peer-proposed, accepted)", key);
+            }
+            ReconnectReport::Accept => {
+                // Our Propose was accepted.
+                if let Some(link) = self.al_links.get_mut(&key) {
+                    link.phase = AlPhase::Established;
+                    link.t_reconnect_start = None;
+                }
+                tracing::info!("AL link {:?} reconnected (our proposal confirmed)", key);
+            }
+            ReconnectReport::Reject => {
+                if let Some(link) = self.al_links.get_mut(&key) {
+                    link.phase = AlPhase::Idle;
+                    link.t_reconnect_start = None;
+                }
+                tracing::info!("AL link {:?} reconnect rejected by peer", key);
+            }
+            ReconnectReport::Reserved => {
+                tracing::warn!("AL link {:?} received reserved ReconnectReport, ignoring", key);
+            }
+        }
+    }
+
+    // ─── tick_end AL activity ─────────────────────────────────────────────────
+
+    /// Called from `tick_end` to handle AL retransmissions, deferred ACKs, and
+    /// timer expiry for every known link.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clauses 21.4.2 – 21.4.7, timers T.251/T.261/
+    /// T.263/T.265/T.271/T.272.
+    fn submit_al_activity_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+        let dltime = self.dltime;
+        let mut msgs: Vec<SapMsg> = Vec::new();
+        let mut links_to_set_idle: Vec<AlLinkKey> = Vec::new();
+        let mut links_to_remove: Vec<AlLinkKey> = Vec::new();
+
+        for (key, link) in self.al_links.iter_mut() {
+            // 0. T.272 — RNR receiver-not-ready expiry (must run before step 1 so that
+            //    buffered SDUs can be dispatched in the same tick they unfreeze).
+            if link.phase == AlPhase::FlowControlled {
+                if let Some(t_start) = link.t_rnr_start {
+                    if dltime.diff(t_start) as u64 >= T272_RECEIVER_NOT_READY_FOR_RX_TIMER as u64 {
+                        link.phase = AlPhase::Established;
+                        link.t_rnr_start = None;
+                        tracing::info!(
+                            "AL link {:?} T.272 expired, resuming transmission",
+                            key
+                        );
+                    }
+                }
+            }
+
+            // 1. TX retransmission (Established only; FlowControlled blocks sending).
+            if link.phase == AlPhase::Established {
+                let mut sdus_to_remove: Vec<u8> = Vec::new();
+                for sdu in link.outstanding_sdus.iter_mut() {
+                    let needs_retx = sdu.force_retx || match sdu.sent_at {
+                        Some(t) => dltime.diff(t) as u64 >= T251_SENDER_RETRY_TIMER as u64,
+                        None => true, // not yet sent at all
+                    };
+                    let has_unacked = sdu.acked_segments.iter().any(|&a| !a);
+                    if needs_retx && has_unacked {
+                        if sdu.retx_count as u32 >= N273_AL_MAX_TLSDU_RETRANSMISSIONS {
+                            tracing::warn!(
+                                "AL link {:?} N(S)={} exhausted retransmissions, dropping SDU",
+                                key, sdu.n_s
+                            );
+                            sdus_to_remove.push(sdu.n_s);
+                            continue;
+                        }
+                        sdu.force_retx = false;
+                        sdu.sent_at = Some(dltime);
+                        if sdu.retx_count > 0 {
+                            sdu.retx_count += 1;
+                        } else {
+                            // First send (not a retransmission).
+                        }
+                        // (Re)send only the unacknowledged segments.
+                        for (idx, pdu) in sdu.pdus.iter().enumerate() {
+                            if !sdu.acked_segments.get(idx).copied().unwrap_or(false) {
+                                let mut buf = BitBuffer::new_autoexpand(256);
+                                pdu.to_bitbuf(&mut buf);
+                                buf.seek(0);
+                                msgs.push(SapMsg {
+                                    sap: Sap::TmaSap,
+                                    src: TetraEntity::Llc,
+                                    dest: TetraEntity::Umac,
+                                    msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                                        carrier_num: Some(link.carrier_num),
+                                        req_handle: 0,
+                                        pdu: buf,
+                                        main_address: link.main_address,
+                                        link_id: link.key.link_id,
+                                        endpoint_id: link.key.endpoint_id,
+                                        stealing_permission: false,
+                                        subscriber_class: 0,
+                                        air_interface_encryption: None,
+                                        stealing_repeats_flag: None,
+                                        data_category: None,
+                                        chan_alloc: None,
+                                        tx_reporter: None,
+                                    }),
+                                });
+                            }
+                        }
+                        if sdu.retx_count > 0 {
+                            tracing::info!(
+                                "AL link {:?} N(S)={} retransmitting (attempt {})",
+                                key, sdu.n_s, sdu.retx_count
+                            );
+                        } else {
+                            sdu.retx_count = 1; // mark as sent once
+                        }
+                    }
+                }
+                for ns in sdus_to_remove {
+                    link.outstanding_sdus.retain(|s| s.n_s != ns);
+                }
+            }
+
+            // 2. Deferred ACK flush.
+            if link.needs_deferred_ack {
+                link.needs_deferred_ack = false;
+                // Build one AL-ACK covering all in-progress reassemblers.
+                let blocks: Vec<AcknowledgementBlock> = link
+                    .reassemblers
+                    .iter()
+                    .map(|(&n_s, reassembler)| {
+                        let missing = reassembler.missing_segments();
+                        if missing.is_empty() {
+                            AcknowledgementBlock {
+                                n_r: n_s,
+                                ack_length: AckLength::Segments(1),
+                                s_r: Some(SR::RestOfSduReceived),
+                                ack_bitmap: None,
+                            }
+                        } else {
+                            AcknowledgementBlock {
+                                n_r: n_s,
+                                ack_length: AckLength::Segments(1),
+                                s_r: Some(SR::OldestNotReceived(missing[0])),
+                                ack_bitmap: None,
+                            }
+                        }
+                    })
+                    .collect();
+
+                if !blocks.is_empty() {
+                    let (first, rest) = blocks.split_first().unwrap();
+                    let ack_pdu = AlAckAlRnr {
+                        kind: AlAckAlRnrKind::Ack,
+                        first_block: first.clone(),
+                        other_blocks: rest.to_vec(),
+                    };
+                    msgs.push(Self::make_al_sap_msg_ack(
+                        ack_pdu,
+                        link.carrier_num,
+                        link.main_address,
+                        link.key.link_id,
+                        link.key.endpoint_id,
+                    ));
+                }
+            }
+
+            // 3. Unack SDU timeout (T.271).
+            let timed_out_ns: Vec<u8> = link
+                .unack_started_at
+                .iter()
+                .filter(|&(_, t)| dltime.diff(*t) as u64 >= T271_RECEIVER_NOT_READY_FOR_TX_TIMER as u64)
+                .map(|(&ns, _)| ns)
+                .collect();
+            for ns in timed_out_ns {
+                if let Some(ra) = link.unack_reassemblers.get_mut(&ns) {
+                    let result = ra.discard();
+                    tracing::warn!(
+                        "AL link {:?} N(S)={} unack SDU T.271 timeout: {:?}",
+                        key, ns, result
+                    );
+                }
+                link.unack_reassemblers.remove(&ns);
+                link.unack_started_at.remove(&ns);
+            }
+
+            // 4. T.261 — AL-SETUP retry / give-up.
+            if link.phase == AlPhase::SetupPending {
+                if let Some(t_start) = link.t_setup_start {
+                    if dltime.diff(t_start) as u64 >= T261_SETUP_WAITING_TIMER as u64 {
+                        if (link.setup_retries as u32) < N262_AL_MAX_CONNECTION_SETUP_RETRIES {
+                            link.setup_retries += 1;
+                            link.t_setup_start = Some(dltime);
+                            if let Some(setup_pdu) = link.pending_setup_pdu.clone() {
+                                msgs.push(Self::make_al_sap_msg_setup(
+                                    setup_pdu,
+                                    link.carrier_num,
+                                    link.main_address,
+                                    link.key.link_id,
+                                    link.key.endpoint_id,
+                                ));
+                                tracing::info!(
+                                    "AL link {:?} SETUP retry {}",
+                                    key, link.setup_retries
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                "AL link {:?} SETUP N.262 exhausted, returning to Idle",
+                                key
+                            );
+                            links_to_set_idle.push(*key);
+                        }
+                    }
+                }
+            }
+
+            // 5. T.263 — AL-DISC retry / give-up.
+            if link.phase == AlPhase::DisconnectPending {
+                if let Some(t_start) = link.t_disc_start {
+                    if dltime.diff(t_start) as u64 >= T263_DISCONNECT_WAITING_TIMER as u64 {
+                        if (link.disc_retries as u32) < N263_AL_MAX_DISCONNECTION_RETRIES {
+                            link.disc_retries += 1;
+                            link.t_disc_start = Some(dltime);
+                            let disc_pdu = AlDisc {
+                                advanced_link_service: link.service,
+                                advanced_link_number_n261: link.key.n261,
+                                report: AlDiscCause::Success,
+                            };
+                            msgs.push(Self::make_al_sap_msg_disc(
+                                disc_pdu,
+                                link.carrier_num,
+                                link.main_address,
+                                link.key.link_id,
+                                link.key.endpoint_id,
+                            ));
+                        } else {
+                            tracing::warn!(
+                                "AL link {:?} DISC N.263 exhausted, removing link",
+                                key
+                            );
+                            links_to_remove.push(*key);
+                        }
+                    }
+                }
+            }
+
+            // 6. T.265 — AL-RECONNECT retry / give-up.
+            if link.phase == AlPhase::ReconnectPending {
+                if let Some(t_start) = link.t_reconnect_start {
+                    if dltime.diff(t_start) as u64 >= T265_RECONNECT_WAITING_TIMER as u64 {
+                        if (link.reconnect_retries as u32) < N265_AL_MAX_RECONNECTION_RETRIES {
+                            link.reconnect_retries += 1;
+                            link.t_reconnect_start = Some(dltime);
+                            if let Some(pdu) = link.pending_reconnect_pdu.clone() {
+                                msgs.push(Self::make_al_sap_msg_reconnect(
+                                    pdu,
+                                    link.carrier_num,
+                                    link.main_address,
+                                    link.key.link_id,
+                                    link.key.endpoint_id,
+                                ));
+                            }
+                        } else {
+                            tracing::warn!(
+                                "AL link {:?} RECONNECT N.265 exhausted, returning to Idle",
+                                key
+                            );
+                            links_to_set_idle.push(*key);
+                        }
+                    }
+                }
+            }
+
+        }
+
+        for key in links_to_set_idle {
+            if let Some(link) = self.al_links.get_mut(&key) {
+                link.phase = AlPhase::Idle;
+                link.t_setup_start = None;
+                link.t_reconnect_start = None;
+            }
+        }
+        for key in links_to_remove {
+            self.al_links.remove(&key);
+        }
+
+        let had = !msgs.is_empty();
+        for msg in msgs {
+            queue.push_back(msg);
+        }
+        had
+    }
+
+    // ─── AL helpers ───────────────────────────────────────────────────────────
+
+    /// Find an AL link by (ssi, link_id, endpoint_id), ignoring n261.
+    ///
+    /// Used for PDU types that do not carry a link number (AL-DATA, AL-ACK).
+    ///
+    /// NOTE: spec ambiguous — if multiple N.261 links exist for the same address,
+    /// this picks the first one in hash-map iteration order.  V1 supports only
+    /// link 0 so there is at most one.
+    fn find_al_link_for_data(
+        &self,
+        ssi: u32,
+        link_id: u32,
+        endpoint_id: u32,
+    ) -> Option<AlLinkKey> {
+        self.al_links
+            .keys()
+            .find(|k| k.ssi == ssi && k.link_id == link_id && k.endpoint_id == endpoint_id)
+            .copied()
+    }
+
+    fn make_al_sap_msg_setup(
+        pdu: AlSetup,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        link_id: u32,
+        endpoint_id: u32,
+    ) -> SapMsg {
+        let mut buf = BitBuffer::new_autoexpand(64);
+        pdu.to_bitbuf(&mut buf);
+        buf.seek(0);
+        Self::make_al_raw_sap_msg(buf, carrier_num, main_address, link_id, endpoint_id)
+    }
+
+    fn make_al_sap_msg_disc(
+        pdu: AlDisc,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        link_id: u32,
+        endpoint_id: u32,
+    ) -> SapMsg {
+        let mut buf = BitBuffer::new_autoexpand(16);
+        pdu.to_bitbuf(&mut buf);
+        buf.seek(0);
+        Self::make_al_raw_sap_msg(buf, carrier_num, main_address, link_id, endpoint_id)
+    }
+
+    fn make_al_sap_msg_reconnect(
+        pdu: AlReconnect,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        link_id: u32,
+        endpoint_id: u32,
+    ) -> SapMsg {
+        let mut buf = BitBuffer::new_autoexpand(16);
+        pdu.to_bitbuf(&mut buf);
+        buf.seek(0);
+        Self::make_al_raw_sap_msg(buf, carrier_num, main_address, link_id, endpoint_id)
+    }
+
+    fn make_al_sap_msg_ack(
+        pdu: AlAckAlRnr,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        link_id: u32,
+        endpoint_id: u32,
+    ) -> SapMsg {
+        let mut buf = BitBuffer::new_autoexpand(64);
+        pdu.to_bitbuf(&mut buf);
+        buf.seek(0);
+        Self::make_al_raw_sap_msg(buf, carrier_num, main_address, link_id, endpoint_id)
+    }
+
+    fn make_al_raw_sap_msg(
+        pdu: BitBuffer,
+        carrier_num: u16,
+        main_address: TetraAddress,
+        link_id: u32,
+        endpoint_id: u32,
+    ) -> SapMsg {
+        SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                carrier_num: Some(carrier_num),
+                req_handle: 0,
+                pdu,
+                main_address,
+                link_id,
+                endpoint_id,
+                stealing_permission: false,
+                subscriber_class: 0,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        }
+    }
+}
+
+// ─── Test-only TX entry point ─────────────────────────────────────────────────
+impl Llc {
+    /// Segment `sdu` and enqueue all resulting PDUs onto `queue` for the
+    /// specified `link`.  This is the **temporary** test-only TX path until
+    /// AL-4 introduces `TlaTlDataReqAl`.
+    ///
+    /// Returns `Err` without any side-effects if preconditions are violated.
+    ///
+    /// # Note
+    /// This method exists for test-only use during AL-3 development.
+    /// AL-4 will wire the proper `TlaTlDataReqAl` SAP handler and this method
+    /// should be removed at that point.
+    pub fn test_send_al_sdu(
+        &mut self,
+        queue: &mut MessageQueue,
+        link_key: AlLinkKey,
+        sdu: Vec<u8>,
+    ) -> Result<(), AlError> {
+        let link = self.al_links.get_mut(&link_key).ok_or(AlError::UnknownLink(link_key))?;
+
+        if link.phase != AlPhase::Established && link.phase != AlPhase::FlowControlled {
+            return Err(AlError::NotEstablished);
+        }
+        if link.outstanding_sdus.len() >= link.tx_window as usize {
+            return Err(AlError::WindowFull);
+        }
+        if sdu.len() > link.max_tl_sdu_octets as usize {
+            return Err(AlError::SduTooLarge { got: sdu.len(), max: link.max_tl_sdu_octets });
+        }
+
+        let n_s = link.next_n_s;
+        let tx_window = link.tx_window;
+        let carrier = link.carrier_num;
+        let addr = link.main_address;
+        let l_id = link.key.link_id;
+        let e_id = link.key.endpoint_id;
+        let seg_bits = self.al_segment_payload_bits;
+
+        let config = SegmenterConfig {
+            segment_payload_bits: seg_bits,
+            starting_n_s: n_s,
+            request_ack_on_final: true,
+            request_ack_on_data: false,
+        };
+
+        let output = segment_sdu(&sdu, &config).map_err(AlError::SegmentationFailed)?;
+
+        let seg_count = output.pdus.len();
+        let acked_segments = vec![false; seg_count];
+
+        // Advance N(S) wrapping mod (tx_window + 1).
+        let link = self.al_links.get_mut(&link_key).unwrap();
+        link.next_n_s = (n_s + 1) % (tx_window + 1);
+        link.outstanding_sdus.push_back(OutstandingSdu {
+            n_s,
+            pdus: output.pdus.clone(),
+            sent_at: None, // will be set on first submission in tick_end
+            acked_segments,
+            retx_count: 0,
+            force_retx: false,
+        });
+
+        // Only push PDUs to UMAC immediately when the link is Established.
+        // When FlowControlled, the SDU is buffered with sent_at=None and
+        // tick_end will dispatch it once flow control clears.
+        let link = self.al_links.get(&link_key).ok_or(AlError::UnknownLink(link_key))?;
+        let is_established = link.phase == AlPhase::Established;
+        if is_established {
+            for pdu in &output.pdus {
+                let mut buf = BitBuffer::new_autoexpand(256);
+                pdu.to_bitbuf(&mut buf);
+                buf.seek(0);
+                queue.push_back(SapMsg {
+                    sap: Sap::TmaSap,
+                    src: TetraEntity::Llc,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                        carrier_num: Some(carrier),
+                        req_handle: 0,
+                        pdu: buf,
+                        main_address: addr,
+                        link_id: l_id,
+                        endpoint_id: e_id,
+                        stealing_permission: false,
+                        subscriber_class: 0,
+                        air_interface_encryption: None,
+                        stealing_repeats_flag: None,
+                        data_category: None,
+                        chan_alloc: None,
+                        tx_reporter: None,
+                    }),
+                });
+            }
+
+            // Mark SDU as sent now.
+            let dltime = self.dltime;
+            if let Some(sdu) = self.al_links.get_mut(&link_key).and_then(|l| l.outstanding_sdus.back_mut()) {
+                sdu.sent_at = Some(dltime);
+            }
+        }
+        // When FlowControlled: sent_at remains None; tick_end submits on unfreeze.
+
+        Ok(())
+    }
 }
 
 impl TetraEntityTrait for Llc {
@@ -983,8 +2253,11 @@ impl TetraEntityTrait for Llc {
         // Take oldest element from scheduled_out_acks, and remove it from the list
         had_activity |= self.submit_ack_replies_to_umac(queue);
 
-        // Step 4 / 4: Send any U-DATA messages
+        // Step 4 / 5: Send any U-DATA messages
         had_activity |= self.submit_udata_msgs_to_umac(queue);
+
+        // Step 5 / 5: AL retransmissions, deferred ACKs, and timer expiry
+        had_activity |= self.submit_al_activity_to_umac(queue);
 
         had_activity
     }
