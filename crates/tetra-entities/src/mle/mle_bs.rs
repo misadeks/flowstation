@@ -256,14 +256,70 @@ impl MleBs {
         }
     }
 
-    fn rx_tlpd_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
+    fn rx_tlpd_prim(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlpd_prim");
-        unimplemented_log!("rx_tlpd_prim called but TLPD SAP is not implemented");
-        // match &message.msg {
-        //     _ => {
-        //         panic!();
-        //     }
-        // }
+        // NOTE: spec ambiguous - PD-3 dispatches both Bl and "Ack service on BL"
+        // (BL supports acknowledged transfers via BL-DATA). Real AL routing requires
+        // SNDCP to supply an al_link_number, which lands in PD-4 if that path is
+        // chosen. Until then, Acknowledged -> TlaTlDataReqBl.
+        let SapMsgInner::LtpdMleUnitdataReq(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message on TlpdSap: {:?}", message);
+            return;
+        };
+
+        let sdu_len = prim.sdu.get_len();
+        let mut pdu = BitBuffer::new(3 + sdu_len);
+        pdu.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+        pdu.copy_bits(&mut prim.sdu, sdu_len);
+        pdu.seek(0);
+
+        let sapmsg = if prim.layer2service == Layer2Service::Unacknowledged {
+            SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Llc,
+                msg: SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
+                    main_address: prim.main_address,
+                    link_id: prim.link_id,
+                    endpoint_id: prim.endpoint_id,
+                    tl_sdu: pdu,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: prim.air_interface_encryption,
+                    packet_data_flag: prim.packet_data_flag,
+                    n_tlsdu_repeats: 0,
+                    data_class_info: None,
+                    req_handle: 0,
+                    chan_alloc: None,
+                    tx_reporter: prim.tx_reporter.take(),
+                }),
+            }
+        } else {
+            SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Llc,
+                msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+                    main_address: prim.main_address,
+                    link_id: prim.link_id,
+                    endpoint_id: prim.endpoint_id,
+                    tl_sdu: pdu,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: prim.air_interface_encryption,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    tx_reporter: prim.tx_reporter.take(),
+                }),
+            }
+        };
+
+        queue.push_back(sapmsg);
     }
 
     fn rx_lcmc_mle_unitdata_req(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
