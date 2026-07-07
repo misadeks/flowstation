@@ -5,4 +5,5 @@ pub mod llc;
 pub mod mle;
 pub mod mm;
 pub mod phy;
+pub mod sndcp;
 pub mod umac;
