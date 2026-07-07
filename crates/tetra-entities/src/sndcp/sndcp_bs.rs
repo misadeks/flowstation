@@ -1,191 +1,767 @@
-use crate::{MessageQueue, TetraEntityTrait};
+//! SNDCP BS entity — per-PDP-context state machine.
+//!
+//! Implements ETSI EN 300 392-2 clause 28.4 (SNDCP PDU exchange), clause 28.23
+//! (SN-ACTIVATE PDP CONTEXT ACCEPT), clause 28.24 (SN-ACTIVATE PDP CONTEXT DEMAND),
+//! and clause 28.108 (reject cause codes).
+//!
+//! All downward SN-PDUs go via `LtpdMleUnitdataReq` on `TlpdSap` (PD-2), which PD-3 MLE
+//! routes to LLC over BL (Basic Link). V1 does not distinguish AL/BL routing; that is a
+//! follow-up item.
+//!
+//! IPv4 pool: `192.168.1.180..=192.168.1.190` (11 addresses). Dynamic and static
+//! allocation supported. Static requests for IPs outside this range are rejected.
+//!
+//! CHAP helpers (`find_chap_response_id`, `chap_success_optional_section`) were moved to
+//! `crates/tetra-pdus/src/sndcp/fields/pco.rs` (PD-1). This module uses the structured
+//! PCO types from that crate directly.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::Ipv4Addr;
+
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap};
-use tetra_saps::ltpd::LtpdMleUnitdataInd;
-use tetra_saps::tla::TlaTlDataReqBl;
+use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress};
+use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
-// TETRA packet data (SNDCP). Air interface: ETSI EN 300 392-2 clause 28; PDU contents tables 28.23
-// (SN-ACTIVATE PDP CONTEXT ACCEPT) and 28.24 (SN-ACTIVATE PDP CONTEXT DEMAND).
+use tetra_pdus::sndcp::enums::configuration_protocol::ConfigurationProtocol;
+use tetra_pdus::sndcp::enums::protocol_identity::ProtocolIdentity;
+use tetra_pdus::sndcp::enums::reject_cause::RejectCause;
+use tetra_pdus::sndcp::enums::tia::Tia;
+use tetra_pdus::sndcp::fields::mtu::Mtu;
+use tetra_pdus::sndcp::fields::nsapi::Nsapi;
+use tetra_pdus::sndcp::fields::pco::{Pco, PcoEntry};
+use tetra_pdus::sndcp::fields::timer_value::{ReadyTimer, ResponseWaitTimer, StandbyTimer};
+use tetra_pdus::sndcp::pdus::{
+    ActivatePdpContextAccept, ActivatePdpContextReject, DeactivatePdpContextAccept, PageRequest,
+    SnPdu, Unitdata,
+};
 
-/// MLE protocol discriminator value for SNDCP (3 bits, 0b100). The MS's MLE routes the downlink SDU
-/// to its SNDCP entity, mirroring the uplink (mle_bs.rs).
-const MLE_DISCRIMINATOR_SNDCP: u64 = 0b100;
-/// SN-PDU type for SN-ACTIVATE PDP CONTEXT (4 bits, 0x0). DEMAND on uplink, ACCEPT on downlink.
-const SN_PDU_ACTIVATE_PDP_CONTEXT: u64 = 0x0;
+use crate::{MessageQueue, TetraEntityTrait};
 
-// SN-ACTIVATE PDP CONTEXT ACCEPT mandatory field values (clause 28.4.5.*).
-const PDU_PRIORITY_MAX: u64 = 4; // 0..7, mid (28.103)
-const READY_TIMER: u64 = 8; // 8 = 10 s (28.112)
-const STANDBY_TIMER: u64 = 5; // 5 = 10 min (28.122)
-const RESPONSE_WAIT_TIMER: u64 = 8; // 8 = 10 s (28.116)
-const TIA_IPV4_STATIC: u64 = 1; // Type identifier in accept: 1 = IPv4 Static Address (28.126)
-const TIA_IPV4_DYNAMIC: u64 = 2; // 2 = IPv4 Dynamic Address
-const MTU_1500: u64 = 4; // 4 = 1500 octets (28.79)
-/// Address handed to a MS that requested a dynamic IPv4 (ATID != 0). Static requests get the address
-/// the MS asked for, echoed back.
-const POOL_IPV4: u64 = 0xC0A8_01B4; // 192.168.1.180
+// --- Constants ----------------------------------------------------------------
 
-// CHAP authentication carried in the Protocol configuration options (PCO) type-3 element.
-// Motorola/Dimetra radios run PPP CHAP (RFC 1994) inside PDP context activation: the DEMAND's PCO
-// carries the MS's CHAP Response (username + MD5 hash). The SwMI must reply with a CHAP Success in
-// the ACCEPT's PCO or the MS aborts the data session ("data server not responding").
-const PCO_TYPE34_ID: u64 = 1; // Table 28.127: type-3/4 element identifier for PCO
-const PPP_PROTO_CHAP: u64 = 0xC223; // RFC 3232 configuration protocol identifier for CHAP
-const PPP_CONFIG_PROTOCOL_PPP: u64 = 0; // Table 28.105: configuration protocol 0000 = PPP
-const CHAP_CODE_SUCCESS: u64 = 3; // RFC 1994 CHAP code: 3 = Success
-/// PCO content length, in bits, for a bare CHAP Success: configuration protocol(4) +
-/// protocol identity(16) + length-of-contents(8) + CHAP Success packet(4 octets = 32) = 60.
-const PCO_CHAP_SUCCESS_BITS: u64 = 60;
+/// SN-ACTIVATE PDP CONTEXT ACCEPT mandatory field defaults (clause 28.23).
+const PDU_PRIORITY_MAX: u8 = 4;        // table 28.103: mid priority
+const READY_TIMER_CODE: u8 = 8;        // table 28.112: 10 s
+const STANDBY_TIMER_CODE: u8 = 5;      // table 28.122: 10 min (600 s)
+const RESP_WAIT_TIMER_CODE: u8 = 8;    // table 28.116: 10 s
+const MTU_CODE: u8 = 4;                // table 28.79: 1500 octets
+
+/// Timer values in TETRA timeslots.
+/// 1 timeslot approx 14.167 ms (1 hyperframe = 4320 timeslots = 61.2 s).
+const READY_TIMER_SLOTS: i32 = 706;        // approx 10 s
+const STANDBY_TIMER_SLOTS: i32 = 42_353;   // approx 10 min
+const RESP_WAIT_TIMER_SLOTS: i32 = 706;    // approx 10 s
+
+/// Static IPv4 pool: 192.168.1.180..=192.168.1.190 (11 addresses).
+const POOL_BASE: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 180);
+const POOL_COUNT: u32 = 11;
+
+// --- Ipv4Pool -----------------------------------------------------------------
+
+/// Tiny IPv4 address allocator. Tracks addresses within the configured range.
+struct Ipv4Pool {
+    available: HashSet<Ipv4Addr>,
+    base_u32: u32,
+    count: u32,
+}
+
+impl Ipv4Pool {
+    fn new(base: Ipv4Addr, count: u32) -> Self {
+        let base_u32 = u32::from(base);
+        let mut available = HashSet::with_capacity(count as usize);
+        for i in 0..count {
+            available.insert(Ipv4Addr::from(base_u32.wrapping_add(i)));
+        }
+        Self { available, base_u32, count }
+    }
+
+    /// Allocate any available address.
+    /// NOTE: spec ambiguous — chosen behaviour: allocate the lowest available IP for
+    /// deterministic test output rather than a random one.
+    fn allocate(&mut self) -> Option<Ipv4Addr> {
+        let ip = self.available.iter().copied().min()?;
+        self.available.remove(&ip);
+        Some(ip)
+    }
+
+    /// Allocate a specific address. Returns `Some(ip)` iff `ip` is currently available.
+    fn allocate_specific(&mut self, ip: Ipv4Addr) -> Option<Ipv4Addr> {
+        if self.available.remove(&ip) { Some(ip) } else { None }
+    }
+
+    /// Return an address to the pool.
+    fn free(&mut self, ip: Ipv4Addr) {
+        self.available.insert(ip);
+    }
+
+    /// True iff `ip` falls within the configured pool range (regardless of allocation state).
+    #[allow(dead_code)]
+    fn is_in_range(&self, ip: Ipv4Addr) -> bool {
+        let v = u32::from(ip);
+        v >= self.base_u32 && v < self.base_u32.saturating_add(self.count)
+    }
+}
+
+// --- Public types -------------------------------------------------------------
+
+/// Key into the per-MS PDP context table.
+///
+/// Two MSes with different addresses may share an NSAPI value, so both fields are
+/// needed. `TetraAddress` does not implement `Eq`/`Hash`, so we store only the SSI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PdpKey {
+    pub ssi: u32,
+    pub nsapi: u8,
+}
+
+impl PdpKey {
+    fn new(addr: TetraAddress, nsapi: u8) -> Self {
+        Self { ssi: addr.ssi, nsapi }
+    }
+}
+
+/// State of a PDP context (ETSI EN 300 392-2 clause 28.4 state machine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdpState {
+    /// ACCEPT sent; awaiting Ready (V1: immediate transition to Ready).
+    /// Activation timestamp is stored in `PdpContext::last_activity`.
+    WaitForAccept,
+    /// Fully active; can send/receive SN-UNITDATA.
+    Ready,
+    /// Ready timer expired; MS must be paged before more downlink data.
+    Standby,
+    /// SN-PAGE REQUEST sent; awaiting SN-PAGE RESPONSE.
+    WaitForPageResponse,
+    /// DEACTIVATE ACCEPT sent; context being torn down.
+    Deactivating,
+}
+
+/// A single active PDP context.
+#[derive(Clone)]
+pub struct PdpContext {
+    pub key: PdpKey,
+    pub state: PdpState,
+    pub ipv4: Ipv4Addr,
+    pub tia: Tia,
+    /// Cached SDU of the ACCEPT we sent (pos=0, without MLE discriminator).
+    /// Resent verbatim on retransmitted DEMAND (idempotency).
+    pub last_accept_sdu: BitBuffer,
+    pub last_activity: TdmaTime,
+    pub ready_deadline: Option<TdmaTime>,
+    pub standby_deadline: Option<TdmaTime>,
+    pub resp_wait_deadline: Option<TdmaTime>,
+    /// IP payloads queued while the MS is in Standby / WaitForPageResponse.
+    pub pending_downlink: VecDeque<Vec<u8>>,
+    /// Link-layer addressing captured from the uplink ACTIVATE DEMAND.
+    pub link_id: u32,
+    pub endpoint_id: u32,
+}
+
+/// Uplink IP payload surfaced to the higher layer (pd-gateway / tests).
+#[derive(Debug, Clone)]
+pub struct GatewayUplink {
+    pub main_address: TetraAddress,
+    pub nsapi: u8,
+    pub payload: Vec<u8>,
+}
+
+/// Downlink IP payload injected from the higher layer (pd-gateway / tests).
+#[derive(Debug, Clone)]
+pub struct GatewayDownlink {
+    pub dest_ipv4: Ipv4Addr,
+    pub payload: Vec<u8>,
+}
+
+// --- Sndcp entity -------------------------------------------------------------
 
 pub struct Sndcp {
-    #[allow(dead_code)] // wired up when the full packet-data state machine is implemented
+    #[allow(dead_code)]
     config: SharedConfig,
+    ipv4_pool: Ipv4Pool,
+    contexts: HashMap<PdpKey, PdpContext>,
+    /// Reverse index: allocated IPv4 to context key (for downlink routing).
+    ipv4_to_key: HashMap<Ipv4Addr, PdpKey>,
+    /// Uplink IP payloads for the pd-gateway (PD-6) or tests to drain.
+    pub uplink_ip_queue: VecDeque<GatewayUplink>,
+    /// Current TDMA time, recorded in `tick_start`.
+    dltime: TdmaTime,
 }
 
 impl Sndcp {
     pub fn new(config: SharedConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            ipv4_pool: Ipv4Pool::new(POOL_BASE, POOL_COUNT),
+            contexts: HashMap::new(),
+            ipv4_to_key: HashMap::new(),
+            uplink_ip_queue: VecDeque::new(),
+            dltime: TdmaTime::default(),
+        }
     }
 
-    /// Reply to an SN-ACTIVATE PDP CONTEXT DEMAND with a spec-conformant SN-ACTIVATE PDP CONTEXT
-    /// ACCEPT (table 28.23): echo the requested NSAPI and grant the IPv4 the MS asked for (or one
-    /// from the pool for a dynamic request), with mandatory timers/MTU and no optional elements.
-    /// `demand` is the SNDCP PDU bit-string (after the 3-bit MLE discriminator).
-    fn send_pdp_accept(&self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, demand: &str) {
-        // Decode the DEMAND mandatory header (table 28.24): type(4) version(4) NSAPI(4) ATID(3)
-        // [IPv4(32) when ATID==0].
-        let bits = |off: usize, n: usize| -> Option<u64> { demand.get(off..off + n).and_then(|s| u64::from_str_radix(s, 2).ok()) };
-        let nsapi = bits(8, 4).unwrap_or(1);
-        let atid = bits(12, 3).unwrap_or(0);
-        let (tia, ipv4) = if atid == 0 {
-            // Static: the MS asked for a specific IPv4 (bits 15..47) — grant it.
-            (TIA_IPV4_STATIC, bits(15, 32).unwrap_or(POOL_IPV4))
-        } else {
-            // Dynamic (or other): assign one from the pool.
-            (TIA_IPV4_DYNAMIC, POOL_IPV4)
+    // -- Uplink dispatch -------------------------------------------------------
+
+    fn on_uplink_pdu(&mut self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd) {
+        let mut buf = ind.sdu.clone();
+        buf.seek(0);
+        // Skip the 3-bit MLE SNDCP protocol discriminator (0b100).
+        if buf.read_bits(3).is_none() {
+            tracing::warn!("SNDCP: uplink SDU too short for discriminator");
+            return;
+        }
+        let sn_pdu = match SnPdu::from_bitbuf_ul(&mut buf) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "SNDCP: failed to decode uplink SN-PDU from {:?}: {e:?}",
+                    ind.received_tetra_address
+                );
+                return;
+            }
         };
+        match sn_pdu {
+            SnPdu::ActivatePdpContextDemand(d) => self.on_activate_demand(queue, ind, d),
+            SnPdu::DeactivatePdpContextDemand(d) => self.on_deactivate_demand(queue, ind, d),
+            SnPdu::DeactivatePdpContextAccept(a) => self.on_deactivate_accept(ind, a),
+            SnPdu::Unitdata(u) => self.on_uplink_unitdata(ind, u),
+            SnPdu::PageResponse(pr) => self.on_page_response(queue, ind, pr),
+            SnPdu::EndOfData(eod) => self.on_end_of_data(ind, eod),
+            SnPdu::Reconnect(rc) => self.on_reconnect(ind, rc),
+            other => {
+                tracing::warn!(
+                    "SNDCP: unhandled uplink SN-PDU from {:?}: {other:?}",
+                    ind.received_tetra_address
+                );
+            }
+        }
+    }
 
-        // Build the ACCEPT (table 28.23), prefixed with the 3-bit MLE SNDCP discriminator.
-        let mut sdu = BitBuffer::new_autoexpand(16);
-        sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
-        sdu.write_bits(SN_PDU_ACTIVATE_PDP_CONTEXT, 4); // SN PDU type = ACCEPT
-        sdu.write_bits(nsapi, 4); // NSAPI (echo)
-        sdu.write_bits(PDU_PRIORITY_MAX, 3);
-        sdu.write_bits(READY_TIMER, 4);
-        sdu.write_bits(STANDBY_TIMER, 4);
-        sdu.write_bits(RESPONSE_WAIT_TIMER, 4);
-        sdu.write_bits(tia, 3); // Type identifier in accept (IPv4 present)
-        sdu.write_bits(ipv4, 32); // IP Address IPv4 (conditional on TIA = 1/2)
-        sdu.write_bits(0, 8); // PCOMP negotiation = 0 (no header compression → no conditional fields)
-        sdu.write_bits(MTU_1500, 3); // Maximum transmission unit
+    // -- SN-ACTIVATE PDP CONTEXT DEMAND (table 28.24) -------------------------
 
-        // Optional elements (annex E.1). If the DEMAND carried PPP CHAP authentication the MS is
-        // waiting for a CHAP Success — without it the data session never opens ("data server not
-        // responding"). Append a PCO type-3 element carrying the Success; otherwise close the PDU
-        // with an o-bit of 0.
-        let chap_id = find_chap_response_id(demand);
-        if let Some(id) = chap_id {
-            for bit in chap_success_optional_section(id).bytes() {
-                sdu.write_bits(u64::from(bit - b'0'), 1);
+    /// Handle an SN-ACTIVATE PDP CONTEXT DEMAND and reply with ACCEPT or REJECT.
+    ///
+    /// Ref: ETSI EN 300 392-2 clause 28.4 (state machine), table 28.24 (DEMAND),
+    /// table 28.23 (ACCEPT), table 28.108 (reject causes).
+    fn on_activate_demand(
+        &mut self,
+        queue: &mut MessageQueue,
+        ind: &LtpdMleUnitdataInd,
+        demand: tetra_pdus::sndcp::pdus::ActivatePdpContextDemand,
+    ) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = demand.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        // Check whether a context already exists for this (SSI, NSAPI) pair.
+        if let Some(ctx) = self.contexts.get_mut(&key) {
+            match ctx.state {
+                // Active context: resend the cached ACCEPT verbatim (idempotent retransmission).
+                // NOTE: spec ambiguous — chosen behaviour: always resend for WaitForAccept, Ready,
+                // or Standby regardless of DEMAND params. A DEMAND for a different IP after
+                // activation is a protocol error; we give the MS its existing ACCEPT.
+                PdpState::WaitForAccept | PdpState::Ready | PdpState::Standby => {
+                    tracing::info!(
+                        "SNDCP: retransmitted ACTIVATE DEMAND from {:?} NSAPI={nsapi} — resending cached ACCEPT",
+                        main_address
+                    );
+                    let sdu = ctx.last_accept_sdu.clone();
+                    ctx.resp_wait_deadline =
+                        Some(self.dltime.add_timeslots(RESP_WAIT_TIMER_SLOTS));
+                    send_downlink(
+                        queue, main_address, ind.link_id, ind.endpoint_id,
+                        sdu, Layer2Service::Acknowledged, false,
+                    );
+                    return;
+                }
+                // Context exists but in a terminal state — reject as conflict.
+                _ => {
+                    tracing::warn!(
+                        "SNDCP: ACTIVATE DEMAND from {:?} NSAPI={nsapi} conflicts with context in {:?}",
+                        main_address, ctx.state
+                    );
+                    self.send_reject(queue, ind, demand.nsapi, RejectCause::PdpContextAlreadyActive);
+                    return;
+                }
+            }
+        }
+
+        // -- Allocate IPv4 -----------------------------------------------------
+        // ATID == 0  => static request (MS supplies the specific IPv4 it wants).
+        // ATID != 0  => dynamic request (SwMI assigns any free address).
+        let (ipv4, tia) = if demand.atid == 0 {
+            let requested = demand.ip_address.unwrap_or(POOL_BASE);
+            match self.ipv4_pool.allocate_specific(requested) {
+                Some(ip) => (ip, Tia::Ipv4Static),
+                None => {
+                    tracing::info!(
+                        "SNDCP: static IPv4 {requested} not available for {:?} NSAPI={nsapi}",
+                        main_address
+                    );
+                    self.send_reject(
+                        queue, ind, demand.nsapi,
+                        RejectCause::RequestedStaticIpv4NotAvailable,
+                    );
+                    return;
+                }
             }
         } else {
-            sdu.write_bits(0, 1); // o-bit = 0: no optional elements → PDU ends
+            match self.ipv4_pool.allocate() {
+                Some(ip) => (ip, Tia::Ipv4Dynamic),
+                None => {
+                    tracing::info!(
+                        "SNDCP: IPv4 pool exhausted for {:?} NSAPI={nsapi}", main_address
+                    );
+                    self.send_reject(queue, ind, demand.nsapi, RejectCause::NoResource);
+                    return;
+                }
+            }
+        };
+
+        // -- Build ACCEPT ------------------------------------------------------
+        // Detect CHAP in the DEMAND PCO. If a CHAP Response (or Challenge) is present,
+        // echo its identifier in a CHAP Success in the ACCEPT PCO.
+        let chap_id = chap_id_from_pco(&demand.pco);
+        let pco = chap_id.map(|id| Pco {
+            configuration_protocol: ConfigurationProtocol::Ppp,
+            entries: vec![PcoEntry {
+                protocol_identity: ProtocolIdentity::Chap,
+                // CHAP Success (RFC 1994): [code=3, id echoed, length_hi=0, length_lo=4].
+                contents: vec![3u8, id, 0, 4],
+            }],
+        });
+
+        let accept = ActivatePdpContextAccept {
+            nsapi: demand.nsapi,
+            pdu_priority_max: PDU_PRIORITY_MAX,
+            ready_timer: ReadyTimer(READY_TIMER_CODE),
+            standby_timer: StandbyTimer(STANDBY_TIMER_CODE),
+            response_wait_timer: ResponseWaitTimer(RESP_WAIT_TIMER_CODE),
+            tia,
+            ip4_address: Some(ipv4),
+            pcomp: 0,
+            vj_slots: None,
+            mtu: Mtu(MTU_CODE),
+            snei: None,
+            pco,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(256);
+        if let Err(e) = accept.to_bitbuf(&mut sdu) {
+            tracing::warn!(
+                "SNDCP: failed to encode ACCEPT for {:?}: {e:?}; freeing {ipv4}", main_address
+            );
+            self.ipv4_pool.free(ipv4);
+            return;
         }
-        let len = sdu.get_pos();
         sdu.seek(0);
+        let cached_sdu = sdu.clone();
 
         tracing::info!(
-            "SNDCP: -> SN-ACTIVATE PDP CONTEXT ACCEPT to {:?}: NSAPI={} TIA={} IPv4={}.{}.{}.{} CHAP-Success={} ({} bits)",
-            ind.received_tetra_address,
-            nsapi,
-            tia,
-            (ipv4 >> 24) & 0xff,
-            (ipv4 >> 16) & 0xff,
-            (ipv4 >> 8) & 0xff,
-            ipv4 & 0xff,
-            chap_id.map(|id| format!("id={id}")).unwrap_or_else(|| "none".into()),
-            len
+            "SNDCP: -> SN-ACTIVATE PDP CONTEXT ACCEPT to {:?}: NSAPI={nsapi} TIA={tia} IPv4={ipv4} CHAP={}",
+            main_address,
+            chap_id.map(|id| format!("Success(id={id})")).unwrap_or_else(|| "none".to_string())
         );
 
-        // Acknowledged basic link (the DEMAND arrived acknowledged), addressed to the requesting MS.
-        queue.push_back(SapMsg {
-            sap: Sap::TlaSap,
-            src: TetraEntity::Sndcp,
-            dest: TetraEntity::Llc,
-            msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
-                main_address: ind.received_tetra_address,
-                link_id: ind.link_id,
-                endpoint_id: ind.endpoint_id,
-                tl_sdu: sdu,
-                stealing_permission: false,
-                subscriber_class: 0,
-                fcs_flag: false,
-                air_interface_encryption: None,
-                stealing_repeats_flag: None,
-                data_class_info: None,
-                req_handle: 0,
-                graceful_degradation: None,
-                chan_alloc: None,
-                tx_reporter: None,
-            }),
+        // -- Insert context (state = Ready immediately, V1 best-effort) -------
+        // NOTE: spec ambiguous — chosen behaviour: V1 transitions directly to Ready without
+        // waiting for an LLC ACK. Real ACK-driven transitions can be layered in a later step.
+        let ctx = PdpContext {
+            key,
+            state: PdpState::Ready,
+            ipv4,
+            tia,
+            last_accept_sdu: cached_sdu,
+            last_activity: self.dltime,
+            ready_deadline: Some(self.dltime.add_timeslots(READY_TIMER_SLOTS)),
+            standby_deadline: None,
+            resp_wait_deadline: None,
+            pending_downlink: VecDeque::new(),
+            link_id: ind.link_id,
+            endpoint_id: ind.endpoint_id,
+        };
+        self.ipv4_to_key.insert(ipv4, key);
+        self.contexts.insert(key, ctx);
+
+        send_downlink(
+            queue, main_address, ind.link_id, ind.endpoint_id,
+            sdu, Layer2Service::Acknowledged, false,
+        );
+    }
+
+    // -- SN-DEACTIVATE PDP CONTEXT DEMAND -------------------------------------
+
+    fn on_deactivate_demand(
+        &mut self,
+        queue: &mut MessageQueue,
+        ind: &LtpdMleUnitdataInd,
+        demand: tetra_pdus::sndcp::pdus::DeactivatePdpContextDemand,
+    ) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = demand.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        let ipv4 = match self.contexts.get(&key) {
+            Some(ctx) => ctx.ipv4,
+            None => {
+                tracing::warn!(
+                    "SNDCP: DEACTIVATE DEMAND from {:?} NSAPI={nsapi}: context not found",
+                    main_address
+                );
+                return;
+            }
+        };
+
+        let deact_accept = DeactivatePdpContextAccept { nsapi: demand.nsapi };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        if let Err(e) = deact_accept.to_bitbuf(&mut sdu) {
+            tracing::warn!("SNDCP: failed to encode DEACTIVATE ACCEPT: {e:?}");
+        } else {
+            sdu.seek(0);
+            send_downlink(
+                queue, main_address, ind.link_id, ind.endpoint_id,
+                sdu, Layer2Service::Acknowledged, false,
+            );
+        }
+
+        self.ipv4_pool.free(ipv4);
+        self.ipv4_to_key.remove(&ipv4);
+        self.contexts.remove(&key);
+        tracing::info!("SNDCP: context {:?} NSAPI={nsapi} IPv4={ipv4} deactivated", main_address);
+    }
+
+    // -- SN-DEACTIVATE PDP CONTEXT ACCEPT -------------------------------------
+
+    fn on_deactivate_accept(
+        &mut self,
+        ind: &LtpdMleUnitdataInd,
+        accept: tetra_pdus::sndcp::pdus::DeactivatePdpContextAccept,
+    ) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = accept.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        match self.contexts.get(&key) {
+            Some(ctx) if ctx.state == PdpState::Deactivating => {
+                let ipv4 = ctx.ipv4;
+                self.ipv4_pool.free(ipv4);
+                self.ipv4_to_key.remove(&ipv4);
+                self.contexts.remove(&key);
+                tracing::info!(
+                    "SNDCP: SwMI-initiated deactivation confirmed for {:?} NSAPI={nsapi}",
+                    main_address
+                );
+            }
+            Some(ctx) => {
+                tracing::warn!(
+                    "SNDCP: unexpected DEACTIVATE ACCEPT from {:?} NSAPI={nsapi} in state {:?}",
+                    main_address, ctx.state
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "SNDCP: DEACTIVATE ACCEPT from {:?} NSAPI={nsapi}: context not found",
+                    main_address
+                );
+            }
+        }
+    }
+
+    // -- SN-UNITDATA uplink ----------------------------------------------------
+
+    fn on_uplink_unitdata(&mut self, ind: &LtpdMleUnitdataInd, u: Unitdata) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = u.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        let ctx = match self.contexts.get_mut(&key) {
+            Some(c) if matches!(c.state, PdpState::Ready | PdpState::Standby) => c,
+            Some(c) => {
+                tracing::warn!(
+                    "SNDCP: uplink UNITDATA from {:?} NSAPI={nsapi} in unexpected state {:?}",
+                    main_address, c.state
+                );
+                return;
+            }
+            None => {
+                tracing::warn!(
+                    "SNDCP: uplink UNITDATA from {:?} NSAPI={nsapi}: context not found",
+                    main_address
+                );
+                return;
+            }
+        };
+
+        // Any uplink packet restores the context to Ready and resets the timer.
+        // NOTE: spec ambiguous — chosen behaviour: reset ready_deadline on every uplink SN-UNITDATA.
+        ctx.state = PdpState::Ready;
+        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+        ctx.standby_deadline = None;
+        ctx.last_activity = self.dltime;
+
+        self.uplink_ip_queue.push_back(GatewayUplink {
+            main_address,
+            nsapi,
+            payload: u.payload,
         });
     }
-}
 
-/// Build the optional-element section (annex E.1) of an ACCEPT that grants a CHAP Success with the
-/// given identifier: the o-bit, the three absent type-2 presence bits (SNDCP network endpoint id,
-/// SwMI IPv6 information, SwMI Mobile IPv4 information — table 28.23), the PCO type-3 element, and
-/// the closing m-bit. Returned MSB-first as a bit string for direct append to the PDU. Kept as the
-/// single source of truth so the wire encoding and its unit test cannot drift apart.
-fn chap_success_optional_section(chap_id: u8) -> String {
-    let mut s = String::with_capacity(81);
-    s.push('1'); // o-bit = 1: optional elements follow
-    s.push_str("000"); // type-2 presence bits, in table order, all absent
-    s.push('1'); // M-bit = 1: a type-3/4 element follows
-    s.push_str(&format!("{PCO_TYPE34_ID:04b}")); // type-3/4 element identifier (PCO = 1)
-    s.push_str(&format!("{PCO_CHAP_SUCCESS_BITS:011b}")); // length indicator (bits)
-    // PCO content (table 28.105): PPP / CHAP / one Success packet.
-    s.push_str(&format!("{PPP_CONFIG_PROTOCOL_PPP:04b}")); // configuration protocol = PPP
-    s.push_str(&format!("{PPP_PROTO_CHAP:016b}")); // protocol identity = CHAP (C223H)
-    s.push_str(&format!("{:08b}", 4)); // length of protocol identity contents = 4 octets
-    // CHAP Success packet (RFC 1994): code=3, identifier echoed from the MS Response, length=4
-    // (header only, no message).
-    s.push_str(&format!("{CHAP_CODE_SUCCESS:08b}"));
-    s.push_str(&format!("{chap_id:08b}"));
-    s.push_str(&format!("{:016b}", 4));
-    s.push('0'); // M-bit = 0: no more type-3/4 elements (last bit in the PDU)
-    s
-}
+    // -- SN-PAGE RESPONSE ------------------------------------------------------
 
-/// Scan an SN-ACTIVATE PDP CONTEXT DEMAND bit-string for a PPP CHAP packet carried in its Protocol
-/// configuration options element and return the identifier of the MS's CHAP Response (RFC 1994 code
-/// 2), to be echoed in the Success we send back. Falls back to a Challenge's (code 1) identifier if
-/// no Response is present, or `None` if the DEMAND carries no CHAP at all (e.g. PAP or no auth → we
-/// leave the ACCEPT without a PCO).
-///
-/// The scan locates the 16-bit CHAP configuration-protocol identifier (C223H) at any bit offset —
-/// the PCO is bit-packed, not byte-aligned — then reads the CHAP packet's code/identifier from the
-/// fixed offsets that follow (8-bit length-of-contents, then code, then identifier). The CHAP code
-/// is validated to reject a coincidental C223H bit pattern inside a hash value.
-fn find_chap_response_id(demand: &str) -> Option<u8> {
-    const CHAP_PROTO_ID: &str = "1100001000100011"; // C223H, MSB first
-    let read = |off: usize| -> Option<u8> { demand.get(off..off + 8).and_then(|s| u8::from_str_radix(s, 2).ok()) };
-    let mut fallback = None;
-    let mut from = 0;
-    while let Some(rel) = demand.get(from..).and_then(|s| s.find(CHAP_PROTO_ID)) {
-        let marker = from + rel;
-        // After C223H: length-of-contents (8 bits), then the CHAP packet (code, identifier, ...).
-        match (read(marker + 16 + 8), read(marker + 16 + 16)) {
-            (Some(2), Some(id)) => return Some(id),                           // Response — echo this identifier
-            (Some(1), Some(id)) if fallback.is_none() => fallback = Some(id), // Challenge
-            _ => {}
+    fn on_page_response(
+        &mut self,
+        queue: &mut MessageQueue,
+        ind: &LtpdMleUnitdataInd,
+        pr: tetra_pdus::sndcp::pdus::PageResponse,
+    ) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = pr.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        let ctx = match self.contexts.get_mut(&key) {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    "SNDCP: PAGE RESPONSE from {:?} NSAPI={nsapi}: context not found",
+                    main_address
+                );
+                return;
+            }
+        };
+
+        if ctx.state != PdpState::WaitForPageResponse {
+            tracing::warn!(
+                "SNDCP: PAGE RESPONSE from {:?} NSAPI={nsapi} in unexpected state {:?}",
+                main_address, ctx.state
+            );
+            return;
         }
-        from = marker + CHAP_PROTO_ID.len();
+
+        ctx.state = PdpState::Ready;
+        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+        ctx.standby_deadline = None;
+        ctx.last_activity = self.dltime;
+
+        let link_id = ctx.link_id;
+        let endpoint_id = ctx.endpoint_id;
+        let nsapi_field = Nsapi(nsapi);
+        let pending: Vec<Vec<u8>> = ctx.pending_downlink.drain(..).collect();
+
+        for payload in pending {
+            let ud = Unitdata { nsapi: nsapi_field, pdu_priority: 0, payload };
+            let mut sdu = BitBuffer::new_autoexpand(256);
+            if let Err(e) = ud.to_bitbuf(&mut sdu) {
+                tracing::warn!("SNDCP: failed to encode UNITDATA for pending downlink: {e:?}");
+                continue;
+            }
+            sdu.seek(0);
+            send_downlink(
+                queue, main_address, link_id, endpoint_id,
+                sdu, Layer2Service::Unacknowledged, true,
+            );
+        }
+        tracing::info!(
+            "SNDCP: PAGE RESPONSE from {:?} NSAPI={nsapi}: Ready, pending downlink drained",
+            main_address
+        );
     }
-    fallback
+
+    // -- SN-END OF DATA --------------------------------------------------------
+
+    fn on_end_of_data(
+        &mut self,
+        ind: &LtpdMleUnitdataInd,
+        eod: tetra_pdus::sndcp::pdus::EndOfData,
+    ) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = eod.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        if let Some(ctx) = self.contexts.get_mut(&key) {
+            if ctx.state == PdpState::Ready {
+                ctx.state = PdpState::Standby;
+                ctx.standby_deadline = Some(self.dltime.add_timeslots(STANDBY_TIMER_SLOTS));
+                ctx.ready_deadline = None;
+                tracing::info!("SNDCP: {:?} NSAPI={nsapi} Ready->Standby (END OF DATA)", main_address);
+            } else {
+                tracing::warn!(
+                    "SNDCP: END OF DATA from {:?} NSAPI={nsapi} in unexpected state {:?}",
+                    main_address, ctx.state
+                );
+            }
+        } else {
+            tracing::warn!(
+                "SNDCP: END OF DATA from {:?} NSAPI={nsapi}: context not found", main_address
+            );
+        }
+    }
+
+    // -- SN-RECONNECT ----------------------------------------------------------
+
+    fn on_reconnect(
+        &mut self,
+        ind: &LtpdMleUnitdataInd,
+        rc: tetra_pdus::sndcp::pdus::Reconnect,
+    ) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = rc.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        if let Some(ctx) = self.contexts.get_mut(&key) {
+            if ctx.state == PdpState::Standby {
+                ctx.state = PdpState::Ready;
+                ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                ctx.standby_deadline = None;
+                tracing::info!("SNDCP: {:?} NSAPI={nsapi} Standby->Ready (RECONNECT)", main_address);
+            } else {
+                tracing::warn!(
+                    "SNDCP: RECONNECT from {:?} NSAPI={nsapi} in unexpected state {:?}",
+                    main_address, ctx.state
+                );
+            }
+        } else {
+            tracing::warn!(
+                "SNDCP: RECONNECT from {:?} NSAPI={nsapi}: context not found", main_address
+            );
+        }
+    }
+
+    // -- Downlink injection (gateway / tests) ----------------------------------
+
+    /// Inject a downlink IP datagram. Routes based on context state:
+    /// - `Ready`: send SN-UNITDATA immediately (unacknowledged, packet_data_flag=true).
+    /// - `Standby`: queue payload and send SN-PAGE REQUEST (acknowledged).
+    /// - `WaitForPageResponse`: queue payload only.
+    /// - Other states: drop with a warning.
+    pub fn feed_downlink_ip(&mut self, queue: &mut MessageQueue, downlink: GatewayDownlink) {
+        let key = match self.ipv4_to_key.get(&downlink.dest_ipv4).copied() {
+            Some(k) => k,
+            None => {
+                tracing::info!("SNDCP: downlink drop — no context for IPv4 {}", downlink.dest_ipv4);
+                return;
+            }
+        };
+
+        let ctx = match self.contexts.get_mut(&key) {
+            Some(c) => c,
+            None => {
+                tracing::warn!("SNDCP: downlink drop — context for {} disappeared", downlink.dest_ipv4);
+                return;
+            }
+        };
+
+        let main_address = TetraAddress::issi(key.ssi);
+        let nsapi = Nsapi(key.nsapi);
+        let link_id = ctx.link_id;
+        let endpoint_id = ctx.endpoint_id;
+
+        match ctx.state {
+            PdpState::Ready => {
+                ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                ctx.last_activity = self.dltime;
+                let ud = Unitdata { nsapi, pdu_priority: 0, payload: downlink.payload };
+                let mut sdu = BitBuffer::new_autoexpand(256);
+                if let Err(e) = ud.to_bitbuf(&mut sdu) {
+                    tracing::warn!("SNDCP: failed to encode downlink UNITDATA: {e:?}");
+                    return;
+                }
+                sdu.seek(0);
+                send_downlink(queue, main_address, link_id, endpoint_id, sdu,
+                    Layer2Service::Unacknowledged, true);
+            }
+            PdpState::Standby => {
+                ctx.pending_downlink.push_back(downlink.payload);
+                ctx.state = PdpState::WaitForPageResponse;
+                let pr = PageRequest { nsapi };
+                let mut sdu = BitBuffer::new_autoexpand(32);
+                if let Err(e) = pr.to_bitbuf(&mut sdu) {
+                    tracing::warn!("SNDCP: failed to encode PAGE REQUEST: {e:?}");
+                    return;
+                }
+                sdu.seek(0);
+                send_downlink(queue, main_address, link_id, endpoint_id, sdu,
+                    Layer2Service::Acknowledged, false);
+                tracing::info!("SNDCP: paging {:?} NSAPI={} — downlink queued", main_address, key.nsapi);
+            }
+            PdpState::WaitForPageResponse => {
+                ctx.pending_downlink.push_back(downlink.payload);
+            }
+            other => {
+                tracing::warn!(
+                    "SNDCP: downlink drop for {:?} NSAPI={} in state {other:?}",
+                    main_address, key.nsapi
+                );
+            }
+        }
+    }
+
+    // -- Timer housekeeping ----------------------------------------------------
+
+    fn run_timers(&mut self) {
+        let now = self.dltime;
+        let mut to_remove: Vec<(PdpKey, Ipv4Addr)> = Vec::new();
+
+        for ctx in self.contexts.values_mut() {
+            match ctx.state {
+                PdpState::Ready => {
+                    if let Some(dl) = ctx.ready_deadline {
+                        if timer_expired(dl, now) {
+                            ctx.state = PdpState::Standby;
+                            ctx.standby_deadline = Some(now.add_timeslots(STANDBY_TIMER_SLOTS));
+                            ctx.ready_deadline = None;
+                        }
+                    }
+                }
+                PdpState::Standby => {
+                    if let Some(dl) = ctx.standby_deadline {
+                        if timer_expired(dl, now) {
+                            to_remove.push((ctx.key, ctx.ipv4));
+                        }
+                    }
+                }
+                PdpState::WaitForAccept => {
+                    if let Some(dl) = ctx.resp_wait_deadline {
+                        if timer_expired(dl, now) {
+                            to_remove.push((ctx.key, ctx.ipv4));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (key, ipv4) in to_remove {
+            self.ipv4_pool.free(ipv4);
+            self.ipv4_to_key.remove(&ipv4);
+            self.contexts.remove(&key);
+        }
+    }
+
+    // -- Helpers ---------------------------------------------------------------
+
+    fn send_reject(
+        &self,
+        queue: &mut MessageQueue,
+        ind: &LtpdMleUnitdataInd,
+        nsapi: Nsapi,
+        cause: RejectCause,
+    ) {
+        let pdu = ActivatePdpContextReject { nsapi, reject_cause: cause };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        if let Err(e) = pdu.to_bitbuf(&mut sdu) {
+            tracing::warn!("SNDCP: failed to encode REJECT ({cause:?}): {e:?}");
+            return;
+        }
+        sdu.seek(0);
+        send_downlink(
+            queue, ind.received_tetra_address, ind.link_id, ind.endpoint_id,
+            sdu, Layer2Service::Acknowledged, false,
+        );
+    }
 }
+
+// --- TetraEntityTrait ---------------------------------------------------------
 
 impl TetraEntityTrait for Sndcp {
     fn entity(&self) -> TetraEntity {
@@ -193,103 +769,77 @@ impl TetraEntityTrait for Sndcp {
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        // Decode the SN-PDU type and, for an SN-ACTIVATE PDP CONTEXT DEMAND, return an ACCEPT.
-        // Never panics: a garbled PDU must not take down the stack.
-        let SapMsgInner::LtpdMleUnitdataInd(ind) = &message.msg else {
-            tracing::debug!("SNDCP: unhandled prim (sap={:?}): {:?}", message.sap, message.msg);
+        let SapMsgInner::LtpdMleUnitdataInd(ref ind) = message.msg else {
+            tracing::debug!(
+                "SNDCP: unhandled prim (sap={:?}): {:?}", message.sap, message.msg
+            );
             return;
         };
+        // Clone to avoid holding a reference across mutable `on_uplink_pdu` dispatch.
+        let ind = ind.clone();
+        self.on_uplink_pdu(queue, &ind);
+    }
 
-        // The SDU still carries the leading 3-bit MLE protocol discriminator (0b100 = SNDCP); the
-        // SNDCP PDU proper — which begins with a 4-bit SN-PDU type — starts after it.
-        let raw = ind.sdu.dump_bin_unformatted();
-        let pdu = raw.get(3..).unwrap_or("");
-        let sn_type = pdu.get(0..4).and_then(|s| u8::from_str_radix(s, 2).ok());
-        // SN-PDU type table (ETSI EN 300 392-2 clause 28.4.5, "SN PDU type").
-        let name = match sn_type {
-            Some(0) => "SN-ACTIVATE PDP CONTEXT (DEMAND/ACCEPT)",
-            Some(1) => "SN-DEACTIVATE PDP CONTEXT ACCEPT",
-            Some(2) => "SN-DEACTIVATE PDP CONTEXT DEMAND",
-            Some(3) => "SN-ACTIVATE PDP CONTEXT REJECT",
-            Some(4) => "SN-UNITDATA",
-            Some(5) => "SN-DATA",
-            Some(6) => "SN-DATA TRANSMIT REQUEST",
-            Some(7) => "SN-DATA TRANSMIT RESPONSE",
-            Some(8) => "SN-END OF DATA",
-            Some(9) => "SN-RECONNECT",
-            Some(10) => "SN-PAGE REQUEST/RESPONSE",
-            Some(11) => "SN-NOT SUPPORTED",
-            Some(12) => "SN-DATA PRIORITY",
-            Some(13) => "SN-MODIFY",
-            _ => "reserved/unknown",
-        };
-        tracing::info!(
-            "SNDCP: <- packet-data PDU from {:?} — SN-PDU type 0x{} ({}), {} bits",
-            ind.received_tetra_address,
-            sn_type.map(|n| format!("{n:x}")).unwrap_or_else(|| "?".into()),
-            name,
-            pdu.len(),
-        );
+    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
+        self.dltime = ts;
+    }
 
-        if sn_type == Some(SN_PDU_ACTIVATE_PDP_CONTEXT as u8) {
-            self.send_pdp_accept(queue, ind, pdu);
-        }
+    fn tick_end(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
+        self.run_timers();
+        false
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// --- Free helpers -------------------------------------------------------------
 
-    fn hex_to_bits(hex: &str) -> String {
-        hex.chars().map(|c| format!("{:04b}", c.to_digit(16).unwrap())).collect()
-    }
+/// Send a SN-PDU body downward via `LtpdMleUnitdataReq` on `TlpdSap` -> MLE -> LLC.
+/// MLE (PD-3) prepends the 3-bit SNDCP discriminator before forwarding to LLC.
+fn send_downlink(
+    queue: &mut MessageQueue,
+    main_address: TetraAddress,
+    link_id: u32,
+    endpoint_id: u32,
+    sdu: BitBuffer,
+    layer2service: Layer2Service,
+    packet_data_flag: bool,
+) {
+    queue.push_back(SapMsg {
+        sap: Sap::TlpdSap,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::LtpdMleUnitdataReq(LtpdMleUnitdataReq {
+            main_address,
+            link_id,
+            endpoint_id,
+            sdu,
+            layer2service,
+            packet_data_flag,
+            air_interface_encryption: None,
+            tx_reporter: None,
+        }),
+    });
+}
 
-    #[test]
-    fn finds_chap_response_identifier_in_real_demand_pco() {
-        // Captured SN-ACTIVATE PDP CONTEXT DEMAND PCO content from a Motorola radio: a CHAP
-        // Challenge (id 5, name "DIMETRA…") followed by a CHAP Response (id 5, username "admin").
-        let pco = hex_to_bits(
-            "0c22318010500180aac20e0caf974bc75e02f44494d455452415f50\
-             c2231a0205001a10db3b2df8c57cce0db8712b16aa9cb5a361646d696",
-        );
-        assert_eq!(find_chap_response_id(&pco), Some(5));
+/// Scan a decoded PCO for a PPP CHAP packet and return the CHAP identifier to echo.
+/// Prefers a CHAP Response (code 2) over a Challenge (code 1). Returns `None` if no
+/// CHAP entries are found.
+fn chap_id_from_pco(pco: &Option<Pco>) -> Option<u8> {
+    let pco = pco.as_ref()?;
+    let mut challenge_id: Option<u8> = None;
+    for entry in &pco.entries {
+        if entry.protocol_identity == ProtocolIdentity::Chap && entry.contents.len() >= 2 {
+            match entry.contents[0] {
+                2 => return Some(entry.contents[1]), // Response — echo this id
+                1 if challenge_id.is_none() => challenge_id = Some(entry.contents[1]),
+                _ => {}
+            }
+        }
     }
+    challenge_id
+}
 
-    #[test]
-    fn prefers_response_over_challenge_and_skips_non_chap_bits() {
-        let mut s = String::from("101"); // leading bits that are not part of any C223H marker
-        s.push_str("1100001000100011"); // C223H
-        s.push_str("00000110"); // length-of-contents (ignored by the scan)
-        s.push_str("00000001"); // CHAP code = 1 (Challenge)
-        s.push_str("00001001"); // identifier = 9
-        s.push_str("1100001000100011"); // C223H
-        s.push_str("00000110"); // length-of-contents
-        s.push_str("00000010"); // CHAP code = 2 (Response)
-        s.push_str("00000111"); // identifier = 7
-        assert_eq!(find_chap_response_id(&s), Some(7));
-    }
-
-    #[test]
-    fn no_chap_in_demand_returns_none() {
-        assert_eq!(find_chap_response_id(&"0".repeat(256)), None);
-    }
-
-    #[test]
-    fn optional_section_layout_matches_spec() {
-        let sec = chap_success_optional_section(5);
-        // o-bit(1) + type-2 P-bits(3) + M-bit(1) + id(4) + length(11) + PCO(60) + M-bit(1) = 81.
-        assert_eq!(sec.len(), 81);
-        assert_eq!(&sec[0..4], "1000"); // o-bit=1, three absent type-2 presence bits
-        assert_eq!(&sec[4..5], "1"); // M-bit = 1
-        assert_eq!(&sec[5..9], "0001"); // type-3/4 element identifier = 1 (PCO)
-        assert_eq!(&sec[9..20], &format!("{PCO_CHAP_SUCCESS_BITS:011b}")); // length indicator
-        assert_eq!(&sec[20..24], "0000"); // configuration protocol = PPP
-        assert_eq!(&sec[24..40], "1100001000100011"); // protocol identity = CHAP
-        assert_eq!(&sec[40..48], "00000100"); // length of contents = 4 octets
-        assert_eq!(&sec[48..56], "00000011"); // CHAP code = 3 (Success)
-        assert_eq!(&sec[56..64], "00000101"); // identifier echoed = 5
-        assert_eq!(&sec[64..80], "0000000000000100"); // CHAP length = 4
-        assert_eq!(&sec[80..81], "0"); // closing M-bit = 0
-    }
+/// True iff `now` is strictly after `deadline` (timer has fired).
+fn timer_expired(deadline: TdmaTime, now: TdmaTime) -> bool {
+    // now.diff(deadline) = now - deadline; positive => now is later than deadline.
+    now.diff(deadline) > 0
 }
