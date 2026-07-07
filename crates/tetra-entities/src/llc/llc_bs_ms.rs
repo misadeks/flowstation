@@ -7,7 +7,10 @@ use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress,
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
-use tetra_saps::tla::{TlaTlDataIndBl, TlaTlUnitdataIndBl};
+use tetra_saps::tla::{
+    TlaTlDataIndAl, TlaTlDataIndBl, TlaTlDataReqAl, TlaTlUnitdataIndAl, TlaTlUnitdataIndBl,
+    TlaTlUnitdataReqAl,
+};
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -23,7 +26,7 @@ use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 // ── Advanced Link imports ────────────────────────────────────────────────────
 use tetra_pdus::llc::al::error::SegmentationError;
 use tetra_pdus::llc::al::reassembler::{Reassembler, ReassemblerFeed, UnackReassembler, UnackReassemblerFeed};
-use tetra_pdus::llc::al::segmenter::{SegmenterConfig, segment_sdu};
+use tetra_pdus::llc::al::segmenter::{SegmenterConfig, UnackSegmenterConfig, segment_sdu, segment_unack_sdu};
 use tetra_pdus::llc::consts::consts::{
     N262_AL_MAX_CONNECTION_SETUP_RETRIES, N263_AL_MAX_DISCONNECTION_RETRIES,
     N265_AL_MAX_RECONNECTION_RETRIES, N273_AL_MAX_TLSDU_RETRANSMISSIONS,
@@ -202,10 +205,10 @@ pub struct AlLink {
     /// When `true`, at least one non-AR segment has been received and a batched
     /// AL-ACK will be flushed in `tick_end`.
     pub needs_deferred_ack: bool,
-    // ── Test / inspection hook ────────────────────────────────────────────────
-    /// Populated every time a complete reassembled SDU arrives.
-    /// AL-4 will replace this with a proper `TlaTlDataIndAl` SapMsg push.
-    pub last_reassembled_sdu: Option<Vec<u8>>,
+    // ── Pending SDU buffer (window-full backpressure) ─────────────────────────
+    /// NOTE: spec ambiguous — chosen behaviour: unbounded queue for V1;
+    /// cap and shed with warn in a later PR if we see memory pressure.
+    pub pending_sdus: VecDeque<Vec<u8>>,
 }
 
 /// Error type for AL-layer operations.
@@ -606,6 +609,120 @@ impl Llc {
         // a pending message waiting for an ack.
     }
 
+    fn rx_tla_tldata_req_al(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        let prim: TlaTlDataReqAl = match message.msg {
+            SapMsgInner::TlaTlDataReqAl(prim) => prim,
+            _ => {
+                tracing::error!("BUG: rx_tla_tldata_req_al: not TlaTlDataReqAl");
+                return;
+            }
+        };
+        let key = AlLinkKey {
+            ssi: prim.main_address.ssi,
+            link_id: prim.link_id,
+            endpoint_id: prim.endpoint_id,
+            n261: prim.al_link_number,
+        };
+        let phase = self.al_links.get(&key).map(|l| l.phase);
+        match phase {
+            None => {
+                tracing::warn!("TLA-DATA-Req-Al: no such AL link {:?}, dropping SDU", key);
+                return;
+            }
+            Some(p) if p != AlPhase::Established && p != AlPhase::FlowControlled => {
+                tracing::warn!(
+                    "TLA-DATA-Req-Al: link {:?} not Established (phase {:?}), dropping",
+                    key,
+                    p
+                );
+                return;
+            }
+            _ => {}
+        }
+        let sdu: Vec<u8> = prim.tl_sdu.into_bytes();
+        if let Err(e) = self.enqueue_al_sdu(queue, key, sdu) {
+            tracing::warn!("TLA-DATA-Req-Al: enqueue_al_sdu failed for link {:?}: {:?}", key, e);
+        }
+    }
+
+    fn rx_tla_tlunitdata_req_al(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        let prim: TlaTlUnitdataReqAl = match message.msg {
+            SapMsgInner::TlaTlUnitdataReqAl(prim) => prim,
+            _ => {
+                tracing::error!("BUG: rx_tla_tlunitdata_req_al: not TlaTlUnitdataReqAl");
+                return;
+            }
+        };
+        let key = AlLinkKey {
+            ssi: prim.main_address.ssi,
+            link_id: prim.link_id,
+            endpoint_id: prim.endpoint_id,
+            n261: prim.al_link_number,
+        };
+        let (carrier, addr, l_id, e_id, next_n_s) = {
+            let Some(link) = self.al_links.get_mut(&key) else {
+                tracing::warn!("TLA-UNITDATA-Req-Al: no such AL link {:?}, dropping SDU", key);
+                return;
+            };
+            if link.phase != AlPhase::Established {
+                tracing::warn!(
+                    "TLA-UNITDATA-Req-Al: link {:?} not Established (phase {:?}), dropping",
+                    key,
+                    link.phase
+                );
+                return;
+            }
+            let n_s = link.next_n_s;
+            link.next_n_s = link.next_n_s.wrapping_add(1);
+            (
+                link.carrier_num,
+                link.main_address,
+                link.key.link_id,
+                link.key.endpoint_id,
+                n_s,
+            )
+        };
+
+        let sdu: Vec<u8> = prim.tl_sdu.into_bytes();
+        let config = UnackSegmenterConfig {
+            segment_payload_bits: self.al_segment_payload_bits,
+            starting_n_s: next_n_s,
+        };
+        let output = match segment_unack_sdu(&sdu, &config) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("TLA-UNITDATA-Req-Al: segmentation failed for link {:?}: {:?}", key, e);
+                return;
+            }
+        };
+        for pdu in &output.pdus {
+            let mut buf = BitBuffer::new_autoexpand(256);
+            pdu.to_bitbuf(&mut buf);
+            buf.seek(0);
+            queue.push_back(SapMsg {
+                sap: Sap::TmaSap,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                    carrier_num: Some(carrier),
+                    req_handle: 0,
+                    pdu: buf,
+                    main_address: addr,
+                    link_id: l_id,
+                    endpoint_id: e_id,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    tx_reporter: None,
+                }),
+            });
+        }
+        tracing::debug!("TLA-UNITDATA-Req-Al: sent {} segments for link {:?}", output.segment_count, key);
+    }
+
     fn rx_tla_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_prim");
         match &message.msg {
@@ -614,6 +731,12 @@ impl Llc {
             }
             SapMsgInner::TlaTlUnitdataReqBl(_) => {
                 self.rx_tla_tlunitdata_req_bl(queue, message);
+            }
+            SapMsgInner::TlaTlDataReqAl(_) => {
+                self.rx_tla_tldata_req_al(queue, message);
+            }
+            SapMsgInner::TlaTlUnitdataReqAl(_) => {
+                self.rx_tla_tlunitdata_req_al(queue, message);
             }
             _ => {
                 tracing::warn!("unhandled match variant, ignoring");
@@ -1290,7 +1413,7 @@ impl Llc {
             pending_reconnect_pdu: None,
             carrier_num,
             needs_deferred_ack: false,
-            last_reassembled_sdu: None,
+            pending_sdus: VecDeque::new(),
         });
         link.phase = AlPhase::Established;
         link.t_setup_start = None;
@@ -1400,7 +1523,7 @@ impl Llc {
         let ar_flag = matches!(pdu.variant, AlDataVariant::DataAr | AlDataVariant::FinalAr);
         let n_s = pdu.n_s;
 
-        let (ack_block_opt, carrier, addr, link_id, endpoint_id) = {
+        let (ack_block_opt, completed_sdu, carrier, addr, link_id, endpoint_id) = {
             let Some(link) = self.al_links.get_mut(&key) else {
                 tracing::warn!("on_al_data: link {:?} not found", key);
                 return;
@@ -1417,6 +1540,7 @@ impl Llc {
             let reassembler = link.reassemblers.entry(n_s).or_insert_with(|| Reassembler::new(n_s));
 
             let feed_result = reassembler.feed(&pdu);
+            let mut completed_sdu = None;
 
             let ack_block_opt: Option<AcknowledgementBlock> = match feed_result {
                 Ok(ReassemblerFeed::Complete { sdu }) => {
@@ -1424,7 +1548,7 @@ impl Llc {
                         "AL link {:?} N(S)={} reassembly complete ({} bytes)",
                         key, n_s, sdu.len()
                     );
-                    link.last_reassembled_sdu = Some(sdu);
+                    completed_sdu = Some(sdu);
                     link.reassemblers.remove(&n_s);
                     Some(AcknowledgementBlock {
                         n_r: n_s,
@@ -1474,8 +1598,35 @@ impl Llc {
                 }
             };
 
-            (ack_block_opt, link.carrier_num, link.main_address, key.link_id, key.endpoint_id)
+            (
+                ack_block_opt,
+                completed_sdu,
+                link.carrier_num,
+                link.main_address,
+                key.link_id,
+                key.endpoint_id,
+            )
         };
+
+        if let Some(sdu) = completed_sdu {
+            let bits = BitBuffer::from_vec(sdu);
+            queue.push_back(SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::TlaTlDataIndAl(TlaTlDataIndAl {
+                    main_address: addr,
+                    link_id,
+                    endpoint_id,
+                    al_link_number: key.n261,
+                    tl_sdu: bits,
+                    subscriber_class: 0,
+                    fcs_ok: true,
+                    air_interface_encryption: None,
+                }),
+            });
+            tracing::info!("TLA-DATA-Ind-Al on link {:?}", key);
+        }
 
         if let Some(block) = ack_block_opt {
             let ack_pdu = AlAckAlRnr {
@@ -1498,51 +1649,76 @@ impl Llc {
     /// ETSI TS 100 392-2 v3.10.1 clause 21.4.4.
     fn on_al_udata(&mut self, queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAlUdataAlUfinal) {
         let n_s = pdu.n_s;
-        let _ = queue; // No ACK for unack service.
+        let dltime = self.dltime;
 
-        let Some(link) = self.al_links.get_mut(&key) else {
-            tracing::warn!("on_al_udata: link {:?} not found", key);
-            return;
+        let (main_address, completed_sdu) = {
+            let Some(link) = self.al_links.get_mut(&key) else {
+                tracing::warn!("on_al_udata: link {:?} not found", key);
+                return;
+            };
+            if link.phase != AlPhase::Established {
+                tracing::warn!("on_al_udata: PDU in phase {:?}, dropping", link.phase);
+                return;
+            }
+
+            link.unack_started_at.entry(n_s).or_insert(dltime);
+
+            let reassembler =
+                link.unack_reassemblers.entry(n_s).or_insert_with(|| UnackReassembler::new(n_s));
+
+            let result = reassembler.feed(&pdu);
+
+            let completed = match result {
+                Ok(UnackReassemblerFeed::Complete { sdu }) => {
+                    tracing::info!(
+                        "AL link {:?} N(S)={} unack reassembly complete ({} bytes)",
+                        key, n_s, sdu.len()
+                    );
+                    link.unack_reassemblers.remove(&n_s);
+                    link.unack_started_at.remove(&n_s);
+                    Some(sdu)
+                }
+                Ok(UnackReassemblerFeed::FcsFailure { .. }) => {
+                    tracing::warn!("AL link {:?} N(S)={} unack FCS failure, discarding", key, n_s);
+                    link.unack_reassemblers.remove(&n_s);
+                    link.unack_started_at.remove(&n_s);
+                    None
+                }
+                Ok(UnackReassemblerFeed::NeedMore { .. }) => None,
+                Ok(UnackReassemblerFeed::Discarded { .. }) => {
+                    link.unack_reassemblers.remove(&n_s);
+                    link.unack_started_at.remove(&n_s);
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("on_al_udata: reassembler error {:?}, dropping", e);
+                    link.unack_reassemblers.remove(&n_s);
+                    link.unack_started_at.remove(&n_s);
+                    None
+                }
+            };
+
+            (link.main_address, completed)
         };
-        if link.phase != AlPhase::Established {
-            tracing::warn!("on_al_udata: PDU in phase {:?}, dropping", link.phase);
-            return;
-        }
 
-        // Record start time for the T.271 SDU timeout.
-        link.unack_started_at.entry(n_s).or_insert(self.dltime);
-
-        let reassembler =
-            link.unack_reassemblers.entry(n_s).or_insert_with(|| UnackReassembler::new(n_s));
-
-        match reassembler.feed(&pdu) {
-            Ok(UnackReassemblerFeed::Complete { sdu }) => {
-                tracing::info!(
-                    "AL link {:?} N(S)={} unack reassembly complete ({} bytes)",
-                    key, n_s, sdu.len()
-                );
-                link.last_reassembled_sdu = Some(sdu);
-                link.unack_reassemblers.remove(&n_s);
-                link.unack_started_at.remove(&n_s);
-            }
-            Ok(UnackReassemblerFeed::FcsFailure { .. }) => {
-                tracing::warn!("AL link {:?} N(S)={} unack FCS failure, discarding", key, n_s);
-                link.unack_reassemblers.remove(&n_s);
-                link.unack_started_at.remove(&n_s);
-            }
-            Ok(UnackReassemblerFeed::NeedMore { .. }) => {
-                // Continue accumulating segments.
-            }
-            Ok(UnackReassemblerFeed::Discarded { .. }) => {
-                // Already discarded by timeout; ignore stale segment.
-                link.unack_reassemblers.remove(&n_s);
-                link.unack_started_at.remove(&n_s);
-            }
-            Err(e) => {
-                tracing::warn!("on_al_udata: reassembler error {:?}, dropping", e);
-                link.unack_reassemblers.remove(&n_s);
-                link.unack_started_at.remove(&n_s);
-            }
+        if let Some(sdu) = completed_sdu {
+            let bits = BitBuffer::from_vec(sdu);
+            queue.push_back(SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::TlaTlUnitdataIndAl(TlaTlUnitdataIndAl {
+                    main_address,
+                    link_id: key.link_id,
+                    endpoint_id: key.endpoint_id,
+                    al_link_number: key.n261,
+                    tl_sdu: bits,
+                    subscriber_class: 0,
+                    fcs_ok: true,
+                    air_interface_encryption: None,
+                }),
+            });
+            tracing::info!("TLA-UNITDATA-Ind-Al on link {:?}", key);
         }
     }
 
@@ -1699,7 +1875,7 @@ impl Llc {
                         pending_reconnect_pdu: None,
                         carrier_num,
                         needs_deferred_ack: false,
-                        last_reassembled_sdu: None,
+                        pending_sdus: VecDeque::new(),
                     });
                 }
                 let msg = Self::make_al_sap_msg_reconnect(
@@ -1990,6 +2166,31 @@ impl Llc {
             self.al_links.remove(&key);
         }
 
+        let pending_to_send: Vec<(AlLinkKey, Vec<u8>)> = {
+            let mut to_send = Vec::new();
+            for (key, link) in self.al_links.iter_mut() {
+                if link.phase == AlPhase::Established {
+                    while link.outstanding_sdus.len() < link.tx_window as usize {
+                        if let Some(sdu) = link.pending_sdus.pop_front() {
+                            to_send.push((*key, sdu));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            to_send
+        };
+        for (key, sdu) in pending_to_send {
+            if let Err(e) = self.enqueue_al_sdu(queue, key, sdu) {
+                tracing::warn!(
+                    "submit_al_activity_to_umac: failed to flush pending SDU on link {:?}: {:?}",
+                    key,
+                    e
+                );
+            }
+        }
+
         let had = !msgs.is_empty();
         for msg in msgs {
             queue.push_back(msg);
@@ -2098,36 +2299,31 @@ impl Llc {
             }),
         }
     }
-}
 
-// ─── Test-only TX entry point ─────────────────────────────────────────────────
-impl Llc {
     /// Segment `sdu` and enqueue all resulting PDUs onto `queue` for the
-    /// specified `link`.  This is the **temporary** test-only TX path until
-    /// AL-4 introduces `TlaTlDataReqAl`.
+    /// specified `link`. When the TX window is full, the SDU is buffered in
+    /// `AlLink::pending_sdus` for later dispatch.
     ///
-    /// Returns `Err` without any side-effects if preconditions are violated.
-    ///
-    /// # Note
-    /// This method exists for test-only use during AL-3 development.
-    /// AL-4 will wire the proper `TlaTlDataReqAl` SAP handler and this method
-    /// should be removed at that point.
-    pub fn test_send_al_sdu(
+    /// Returns `Err` (without side-effects) only for hard failures (unknown link,
+    /// wrong phase, SDU too large, segmentation error).
+    pub(super) fn enqueue_al_sdu(
         &mut self,
         queue: &mut MessageQueue,
-        link_key: AlLinkKey,
+        key: AlLinkKey,
         sdu: Vec<u8>,
     ) -> Result<(), AlError> {
-        let link = self.al_links.get_mut(&link_key).ok_or(AlError::UnknownLink(link_key))?;
+        let link = self.al_links.get_mut(&key).ok_or(AlError::UnknownLink(key))?;
 
         if link.phase != AlPhase::Established && link.phase != AlPhase::FlowControlled {
             return Err(AlError::NotEstablished);
         }
-        if link.outstanding_sdus.len() >= link.tx_window as usize {
-            return Err(AlError::WindowFull);
-        }
         if sdu.len() > link.max_tl_sdu_octets as usize {
             return Err(AlError::SduTooLarge { got: sdu.len(), max: link.max_tl_sdu_octets });
+        }
+
+        if link.outstanding_sdus.len() >= link.tx_window as usize {
+            link.pending_sdus.push_back(sdu);
+            return Ok(());
         }
 
         let n_s = link.next_n_s;
@@ -2150,22 +2346,18 @@ impl Llc {
         let seg_count = output.pdus.len();
         let acked_segments = vec![false; seg_count];
 
-        // Advance N(S) wrapping mod (tx_window + 1).
-        let link = self.al_links.get_mut(&link_key).unwrap();
+        let link = self.al_links.get_mut(&key).ok_or(AlError::UnknownLink(key))?;
         link.next_n_s = (n_s + 1) % (tx_window + 1);
         link.outstanding_sdus.push_back(OutstandingSdu {
             n_s,
             pdus: output.pdus.clone(),
-            sent_at: None, // will be set on first submission in tick_end
+            sent_at: None,
             acked_segments,
             retx_count: 0,
             force_retx: false,
         });
 
-        // Only push PDUs to UMAC immediately when the link is Established.
-        // When FlowControlled, the SDU is buffered with sent_at=None and
-        // tick_end will dispatch it once flow control clears.
-        let link = self.al_links.get(&link_key).ok_or(AlError::UnknownLink(link_key))?;
+        let link = self.al_links.get(&key).ok_or(AlError::UnknownLink(key))?;
         let is_established = link.phase == AlPhase::Established;
         if is_established {
             for pdu in &output.pdus {
@@ -2194,13 +2386,11 @@ impl Llc {
                 });
             }
 
-            // Mark SDU as sent now.
             let dltime = self.dltime;
-            if let Some(sdu) = self.al_links.get_mut(&link_key).and_then(|l| l.outstanding_sdus.back_mut()) {
-                sdu.sent_at = Some(dltime);
+            if let Some(sdu_entry) = self.al_links.get_mut(&key).and_then(|l| l.outstanding_sdus.back_mut()) {
+                sdu_entry.sent_at = Some(dltime);
             }
         }
-        // When FlowControlled: sent_at remains None; tick_end submits on unfreeze.
 
         Ok(())
     }
