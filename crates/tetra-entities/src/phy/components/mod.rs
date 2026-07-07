@@ -10,8 +10,10 @@ pub mod modem_common;
 pub mod modulator;
 pub mod soapy_settings;
 pub mod soapy_time;
+#[cfg(feature = "sdr")]
 pub mod soapyio;
 
+#[cfg(feature = "sdr")]
 pub mod soapy_dev;
 // pub mod _rxtxdev_buffer;
 

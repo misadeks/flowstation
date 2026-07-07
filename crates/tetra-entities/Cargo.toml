@@ -7,8 +7,16 @@ edition.workspace = true
 # Default build excludes the Asterisk SIP/RTP bridge so it needs no native
 # libtetra-codec. Enable with `--features asterisk` to compile net_asterisk and
 # link the TETRA codec.
-default = []
+# `sdr` is enabled by default so normal builds (e.g. bluestation-bs) behave as
+# before. Pass `--no-default-features` when building/testing on machines
+# without the SoapySDR C library installed (e.g. CI or dev workstations that
+# lack PothosSDR).
+default = ["sdr"]
 asterisk = []
+# Enable SoapySDR / PothosSDR hardware radio support. Enabled by default;
+# opt out with `--no-default-features` on systems without the SoapySDR C
+# library installed.
+sdr = ["dep:soapysdr"]
 
 [dependencies]
 tetra-core = { workspace = true }
@@ -22,7 +30,7 @@ rustfft = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
-soapysdr = { workspace = true }
+soapysdr = { workspace = true, optional = true }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
