@@ -528,6 +528,51 @@ voice_service = true
 
 ###############################################################################
 
+# OPTIONAL: Advanced Link (AL) LLC state machine knobs (FlowStation)
+#
+# Controls the runtime parameters of the TETRA Advanced Link data service
+# (ETSI TS 100 392-2 v3.10.1 annex A.2, constants N.262 – N.274).
+# All defaults match AL-3's prior hardcoded values — omitting this whole section
+# produces exactly the same behaviour as an older FlowStation build.
+#
+# Only touch these if you need to tune AL behaviour for a specific radio fleet
+# or network environment.
+#
+# [llc.advanced_link]
+# # Octets available for the TL-SDU segment payload inside each AL-DATA/AL-FINAL
+# # PDU (excluding LLC header + FCS).  400 bits / 8 = 50 octets matches one
+# # standard MAC block minus header overhead.  Range: 1..=512.
+# segment_payload_octets = 50
+#
+# # TX window size N.272.  How many TL-SDUs can be outstanding (unacknowledged)
+# # simultaneously.  Original AL supports 1..=3.
+# tx_window = 3
+#
+# # Maximum TL-SDU retransmissions N.273 (3-bit spec field).  Range: 0..=7.
+# max_sdu_retx = 3
+#
+# # Maximum per-segment retransmissions N.274 (4-bit spec field).  Range: 0..=15.
+# max_segment_retx = 3
+#
+# # Maximum AL-SETUP retries N.262 before the link returns to Idle.
+# # Spec range: 1..=5.
+# max_setup_retries = 3
+#
+# # Maximum AL-DISC retries N.263 before the link is forcibly removed.
+# # Spec range: 3..=5.
+# max_disc_retries = 3
+#
+# # Maximum AL-RECONNECT retries N.265 before the link returns to Idle.
+# # Spec range: 0..=5.
+# max_reconnect_retries = 3
+#
+# # Maximum TL-SDU length N.271 in octets.  Used for reconnect-fallback links
+# # (those created without a prior AL-SETUP exchange, e.g. after a BS restart).
+# # Must be one of the N.271 power-of-two values: 32|64|128|256|512|1024|2048|4096.
+# max_tl_sdu_octets = 4096
+
+###############################################################################
+
 # OPTIONAL: Web dashboard — accessible at http://<BTS-IP>:8080 (FlowStation)
 #
 # Live view of terminals, active calls, log, config editor, kick and SDS.

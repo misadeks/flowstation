@@ -645,3 +645,85 @@ fn al_data_req_via_sap_completes_full_tx_cycle() {
     let link = llc.al_links.get(&test_key()).unwrap();
     assert_eq!(link.outstanding_sdus.len(), 0, "ACK must advance the TX window");
 }
+
+/// AL-5: The LLC state machine must honour a non-default `tx_window` from
+/// `AdvancedLinkConfig`.
+///
+/// Strategy: create a link via the reconnect-fallback path (no prior SETUP PDU),
+/// which uses config defaults for all negotiated parameters including `tx_window`.
+/// With `tx_window = 2`, the window fills after exactly 2 outstanding SDUs, and a
+/// third TLA-DATA-Req-Al goes to `pending_sdus`.  With `tx_window = 3` the same
+/// two sends leave room for one more.
+#[test]
+fn al_tx_window_config_respected() {
+    debug::setup_logging_verbose();
+
+    // -- Build Llc with tx_window = 2 -----------------------------------------
+    let mut cfg_w2 = ComponentTest::get_default_test_config(StackMode::Bs);
+    cfg_w2.llc.advanced_link.tx_window = 2;
+    let sc_w2 = tetra_config::bluestation::SharedConfig::from_parts(cfg_w2, None);
+    let mut llc_w2 = Llc::new(sc_w2);
+    let mut q_w2 = MessageQueue::new();
+
+    // -- Build Llc with default tx_window = 3 ---------------------------------
+    let (mut llc_w3, mut q_w3) = make_llc();
+
+    // -- Trigger reconnect-fallback to create a link using config defaults -----
+    //
+    // When AL-RECONNECT Propose arrives for an unknown link, the LLC creates a
+    // minimal AlLink using the config defaults (reconnect-fallback path).
+    let reconnect = AlReconnect {
+        advanced_link_service: AdvancedLinkService::Ack,
+        advanced_link_number_n261: N261,
+        reconnect_report: ReconnectReport::Propose,
+    };
+    let mut buf = BitBuffer::new_autoexpand(16);
+    reconnect.to_bitbuf(&mut buf);
+    buf.seek(0);
+
+    // Feed reconnect to both LLCs (one_tick = tick_start + rx_prim + tick_end).
+    let reconnect_msg_w2 = make_tma_ind(buf.clone());
+    one_tick(&mut llc_w2, &mut q_w2, TdmaTime::default(), reconnect_msg_w2);
+    drain_queue(&mut q_w2);
+
+    buf.seek(0);
+    let reconnect_msg_w3 = make_tma_ind(buf);
+    one_tick(&mut llc_w3, &mut q_w3, TdmaTime::default(), reconnect_msg_w3);
+    drain_queue(&mut q_w3);
+
+    // Verify link tx_window was set from config.
+    let key = test_key();
+    assert_eq!(llc_w2.al_links.get(&key).expect("w2 link").tx_window, 2);
+    assert_eq!(llc_w3.al_links.get(&key).expect("w3 link").tx_window, 3);
+
+    // -- Enqueue SDUs via TLA-DATA-Req-Al (public SAP interface) --------------
+    //
+    // Perform tick_start once, then rx_prim multiple times without tick_end so
+    // that submit_al_activity_to_umac does not flush pending SDUs between sends.
+    let ts = TdmaTime::default();
+    let sdu = b"AL-5 test payload".to_vec();
+
+    llc_w2.tick_start(&mut q_w2, ts);
+    llc_w2.rx_prim(&mut q_w2, make_tla_data_req_al_sap(sdu.clone()));  // SDU 1
+    llc_w2.rx_prim(&mut q_w2, make_tla_data_req_al_sap(sdu.clone()));  // SDU 2
+    // After 2 enqueues the window (size=2) is full; a 3rd goes to pending.
+    llc_w2.rx_prim(&mut q_w2, make_tla_data_req_al_sap(sdu.clone()));  // SDU 3
+
+    {
+        let link = llc_w2.al_links.get(&key).unwrap();
+        assert_eq!(link.outstanding_sdus.len(), 2, "w2: exactly 2 outstanding (= tx_window)");
+        assert_eq!(link.pending_sdus.len(), 1,     "w2: 3rd SDU buffered in pending");
+    }
+
+    llc_w3.tick_start(&mut q_w3, ts);
+    llc_w3.rx_prim(&mut q_w3, make_tla_data_req_al_sap(sdu.clone()));  // SDU 1
+    llc_w3.rx_prim(&mut q_w3, make_tla_data_req_al_sap(sdu.clone()));  // SDU 2
+    // With tx_window=3 there is still room; 3rd SDU goes directly to outstanding.
+    llc_w3.rx_prim(&mut q_w3, make_tla_data_req_al_sap(sdu.clone()));  // SDU 3
+
+    {
+        let link = llc_w3.al_links.get(&key).unwrap();
+        assert_eq!(link.outstanding_sdus.len(), 3, "w3: 3 outstanding (window not full)");
+        assert_eq!(link.pending_sdus.len(), 0,     "w3: nothing buffered");
+    }
+}

@@ -9,6 +9,7 @@ use crate::bluestation::{
 
 use super::sec_brew::CfgBrew;
 use super::sec_dashboard::CfgDashboard;
+use super::sec_llc::CfgLlc;
 use super::sec_telegram::CfgTelegram;
 use super::sec_telemetry::CfgTelemetry;
 
@@ -118,6 +119,10 @@ pub struct StackConfig {
     /// Emergency-state handling. Always present (defaults: LOCAL-only — no Brew forward,
     /// telegram_alert ON, clear_timeout_secs 30). See [`CfgEmergency`].
     pub emergency: CfgEmergency,
+
+    /// LLC runtime knobs — AL state machine configuration.  Always present;
+    /// defaults match AL-3's prior hardcoded values.
+    pub llc: CfgLlc,
 }
 
 impl StackConfig {

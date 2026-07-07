@@ -27,10 +27,6 @@ use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::llc::al::error::SegmentationError;
 use tetra_pdus::llc::al::reassembler::{Reassembler, ReassemblerFeed, UnackReassembler, UnackReassemblerFeed};
 use tetra_pdus::llc::al::segmenter::{SegmenterConfig, UnackSegmenterConfig, segment_sdu, segment_unack_sdu};
-use tetra_pdus::llc::consts::consts::{
-    N262_AL_MAX_CONNECTION_SETUP_RETRIES, N263_AL_MAX_DISCONNECTION_RETRIES,
-    N265_AL_MAX_RECONNECTION_RETRIES, N273_AL_MAX_TLSDU_RETRANSMISSIONS,
-};
 use tetra_pdus::llc::consts::timers::{
     T261_SETUP_WAITING_TIMER, T263_DISCONNECT_WAITING_TIMER, T265_RECONNECT_WAITING_TIMER,
     T271_RECEIVER_NOT_READY_FOR_TX_TIMER, T272_RECEIVER_NOT_READY_FOR_RX_TIMER,
@@ -250,6 +246,7 @@ pub struct Llc {
 
 impl Llc {
     pub fn new(config: SharedConfig) -> Self {
+        let seg_payload_bits = config.config().llc.advanced_link.segment_payload_octets as usize * 8;
         Self {
             dltime: TdmaTime::default(),
             config,
@@ -258,7 +255,7 @@ impl Llc {
             outbound_udata_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
             al_links: HashMap::new(),
-            al_segment_payload_bits: 400,
+            al_segment_payload_bits: seg_payload_bits,
         }
     }
 
@@ -1849,16 +1846,21 @@ impl Llc {
                     link.phase = AlPhase::Established;
                     link.carrier_num = carrier_num;
                 } else {
-                    // Create a minimal link on reconnect if none exists.
+                    // Create a minimal link on reconnect if none exists (e.g. BS restarted).
+                    // Use config defaults for negotiated parameters since no SETUP PDU was seen.
+                    let al_cfg = {
+                        let cfg = self.config.config();
+                        cfg.llc.advanced_link.clone()
+                    };
                     self.al_links.insert(key, AlLink {
                         key,
                         main_address,
                         phase: AlPhase::Established,
                         service: pdu.advanced_link_service,
-                        max_tl_sdu_octets: 256,
-                        tx_window: 3,
-                        max_sdu_retx: N273_AL_MAX_TLSDU_RETRANSMISSIONS as u8,
-                        max_segment_retx: 3,
+                        max_tl_sdu_octets: al_cfg.max_tl_sdu_octets,
+                        tx_window: al_cfg.tx_window,
+                        max_sdu_retx: al_cfg.max_sdu_retx,
+                        max_segment_retx: al_cfg.max_segment_retx,
                         next_n_s: 0,
                         outstanding_sdus: VecDeque::new(),
                         reassemblers: HashMap::new(),
@@ -1914,6 +1916,13 @@ impl Llc {
     /// T.263/T.265/T.271/T.272.
     fn submit_al_activity_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
         let dltime = self.dltime;
+        // Extract config-driven retry limits before the loop to avoid borrow conflicts
+        // with the mutable borrow of self.al_links inside the loop.
+        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect) = {
+            let cfg = self.config.config();
+            let al = &cfg.llc.advanced_link;
+            (al.max_setup_retries, al.max_disc_retries, al.max_reconnect_retries)
+        };
         let mut msgs: Vec<SapMsg> = Vec::new();
         let mut links_to_set_idle: Vec<AlLinkKey> = Vec::new();
         let mut links_to_remove: Vec<AlLinkKey> = Vec::new();
@@ -1944,7 +1953,9 @@ impl Llc {
                     };
                     let has_unacked = sdu.acked_segments.iter().any(|&a| !a);
                     if needs_retx && has_unacked {
-                        if sdu.retx_count as u32 >= N273_AL_MAX_TLSDU_RETRANSMISSIONS {
+                        // Use the link's per-negotiated max_sdu_retx (from SETUP PDU or config
+                        // default for reconnect-fallback links) rather than the global constant.
+                        if sdu.retx_count >= link.max_sdu_retx {
                             tracing::warn!(
                                 "AL link {:?} N(S)={} exhausted retransmissions, dropping SDU",
                                 key, sdu.n_s
@@ -2069,7 +2080,7 @@ impl Llc {
             if link.phase == AlPhase::SetupPending {
                 if let Some(t_start) = link.t_setup_start {
                     if dltime.diff(t_start) as u64 >= T261_SETUP_WAITING_TIMER as u64 {
-                        if (link.setup_retries as u32) < N262_AL_MAX_CONNECTION_SETUP_RETRIES {
+                        if (link.setup_retries as u32) < cfg_max_setup as u32 {
                             link.setup_retries += 1;
                             link.t_setup_start = Some(dltime);
                             if let Some(setup_pdu) = link.pending_setup_pdu.clone() {
@@ -2100,7 +2111,7 @@ impl Llc {
             if link.phase == AlPhase::DisconnectPending {
                 if let Some(t_start) = link.t_disc_start {
                     if dltime.diff(t_start) as u64 >= T263_DISCONNECT_WAITING_TIMER as u64 {
-                        if (link.disc_retries as u32) < N263_AL_MAX_DISCONNECTION_RETRIES {
+                        if (link.disc_retries as u32) < cfg_max_disc as u32 {
                             link.disc_retries += 1;
                             link.t_disc_start = Some(dltime);
                             let disc_pdu = AlDisc {
@@ -2130,7 +2141,7 @@ impl Llc {
             if link.phase == AlPhase::ReconnectPending {
                 if let Some(t_start) = link.t_reconnect_start {
                     if dltime.diff(t_start) as u64 >= T265_RECONNECT_WAITING_TIMER as u64 {
-                        if (link.reconnect_retries as u32) < N265_AL_MAX_RECONNECTION_RETRIES {
+                        if (link.reconnect_retries as u32) < cfg_max_reconnect as u32 {
                             link.reconnect_retries += 1;
                             link.t_reconnect_start = Some(dltime);
                             if let Some(pdu) = link.pending_reconnect_pdu.clone() {
