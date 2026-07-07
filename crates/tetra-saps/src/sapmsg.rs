@@ -67,6 +67,10 @@ pub enum SapMsgInner {
     TlaTlReportInd(TlaTlReportInd),
     TlaTlUnitdataIndBl(TlaTlUnitdataIndBl),
     TlaTlUnitdataReqBl(TlaTlUnitdataReqBl),
+    TlaTlDataIndAl(TlaTlDataIndAl),
+    TlaTlDataReqAl(TlaTlDataReqAl),
+    TlaTlUnitdataIndAl(TlaTlUnitdataIndAl),
+    TlaTlUnitdataReqAl(TlaTlUnitdataReqAl),
 
     // LMM-SAP (MLE-MM)
     LmmMleUnitdataInd(LmmMleUnitdataInd),
@@ -196,6 +200,10 @@ impl Display for SapMsgInner {
             SapMsgInner::TlaTlReportInd(_) => write!(f, "TlaTlReportInd"),
             SapMsgInner::TlaTlUnitdataIndBl(_) => write!(f, "TlaTlUnitdataIndBl"),
             SapMsgInner::TlaTlUnitdataReqBl(_) => write!(f, "TlaTlUnitdataReqBl"),
+            SapMsgInner::TlaTlDataIndAl(_) => write!(f, "TlaTlDataIndAl"),
+            SapMsgInner::TlaTlDataReqAl(_) => write!(f, "TlaTlDataReqAl"),
+            SapMsgInner::TlaTlUnitdataIndAl(_) => write!(f, "TlaTlUnitdataIndAl"),
+            SapMsgInner::TlaTlUnitdataReqAl(_) => write!(f, "TlaTlUnitdataReqAl"),
             SapMsgInner::LmmMleUnitdataInd(_) => write!(f, "LmmMleUnitdataInd"),
             SapMsgInner::LmmMleUnitdataReq(_) => write!(f, "LmmMleUnitdataReq"),
             SapMsgInner::LcmcMleUnitdataInd(_) => write!(f, "LcmcMleUnitdataInd"),

@@ -2,7 +2,7 @@
 ///
 /// Tests the AL-3 state machine implemented in `llc_bs_ms.rs`.
 /// All tests instantiate `Llc` directly (without ComponentTest) so they can
-/// inspect internal state (`al_links`, `last_reassembled_sdu`, …) alongside
+/// inspect internal state (`al_links`, outstanding windows, …) alongside
 /// the outbound message queue.
 ///
 /// Pattern:
@@ -17,7 +17,7 @@ use common::ComponentTest;
 use tetra_config::bluestation::StackMode;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_entities::llc::llc_bs_ms::{AlError, AlLinkKey, AlPhase, Llc};
+use tetra_entities::llc::llc_bs_ms::{AlLinkKey, AlPhase, Llc};
 use tetra_entities::{MessageQueue, TetraEntityTrait};
 use tetra_pdus::llc::al::segmenter::{SegmenterConfig, segment_sdu};
 use tetra_pdus::llc::consts::timers::{T261_SETUP_WAITING_TIMER, T272_RECEIVER_NOT_READY_FOR_RX_TIMER};
@@ -33,6 +33,7 @@ use tetra_pdus::llc::pdus::al_reconnect::AlReconnect;
 use tetra_pdus::llc::enums::reconnect_report::ReconnectReport;
 use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tla::{TlaTlDataIndAl, TlaTlDataReqAl};
 use tetra_saps::tma::TmaUnitdataInd;
 
 const CARRIER: u16 = 1521;
@@ -122,6 +123,37 @@ fn drain_queue(queue: &mut MessageQueue) -> Vec<SapMsg> {
     msgs
 }
 
+/// Drain the queue and return the first `TlaTlDataIndAl` message found, if any.
+fn take_data_ind_al(queue: &mut MessageQueue) -> Option<TlaTlDataIndAl> {
+    while let Some(msg) = queue.pop_front() {
+        if let SapMsgInner::TlaTlDataIndAl(ind) = msg.msg {
+            return Some(ind);
+        }
+    }
+    None
+}
+
+/// Build a TLA-DATA-Req-Al SapMsg for the test address.
+fn make_tla_data_req_al_sap(sdu: Vec<u8>) -> SapMsg {
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlDataReqAl(TlaTlDataReqAl {
+            main_address: test_addr(),
+            link_id: LINK_ID,
+            endpoint_id: ENDPOINT_ID,
+            al_link_number: N261,
+            tl_sdu: BitBuffer::from_vec(sdu),
+            subscriber_class: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            req_handle: 0,
+            tx_reporter: None,
+        }),
+    }
+}
+
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 /// Feed an AL-SETUP to `llc` and return the output messages.
@@ -191,8 +223,9 @@ fn al_disc_from_peer_removes_link() {
     assert!(matches!(msgs[0].msg, SapMsgInner::TmaUnitdataReq(_)));
 }
 
-/// Single-PDU SDU (AL-FINAL-AR): reassembly must complete and an AL-ACK
-/// with `EntireSduReceived` must be enqueued.
+/// Single-PDU SDU (AL-FINAL-AR): reassembly must complete, a
+/// `TlaTlDataIndAl` must be emitted, and an AL-ACK with
+/// `EntireSduReceived` must be enqueued.
 #[test]
 fn al_data_single_pdu_sdu_acked() {
     debug::setup_logging_verbose();
@@ -218,15 +251,10 @@ fn al_data_single_pdu_sdu_acked() {
     buf.seek(0);
     one_tick(&mut llc, &mut queue, TdmaTime::default(), make_tma_ind(buf));
     let _ = pdu_len; // used to confirm non-zero length
+    let ind = take_data_ind_al(&mut queue).expect("TlaTlDataIndAl must be in queue");
+    assert_eq!(ind.tl_sdu.into_bytes(), sdu, "reassembled SDU must match original");
+    assert!(ind.fcs_ok, "fcs_ok must be true");
     let msgs = drain_queue(&mut queue);
-
-    // SDU must be reassembled.
-    let link = llc.al_links.get(&test_key()).expect("link must still exist");
-    assert_eq!(
-        link.last_reassembled_sdu.as_deref(),
-        Some(sdu.as_slice()),
-        "reassembled SDU must match original"
-    );
 
     // One AL-ACK must be emitted.
     assert_eq!(msgs.len(), 1, "expected exactly one AL-ACK");
@@ -250,8 +278,8 @@ fn al_data_single_pdu_sdu_acked() {
 }
 
 /// Multi-PDU reassembly: 3 AL-DATA/FINAL segments fed in order.
-/// After the last (AL-FINAL-AR) the complete SDU must be in
-/// `last_reassembled_sdu` and an AL-ACK must be emitted.
+/// After the last (AL-FINAL-AR) the complete SDU must be delivered to TLA and
+/// an AL-ACK must be emitted.
 #[test]
 fn al_data_multi_pdu_sdu_reassembles_and_acks() {
     debug::setup_logging_verbose();
@@ -282,13 +310,17 @@ fn al_data_multi_pdu_sdu_reassembles_and_acks() {
         all_msgs.extend(drain_queue(&mut queue));
     }
 
-    // SDU must be reassembled.
-    let link = llc.al_links.get(&test_key()).expect("link exists");
-    assert_eq!(
-        link.last_reassembled_sdu.as_deref(),
-        Some(sdu.as_slice()),
-        "reassembled SDU must match original"
-    );
+    let ind_al = all_msgs
+        .iter()
+        .find_map(|m| {
+            if let SapMsgInner::TlaTlDataIndAl(ref ind) = m.msg {
+                Some(ind.clone())
+            } else {
+                None
+            }
+        })
+        .expect("TlaTlDataIndAl must be delivered after reassembly");
+    assert_eq!(ind_al.tl_sdu.into_bytes(), sdu, "reassembled SDU must match original");
 
     // At least one AL-ACK emitted (the final segment triggers it).
     let acks: Vec<_> = all_msgs
@@ -353,7 +385,7 @@ fn al_data_fcs_corruption_generates_repeat_ack() {
         "ACK length must be SduFcsFailure on FCS error");
 }
 
-/// TX window: `test_send_al_sdu` puts an SDU in flight.
+/// TX window: a TLA-DATA-Req-Al puts an SDU in flight.
 /// Feeding an incoming AL-ACK with `EntireSduReceived` must shrink the window.
 #[test]
 fn al_ack_from_peer_advances_window() {
@@ -361,9 +393,9 @@ fn al_ack_from_peer_advances_window() {
     let (mut llc, mut queue) = make_llc();
     establish_link(&mut llc, &mut queue);
 
-    // Send one SDU via the test helper.
+    // Send one SDU via the real SAP.
     let sdu = b"window test".to_vec();
-    llc.test_send_al_sdu(&mut queue, test_key(), sdu).expect("send must succeed");
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(sdu));
 
     // Window has one outstanding SDU.
     {
@@ -393,8 +425,8 @@ fn al_ack_from_peer_advances_window() {
     assert_eq!(link.outstanding_sdus.len(), 0, "ACK must remove the SDU from the window");
 }
 
-/// AL-RNR freezes TX: after receiving AL-RNR, any new `test_send_al_sdu`
-/// succeeds (the SDU is buffered) but no NEW PDUs are submitted to UMAC
+/// AL-RNR freezes TX: after receiving AL-RNR, any new TLA-DATA-Req-Al
+/// succeeds but no NEW PDUs are submitted to UMAC
 /// in `tick_end` until T.272 expires.
 #[test]
 fn al_rnr_from_peer_freezes_tx() {
@@ -403,7 +435,7 @@ fn al_rnr_from_peer_freezes_tx() {
     establish_link(&mut llc, &mut queue);
 
     // Send first SDU; drain the initial PDUs.
-    llc.test_send_al_sdu(&mut queue, test_key(), b"first sdu".to_vec()).expect("ok");
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"first sdu".to_vec()));
     drain_queue(&mut queue);
 
     // Feed an AL-RNR (ACK + RNR flag).
@@ -431,8 +463,7 @@ fn al_rnr_from_peer_freezes_tx() {
     );
 
     // Send a second SDU (buffered, not yet sent).
-    llc.test_send_al_sdu(&mut queue, test_key(), b"second sdu".to_vec()).expect("ok");
-    // Buffer should have 1 outstanding SDU (first was acked in RNR, second is new).
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"second sdu".to_vec()));
     {
         let link = llc.al_links.get(&test_key()).unwrap();
         assert_eq!(link.outstanding_sdus.len(), 1, "one SDU should be outstanding");
@@ -535,9 +566,9 @@ fn al_reconnect_propose_from_peer_accepted() {
     assert!(matches!(msgs[0].msg, SapMsgInner::TmaUnitdataReq(_)));
 }
 
-/// Sending an SDU when the window is full must return `AlError::WindowFull`.
+/// Sending an SDU when the window is full must buffer it in `pending_sdus`.
 #[test]
-fn test_send_al_sdu_window_full_returns_error() {
+fn al_sdu_window_full_buffers_in_pending() {
     debug::setup_logging_verbose();
     let (mut llc, mut queue) = make_llc();
     establish_link(&mut llc, &mut queue);
@@ -545,23 +576,72 @@ fn test_send_al_sdu_window_full_returns_error() {
 
     // Flood the window (tx_window = 3).
     for i in 0..3u8 {
-        let sdu = vec![i; 10];
-        llc.test_send_al_sdu(&mut queue, test_key(), sdu)
-            .unwrap_or_else(|e| panic!("SDU {} should fit in window: {:?}", i, e));
+        llc.rx_prim(&mut queue, make_tla_data_req_al_sap(vec![i; 10]));
         drain_queue(&mut queue);
     }
 
-    // Fourth SDU must fail with WindowFull.
-    let err = llc.test_send_al_sdu(&mut queue, test_key(), b"overflow".to_vec());
-    assert_eq!(err, Err(AlError::WindowFull), "fourth SDU must overflow the window");
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.outstanding_sdus.len(), 3, "window must be full with 3 SDUs");
+
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"overflow".to_vec()));
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.pending_sdus.len(), 1, "fourth SDU must be buffered in pending_sdus");
+    assert_eq!(link.outstanding_sdus.len(), 3, "window must still have 3 SDUs");
 }
 
-/// Sending an SDU to a non-Established link returns `AlError::NotEstablished`.
+/// Sending an SDU to an unknown AL link through the SAP must be a silent drop.
 #[test]
-fn test_send_al_sdu_not_established_returns_error() {
+fn al_sdu_for_unknown_link_is_silently_dropped() {
     debug::setup_logging_verbose();
     let (mut llc, mut queue) = make_llc();
-    // No setup → link does not exist.
-    let err = llc.test_send_al_sdu(&mut queue, test_key(), b"no link".to_vec());
-    assert_eq!(err, Err(AlError::UnknownLink(test_key())));
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"no link".to_vec()));
+    let msgs = drain_queue(&mut queue);
+    assert!(msgs.is_empty(), "SAP request for unknown link must produce no output");
+    assert!(llc.al_links.is_empty(), "no link should have been created");
+}
+
+/// Smoke test: SDU enters via TLA-DATA-Req-Al, AL-DATA/FINAL-AR PDUs appear on
+/// TmaSap outbound, a synthetic peer AL-ACK is fed back, and the window advances.
+#[test]
+fn al_data_req_via_sap_completes_full_tx_cycle() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"full cycle sdu".to_vec()));
+
+    llc.tick_start(&mut queue, TdmaTime::default());
+    llc.tick_end(&mut queue, TdmaTime::default());
+    let msgs = drain_queue(&mut queue);
+
+    let umac_pdus: Vec<_> = msgs
+        .iter()
+        .filter(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_)))
+        .collect();
+    assert!(!umac_pdus.is_empty(), "AL-DATA PDUs must reach UMAC after SAP request");
+
+    {
+        let link = llc.al_links.get(&test_key()).unwrap();
+        assert_eq!(link.outstanding_sdus.len(), 1, "one SDU must be in the TX window");
+        assert_eq!(link.outstanding_sdus[0].n_s, 0, "first SDU must have N(S)=0");
+    }
+
+    let ack_pdu = AlAckAlRnr {
+        kind: AlAckAlRnrKind::Ack,
+        first_block: AcknowledgementBlock {
+            n_r: 0,
+            ack_length: AckLength::EntireSduReceived,
+            s_r: None,
+            ack_bitmap: None,
+        },
+        other_blocks: vec![],
+    };
+    let mut ack_buf = BitBuffer::new_autoexpand(64);
+    ack_pdu.to_bitbuf(&mut ack_buf);
+    ack_buf.seek(0);
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_tma_ind(ack_buf));
+
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.outstanding_sdus.len(), 0, "ACK must advance the TX window");
 }

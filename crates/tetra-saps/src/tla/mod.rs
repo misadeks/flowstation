@@ -302,6 +302,74 @@ pub struct TlUnitdataConfBl {
     pub report: Option<Todo>,
 }
 
+/// TLA-DATA request for the acknowledged Advanced Link service.
+/// Symmetric to `TlaTlDataReqBl`. The LLC entity segments the `tl_sdu`
+/// according to the negotiated N.271/N.272/N.274 parameters and transmits
+/// AL-DATA/AL-FINAL-AR PDUs on the previously-established AL link.
+#[derive(Debug, Clone)]
+pub struct TlaTlDataReqAl {
+    pub main_address: TetraAddress,
+    pub link_id: u32,
+    pub endpoint_id: u32,
+    /// N.261: 0..=3; must match an Established AL link.
+    pub al_link_number: u8,
+    pub tl_sdu: BitBuffer,
+    pub subscriber_class: u8,
+    /// NOTE: spec ambiguous — chosen behaviour: fcs_flag is reserved for future
+    /// extended-AL wiring and ignored by the segmenter (which always emits FCS
+    /// in the FINAL PDU).
+    pub fcs_flag: bool,
+    pub air_interface_encryption: Option<Todo>,
+    pub req_handle: Todo,
+    pub tx_reporter: Option<TxReporter>,
+}
+
+/// TLA-DATA indication for the acknowledged Advanced Link service.
+/// LLC delivers the fully reassembled TL-SDU to the upper layer once all
+/// segments arrive and FCS validates.
+#[derive(Debug, Clone)]
+pub struct TlaTlDataIndAl {
+    pub main_address: TetraAddress,
+    pub link_id: u32,
+    pub endpoint_id: u32,
+    pub al_link_number: u8,
+    pub tl_sdu: BitBuffer,
+    pub subscriber_class: u8,
+    /// Always `true` when this Ind is emitted (LLC drops FCS failures);
+    /// kept for parity with BL indications and future extended-AL wiring.
+    pub fcs_ok: bool,
+    pub air_interface_encryption: Option<Todo>,
+}
+
+/// TLA-UNITDATA request for the unacknowledged Advanced Link service.
+#[derive(Debug, Clone)]
+pub struct TlaTlUnitdataReqAl {
+    pub main_address: TetraAddress,
+    pub link_id: u32,
+    pub endpoint_id: u32,
+    pub al_link_number: u8,
+    pub tl_sdu: BitBuffer,
+    pub subscriber_class: u8,
+    /// NOTE: spec ambiguous — reserved for future extended-AL wiring.
+    pub fcs_flag: bool,
+    pub air_interface_encryption: Option<Todo>,
+    pub req_handle: Todo,
+    pub tx_reporter: Option<TxReporter>,
+}
+
+/// TLA-UNITDATA indication for the unacknowledged Advanced Link service.
+#[derive(Debug, Clone)]
+pub struct TlaTlUnitdataIndAl {
+    pub main_address: TetraAddress,
+    pub link_id: u32,
+    pub endpoint_id: u32,
+    pub al_link_number: u8,
+    pub tl_sdu: BitBuffer,
+    pub subscriber_class: u8,
+    pub fcs_ok: bool,
+    pub air_interface_encryption: Option<Todo>,
+}
+
 /// Advanced link
 #[derive(Debug, Clone)]
 pub struct TlUnitdataReqAl;
