@@ -1,7 +1,7 @@
 // Clause 17.3.5 Service state diagram for the LTPD-SAP (MLE-SNDCP)
 
 #![allow(unused)]
-use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, TetraAddress, Todo};
+use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, TetraAddress, Todo, TxReporter};
 
 #[derive(Debug, Clone)]
 pub struct LtpdMleActivityReq {
@@ -195,25 +195,35 @@ pub struct LtpdMleResumeInd {
     pub mnc: Todo, // Current network
 }
 
+/// SNDCP → MLE downlink primitive over TL-PD SAP.
+/// Symmetric to `LtpdMleUnitdataInd`.
+///
+/// The SDU already has the SN-PDU body bits; MLE prepends the 3-bit SNDCP
+/// protocol discriminator (0b100) and forwards the resulting TL-SDU to LLC
+/// via the TLA SAP.
+///
+/// The `layer2service` field selects Basic Link (unacknowledged, for SN-UNITDATA
+/// carrying user IP) vs Advanced Link (acknowledged, for SNDCP control PDUs and
+/// SN-DATA). MLE dispatches to `TlaTl(Data|Unitdata)ReqBl` or the AL equivalent
+/// depending on this field. Landing SNDCP-side selection lives in PD-4.
+///
+/// The `packet_data_flag` is threaded through so LLC/UMAC can (later) route the
+/// PDU onto the PDCH scheduler when it is set.
 #[derive(Debug, Clone)]
 pub struct LtpdMleUnitdataReq {
-    pub sdu: Todo,
-    pub handle: Todo,
-    pub layer2service: Layer2Service,
-    pub unacked_bl_repetitions: Todo,
-    pub pdu_prio: Todo,
-    pub endpoint_id: EndpointId,
+    pub main_address: TetraAddress,
     pub link_id: LinkId,
-    pub stealing_permission: bool,
-    pub stealing_repeats_flag: bool,
-    pub channel_advice_flag: bool,
-    pub data_class_info: Todo,
-    pub data_prio: Todo,
-    pub mle_data_prio_flag: bool,
+    pub endpoint_id: EndpointId,
+    /// SN-PDU body bits, WITHOUT the 3-bit MLE SNDCP discriminator (MLE prepends it).
+    pub sdu: BitBuffer,
+    /// Basic Link (unacknowledged) for SN-UNITDATA; Advanced Link (acknowledged) for SN-DATA and control PDUs.
+    pub layer2service: Layer2Service,
+    /// True when the SDU carries user IP (SN-UNITDATA); false for SNDCP control PDUs.
+    /// Threads through to LLC and eventually to the UMAC PDCH scheduler in PD-5.
     pub packet_data_flag: bool,
-    pub scheduled_data_status: Todo,
-    pub max_schedule_interval: Todo,
-    pub fcs_flag: bool,
+    /// Optional AIE session; wire through the existing plumbing (None until AIE lands).
+    pub air_interface_encryption: Option<Todo>,
+    pub tx_reporter: Option<TxReporter>,
 }
 
 #[derive(Debug, Clone)]
