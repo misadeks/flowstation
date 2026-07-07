@@ -17,6 +17,7 @@ use super::sec_dashboard::{CfgDashboardDto, apply_dashboard_patch};
 use super::sec_emergency::{CfgEmergencyDto, apply_emergency_patch};
 use super::sec_geoalarm::{CfgGeoalarmDto, apply_geoalarm_patch};
 use super::sec_health::{CfgHealthDto, apply_health_patch};
+use super::sec_llc::{CfgLlcDto, apply_llc_patch};
 use super::sec_recovery::{CfgRecoveryDto, apply_recovery_patch};
 use super::sec_security::{CfgSecurityDto, apply_security_patch};
 use super::sec_snom_notify::{CfgSnomNotifyDto, apply_snom_notify_patch};
@@ -192,6 +193,18 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         return Err(format!("Unrecognized fields in emergency config: {:?}", sorted_keys(&emergency.extra)).into());
     }
 
+    // Optional llc section — reject unknown keys at both [llc] and [llc.advanced_link] levels.
+    if let Some(ref llc) = root.llc {
+        if !llc.extra.is_empty() {
+            return Err(format!("Unrecognized fields in llc config: {:?}", sorted_keys(&llc.extra)).into());
+        }
+        if let Some(ref al) = llc.advanced_link
+            && !al.extra.is_empty()
+        {
+            return Err(format!("Unrecognized fields in llc.advanced_link config: {:?}", sorted_keys(&al.extra)).into());
+        }
+    }
+
     // Build cell config, then inject the separately-parsed neighbor cells and sds_command_control
     let mut cell_cfg = cell_dto_to_cfg(root.cell_info);
     cell_cfg.neighbor_cells_ca = neighbor_cells_ca;
@@ -243,6 +256,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         telegram: None,
         health: apply_health_patch(root.health.unwrap_or_default()),
         emergency: apply_emergency_patch(root.emergency.unwrap_or_default()),
+        llc: apply_llc_patch(root.llc.unwrap_or_default())?,
     };
 
     if let Some(brew) = root.brew {
@@ -321,6 +335,7 @@ struct TomlConfigRoot {
     telegram_alerts: Option<CfgTelegramDto>,
     health: Option<CfgHealthDto>,
     emergency: Option<CfgEmergencyDto>,
+    llc: Option<CfgLlcDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -521,6 +536,16 @@ dl_queue_degraded = 64
 dl_queue_critical = 192
 sds_queue_degraded = 32
 sds_queue_critical = 128
+
+[llc.advanced_link]
+segment_payload_octets = 50
+tx_window = 3
+max_sdu_retx = 3
+max_segment_retx = 3
+max_setup_retries = 3
+max_disc_retries = 3
+max_reconnect_retries = 3
+max_tl_sdu_octets = 4096
 "#;
         let cfg = from_toml_str(toml).unwrap_or_else(|e| panic!("documented optional blocks must parse when uncommented: {e}"));
         assert!(cfg.recovery.enabled);
@@ -550,6 +575,9 @@ sds_queue_critical = 128
         assert!(cfg.dapnet.telegram_allowed_rics.contains(&200));
         assert!(cfg.dapnet.telegram_allowed_rics.contains(&0x1C40));
         assert!(cfg.geoalarm.enabled);
+        assert_eq!(cfg.llc.advanced_link.segment_payload_octets, 50);
+        assert_eq!(cfg.llc.advanced_link.tx_window, 3);
+        assert_eq!(cfg.llc.advanced_link.max_tl_sdu_octets, 4096);
     }
 
     fn minimal_toml(extra_cell: &str) -> String {
