@@ -129,6 +129,7 @@ pub enum SapMsgInner {
 
     // LTPD-SAP (MLE-LTPD)
     LtpdMleUnitdataInd(LtpdMleUnitdataInd),
+    LtpdMleUnitdataReq(LtpdMleUnitdataReq),
 
     // TNMM-SAP (MM-User)
     TnmmTestDemand(TnmmTestDemand),
@@ -209,6 +210,7 @@ impl Display for SapMsgInner {
             SapMsgInner::LcmcMleUnitdataInd(_) => write!(f, "LcmcMleUnitdataInd"),
             SapMsgInner::LcmcMleUnitdataReq(_) => write!(f, "LcmcMleUnitdataReq"),
             SapMsgInner::LtpdMleUnitdataInd(_) => write!(f, "LtpdMleUnitdataInd"),
+            SapMsgInner::LtpdMleUnitdataReq(_) => write!(f, "LtpdMleUnitdataReq"),
             SapMsgInner::TnmmTestDemand(_) => write!(f, "TnmmTestDemand"),
             SapMsgInner::TnmmTestResponse(_) => write!(f, "TnmmTestResponse"),
             // TLB-SAP
