@@ -571,6 +571,52 @@ voice_service = true
 # # Must be one of the N.271 power-of-two values: 32|64|128|256|512|1024|2048|4096.
 # max_tl_sdu_octets = 4096
 
+# OPTIONAL: Packet Data (SNDCP / PDCH) configuration.
+# All fields default to values identical to the PD-4/PD-5 hardcodes, so this
+# section can be omitted entirely to preserve the old (off) behaviour.
+#
+# [packet_data]
+# # Enable packet data cell-wide.  Disabled by default.
+# enabled = false
+#
+# # Base and prefix for the dynamic IPv4 pool.  SNDCP allocates from this pool
+# # for MSes that request TIA=Ipv4Dynamic.  Static leases below MUST fall inside.
+# ipv4_pool_base   = "192.168.100.0"
+# ipv4_pool_prefix = 24
+#
+# # TUN interface name; consumed by bins/pd-gateway.
+# tun_name = "flowstation-pd0"
+#
+# # The TUN's own IPv4 (i.e. the gateway address advertised on the pool subnet).
+# # Must lie inside the pool network but NOT be an address the pool hands out.
+# tun_addr = "192.168.100.1"
+#
+# # IPv4 MTU (bytes) advertised to MSes in SN-ACTIVATE PDP CONTEXT ACCEPT.
+# # Must be one of: 256, 512, 1024, 1280, 1500, 2048, 4096.
+# mtu = 1500
+#
+# # Optional per-ISSI static leases.  Checked before dynamic allocation.
+# # [[packet_data.static_lease]]
+# # issi = 2632585
+# # ipv4 = "192.168.100.10"
+#
+# # SNDCP timer encoded values (see ETSI TS 100 392-2 v3.10.1 tables
+# # 28.112 / 28.116 / 28.122; the encoded value is what goes on the wire).
+# [packet_data.timers]
+# ready_timer      = 8   # 8  -> 10 s
+# standby_timer    = 5   # 5  -> 10 min
+# resp_wait_timer  = 8   # 8  -> 10 s
+# pdu_priority_max = 4   # 0..7
+#
+# # PDCH allocator settings (consumed by UMAC).
+# [packet_data.pdch]
+# # Release a PDCH assignment after this many idle frames (default ~1 s at 18 fps).
+# idle_release_frames = 18
+# # Whether to permit multi-slot PDCH (V1: false).
+# multi_slot          = false
+# # Channel width: 0 = 25 kHz (V1 default); 1 = 50 kHz TEDS; 2 = 100; 3 = 150.
+# channel_width       = 0
+
 ###############################################################################
 
 # OPTIONAL: Web dashboard — accessible at http://<BTS-IP>:8080 (FlowStation)

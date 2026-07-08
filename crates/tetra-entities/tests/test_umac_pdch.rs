@@ -500,6 +500,53 @@ fn pdch_release_req_removes_assignment() {
     );
 }
 
+// ── test PD-7 ─────────────────────────────────────────────────────────────────
+/// PD-7: Setting `packet_data.enabled = true` in the config (not via
+/// `set_packet_data_enabled_for_test`) must auto-enable PDCH.
+/// Submitting a `TmaUnitdataReq { packet_data_flag: true }` then causes UMAC
+/// to grant a PDCH timeslot.
+#[test]
+fn packet_data_enabled_via_config_auto_enables_pdch() {
+    debug::setup_logging_verbose();
+
+    use tetra_config::bluestation::CfgPacketData;
+
+    const TEST_ISSI: u32 = 7777;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    // Enable packet data via config — do NOT call set_packet_data_enabled_for_test.
+    config.packet_data = CfgPacketData {
+        enabled: true,
+        ..CfgPacketData::default()
+    };
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Submit a packet-data unitdata request.
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(TEST_ISSI)),
+    });
+    test.run_stack(Some(4));
+
+    let umac = test
+        .router
+        .get_entity(TetraEntity::Umac)
+        .expect("UMAC not found")
+        .as_any_mut()
+        .downcast_mut::<UmacBs>()
+        .expect("downcast to UmacBs");
+
+    assert!(
+        umac.pdch_allocator().current_timeslot.is_some(),
+        "packet_data.enabled=true in config must auto-enable PDCH \
+         (current_timeslot must be Some after packet-data uplink)"
+    );
+}
+
 // ── test 8 ────────────────────────────────────────────────────────────────────
 /// When TS2, TS3, and TS4 are all occupied by voice circuits, the PDCH
 /// allocator must not pick any timeslot (`current_timeslot = None`) and

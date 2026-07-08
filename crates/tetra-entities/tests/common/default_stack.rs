@@ -1,6 +1,7 @@
 use tetra_config::bluestation::{
-    CfgAsterisk, CfgCellInfo, CfgDapnet, CfgEmergency, CfgGeoalarm, CfgHealth, CfgLlc, CfgNetInfo, CfgPhyIo, CfgRecovery, CfgSecurity,
-    CfgSnomNotify, CfgTpg2200Action, CfgWxService, PhyBackend, StackConfig, StackMode,
+    CfgAsterisk, CfgCellInfo, CfgDapnet, CfgEmergency, CfgGeoalarm, CfgHealth, CfgLlc, CfgNetInfo, CfgPacketData,
+    CfgPhyIo, CfgRecovery, CfgSecurity, CfgSnomNotify, CfgTpg2200Action, CfgWxService, PhyBackend, StackConfig,
+    StackMode,
 };
 use tetra_core::{freqs::FreqInfo, ranges::SortedDisjointSsiRanges};
 
@@ -36,6 +37,7 @@ pub fn default_test_config_bs() -> StackConfig {
         health: CfgHealth::default(),
         emergency: CfgEmergency::default(),
         llc: CfgLlc::default(),
+        packet_data: CfgPacketData::default(),
     }
 }
 

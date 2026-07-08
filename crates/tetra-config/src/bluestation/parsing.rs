@@ -18,6 +18,7 @@ use super::sec_emergency::{CfgEmergencyDto, apply_emergency_patch};
 use super::sec_geoalarm::{CfgGeoalarmDto, apply_geoalarm_patch};
 use super::sec_health::{CfgHealthDto, apply_health_patch};
 use super::sec_llc::{CfgLlcDto, apply_llc_patch};
+use super::sec_packet_data::{PacketDataDto, apply_packet_data_patch};
 use super::sec_recovery::{CfgRecoveryDto, apply_recovery_patch};
 use super::sec_security::{CfgSecurityDto, apply_security_patch};
 use super::sec_snom_notify::{CfgSnomNotifyDto, apply_snom_notify_patch};
@@ -257,6 +258,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         health: apply_health_patch(root.health.unwrap_or_default()),
         emergency: apply_emergency_patch(root.emergency.unwrap_or_default()),
         llc: apply_llc_patch(root.llc.unwrap_or_default())?,
+        packet_data: apply_packet_data_patch(root.packet_data)?,
     };
 
     if let Some(brew) = root.brew {
@@ -336,6 +338,7 @@ struct TomlConfigRoot {
     health: Option<CfgHealthDto>,
     emergency: Option<CfgEmergencyDto>,
     llc: Option<CfgLlcDto>,
+    packet_data: Option<PacketDataDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,

@@ -37,18 +37,17 @@ use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
 use crate::umac::subcomp::bs_frag::BsFragger;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, CarrierDownlinkMode, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
-use crate::umac::subcomp::pdch_allocator::{PdchAllocator, PDCH_IDLE_RELEASE_FRAMES};
+use crate::umac::subcomp::pdch_allocator::PdchAllocator;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 use super::subcomp::bs_defrag::BsDefrag;
 
-/// When false (default) the PDCH scheduler path is completely disabled and
-/// the BS behaves byte-identically to the pre-PD-5 baseline. PD-7 will
-/// replace this const with a config-driven field.
-/// IMPORTANT: all PDCH code paths in this file are gated on
-/// `self.packet_data_enabled`, NOT on this const directly, so tests can
-/// override the field without recompiling.
-const PACKET_DATA_ENABLED: bool = false;
+/// `self.packet_data_enabled` field on `UmacBs`, initialised from
+/// `config.packet_data.enabled` at construction time.  The
+/// `set_packet_data_enabled_for_test` helper exists for tests that prefer an
+/// imperative toggle over a config-built UMAC.
+///
+/// NOTE: PD-7 wired this to config; the const is removed.
 
 pub struct UmacBs {
     self_component: TetraEntity,
@@ -83,8 +82,8 @@ pub struct UmacBs {
     // ── PD-5: Packet Data Channel (PDCH) ─────────────────────────────────────
     /// When false (the default), all PDCH code paths are bypassed and the
     /// scheduler is byte-identical to the pre-PD-5 baseline.
-    /// Initialised from `PACKET_DATA_ENABLED`; tests override it via
-    /// `set_packet_data_enabled_for_test`.
+    /// Initialised from `config.packet_data.enabled` (PD-7); tests can
+    /// also toggle it via `set_packet_data_enabled_for_test`.
     packet_data_enabled: bool,
     /// Tracks per-ISSI PDCH reservations and handles idle-release.
     pdch_allocator: PdchAllocator,
@@ -143,8 +142,8 @@ impl UmacBs {
             ul_signal_owner: HashMap::new(),
             pending_circuit_closes: HashMap::new(),
             telemetry,
-            packet_data_enabled: PACKET_DATA_ENABLED,
-            pdch_allocator: PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES),
+            packet_data_enabled: c.packet_data.enabled,
+            pdch_allocator: PdchAllocator::new(c.packet_data.pdch.idle_release_frames),
             pdch_dl_queue: std::collections::VecDeque::new(),
             pdch_access_define_buf: None,
             pdch_access_define_emitted: false,
