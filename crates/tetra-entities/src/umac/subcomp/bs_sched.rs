@@ -137,6 +137,22 @@ pub struct BsChannelScheduler {
     /// fragmented MM PDU (e.g. ULocationUpdate when re-entering coverage).
     /// Issuing a real marker fixes that.
     next_usage_marker: [u8; 4],
+
+    /// The timeslot currently serving as the Packet Data Channel (PDCH), or
+    /// `None` if no PDCH is active.  When `Some(ts)`, `generate_bbk_block`
+    /// emits `AssignedControl` / `AssignedOnly` in the AACH for that slot so
+    /// the MS knows the timeslot is an assigned SCCH and may transmit control-
+    /// plane uplink bursts (SchF / MAC-DATA) on the corresponding uplink slot.
+    ///
+    /// Set by `emit_pdch_mac_resource` immediately after a grant is built.
+    /// Cleared when the last PDCH reservation expires, when an explicit
+    /// `PdchReleaseReq` empties all reservations, or when a voice circuit
+    /// preempts the slot via `create_circuit`.
+    ///
+    /// Priority in `generate_bbk_block`: hangtime > PDCH > Traffic/Unallocated.
+    /// Voice hangtime takes precedence so the circuit teardown signalling is
+    /// not disrupted by a stale PDCH marker.
+    pdch_timeslot: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -192,6 +208,7 @@ impl BsChannelScheduler {
             mcch_chan_alloc_sent_this_frame: false,
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
+            pdch_timeslot: None,
         }
     }
 
@@ -205,6 +222,21 @@ impl BsChannelScheduler {
 
     pub fn carrier_num(&self) -> u16 {
         self.carrier_num
+    }
+
+    /// Activate or deactivate PDCH signalling on the given timeslot (2–4).
+    ///
+    /// When `Some(ts)`, `generate_bbk_block` will emit `AssignedControl` /
+    /// `AssignedOnly` in the AACH for that slot on every downlink frame,
+    /// telling the MS that an assigned SCCH is available for packet-data
+    /// uplink bursts.  Pass `None` to revert the slot to `Unallocated`.
+    pub fn set_pdch_timeslot(&mut self, ts: Option<u8>) {
+        self.pdch_timeslot = ts;
+    }
+
+    /// Return the timeslot currently configured as PDCH, if any.
+    pub fn pdch_timeslot(&self) -> Option<u8> {
+        self.pdch_timeslot
     }
 
     pub fn allow_mcch(&self) -> bool {
@@ -863,6 +895,21 @@ impl BsChannelScheduler {
                 self.downlink_mode
             );
             return;
+        }
+        // Preemption guard: if a voice circuit is claiming the active PDCH slot,
+        // clear the PDCH AACH signalling before the circuit goes in.  This ensures
+        // the slot transitions atomically (same frame) from AssignedControl to
+        // Traffic so the MS does not see an inconsistent AACH state.
+        // TODO(PD-future): send PdchReleaseInd to SNDCP so it can move affected
+        // contexts to Standby and (optionally) trigger reassignment.
+        if Some(circuit.ts) == self.pdch_timeslot {
+            tracing::warn!(
+                "BsChannelScheduler: {:?} circuit on ts {} preempts active PDCH slot — \
+                 clearing AssignedControl AACH",
+                dir,
+                circuit.ts
+            );
+            self.pdch_timeslot = None;
         }
         // New/updated circuit implies traffic mode.
         if (1..=4).contains(&circuit.ts) {
@@ -1595,6 +1642,23 @@ impl BsChannelScheduler {
                         aach.dl_usage = AccessAssignDlUsage::AssignedControl;
                         // AssignedOnly (Header 2) allows random access for MSs on
                         // the assigned channel while blocking common control MSs.
+                        aach.ul_usage = AccessAssignUlUsage::AssignedOnly;
+                        aach.f2_af = Some(AccessField {
+                            access_code: 0,
+                            base_frame_len: 4,
+                        });
+                    } else if self.pdch_timeslot == Some(ts.t) {
+                        // PDCH assigned SCCH — priority: hangtime > PDCH > Traffic/Unallocated.
+                        // Hangtime takes precedence above so voice teardown signalling is
+                        // not disrupted.  PDCH overrides the plain Unallocated path below so
+                        // the MS receives a sustained "assigned channel, control uplink" signal
+                        // on every frame after the one-shot MAC-RESOURCE grant.
+                        //
+                        // AssignedControl (DL) + AssignedOnly (UL) + AccessField tells the MS
+                        // this slot is an assigned SCCH; it may transmit SchF / MAC-DATA
+                        // control-plane bursts on the corresponding uplink slot.
+                        // Per ETSI TS 100 392-2 §21.2 AACH header 11.
+                        aach.dl_usage = AccessAssignDlUsage::AssignedControl;
                         aach.ul_usage = AccessAssignUlUsage::AssignedOnly;
                         aach.f2_af = Some(AccessField {
                             access_code: 0,
@@ -2356,5 +2420,100 @@ mod tests {
         sched.dump_dl_queue();
 
         assert!(sched.dltx_queues[ts.t as usize - 1].len() == 1);
+    }
+
+    // ── PD-5b tests ────────────────────────────────────────────────────────────
+
+    /// Helper: parse the AACH for `ts` at non-frame-18 time from the scheduler.
+    fn aach_for_ts(sched: &mut BsChannelScheduler, ts: u8) -> AccessAssign {
+        let bbk = sched.generate_bbk_block(TdmaTime { t: ts, f: 1, m: 1, h: 0 });
+        let mut buf = bbk.mac_block;
+        // generate_bbk_block writes via to_bitbuf which advances the write cursor.
+        // Seek back to 0 so from_bitbuf reads from the beginning.
+        buf.seek(0);
+        AccessAssign::from_bitbuf(&mut buf).expect("AACH must parse")
+    }
+
+    #[test]
+    fn pdch_slot_generates_assigned_control_aach() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch_timeslot(Some(4));
+
+        let aach = aach_for_ts(&mut sched, 4);
+
+        assert_eq!(
+            aach.dl_usage,
+            AccessAssignDlUsage::AssignedControl,
+            "PDCH slot DL must be AssignedControl"
+        );
+        assert_eq!(
+            aach.ul_usage,
+            AccessAssignUlUsage::AssignedOnly,
+            "PDCH slot UL must be AssignedOnly"
+        );
+
+        // Other slots must not be affected.
+        let aach2 = aach_for_ts(&mut sched, 2);
+        let aach3 = aach_for_ts(&mut sched, 3);
+        assert_eq!(aach2.dl_usage, AccessAssignDlUsage::Unallocated, "TS2 must stay Unallocated");
+        assert_eq!(aach3.dl_usage, AccessAssignDlUsage::Unallocated, "TS3 must stay Unallocated");
+    }
+
+    #[test]
+    fn pdch_slot_cleared_returns_to_unallocated_aach() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch_timeslot(Some(4));
+
+        // Verify it was set.
+        assert_eq!(
+            aach_for_ts(&mut sched, 4).dl_usage,
+            AccessAssignDlUsage::AssignedControl
+        );
+
+        // Clear it.
+        sched.set_pdch_timeslot(None);
+
+        let aach = aach_for_ts(&mut sched, 4);
+        assert_eq!(
+            aach.dl_usage,
+            AccessAssignDlUsage::Unallocated,
+            "after clearing PDCH, slot must revert to Unallocated"
+        );
+        assert_eq!(
+            aach.ul_usage,
+            AccessAssignUlUsage::Unallocated,
+            "after clearing PDCH, UL must also revert to Unallocated"
+        );
+    }
+
+    #[test]
+    fn voice_circuit_preempts_pdch_clears_pdch_slot() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch_timeslot(Some(4));
+
+        // Pre-condition: AACH is AssignedControl.
+        assert_eq!(
+            aach_for_ts(&mut sched, 4).dl_usage,
+            AccessAssignDlUsage::AssignedControl,
+            "pre-condition: PDCH AACH must be AssignedControl before voice preemption"
+        );
+
+        // Voice circuit takes TS4.
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 4));
+
+        // pdch_timeslot must be cleared.
+        assert_eq!(
+            sched.pdch_timeslot(),
+            None,
+            "create_circuit on PDCH slot must clear pdch_timeslot"
+        );
+
+        // AACH must now show Traffic (not AssignedControl).
+        let aach = aach_for_ts(&mut sched, 4);
+        assert!(
+            matches!(aach.dl_usage, AccessAssignDlUsage::Traffic(_)),
+            "after voice preemption, TS4 DL AACH must be Traffic, got {:?}",
+            aach.dl_usage
+        );
     }
 }
