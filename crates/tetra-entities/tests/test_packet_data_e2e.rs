@@ -1,9 +1,10 @@
 /// PD-8: Full packet-data lifecycle integration test.
 ///
 /// Wires SNDCP + MLE + LLC + UMAC together and drives a complete PDP-context
-/// lifecycle: ACTIVATE, uplink SN-UNITDATA, downlink SN-UNITDATA (PDCH grant),
-/// Ready-timer expiry → Standby, SN-PAGE-REQUEST / RESPONSE round-trip, and
-/// DEACTIVATE – all verified through the full SapMsg chain.
+/// lifecycle: ACTIVATE, uplink SN-UNITDATA and SN-DATA (acknowledged flow),
+/// downlink SN-UNITDATA and SN-DATA, Ready-timer expiry → Standby,
+/// SN-PAGE-REQUEST / RESPONSE round-trip, and DEACTIVATE – all verified through
+/// the full SapMsg chain.
 mod common;
 
 use std::net::Ipv4Addr;
@@ -17,11 +18,13 @@ use tetra_entities::sndcp::sndcp_bs::{GatewayDownlink, Sndcp};
 use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_entities::{MessageQueue, TetraEntityTrait};
 use tetra_pdus::sndcp::enums::deactivation_type::DeactivationType;
+use tetra_pdus::sndcp::enums::logical_link_status::LogicalLinkStatus;
 use tetra_pdus::sndcp::enums::pdms_type::PdmsType;
 use tetra_pdus::sndcp::enums::tia::Tia;
 use tetra_pdus::sndcp::fields::nsapi::Nsapi;
 use tetra_pdus::sndcp::pdus::{
-    ActivatePdpContextDemand, DeactivatePdpContextDemand, PageResponse, SnPdu, Unitdata,
+    ActivatePdpContextDemand, DeactivatePdpContextDemand, PageResponse, SnData,
+    SnDataTransmitRequest, SnPdu, Unitdata,
 };
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
@@ -179,9 +182,37 @@ fn build_activate_demand_pdu(nsapi: u8) -> BitBuffer {
 
 /// Build an SN-UNITDATA PDU with the SNDCP protocol discriminator prepended.
 fn build_unitdata_pdu(nsapi: u8, payload: &[u8]) -> BitBuffer {
-    let ud = Unitdata { nsapi: Nsapi(nsapi), pdu_priority: 0, payload: payload.to_vec() };
+    let ud = Unitdata { nsapi: Nsapi(nsapi), pcomp: 0, dcomp: 0, payload: payload.to_vec() };
     let mut buf = BitBuffer::new_autoexpand(256);
     ud.to_bitbuf(&mut buf).expect("encode unitdata");
+    buf.seek(0);
+    with_discriminator(&buf)
+}
+
+/// Build a minimal SN-DATA-TRANSMIT-REQUEST (type 6) with the SNDCP discriminator prepended.
+/// No enhanced_pi4_dqpsk, no o_bit, no additional NSAPIs — matches Motorola MTM800E minimum form.
+fn build_data_transmit_request_pdu(nsapi: u8) -> BitBuffer {
+    let req = SnDataTransmitRequest {
+        nsapi: Nsapi(nsapi),
+        logical_link_status: LogicalLinkStatus::NotConnected,
+        enhanced_pi4_dqpsk_service: false,
+        resource_request: None,
+        o_bit: false,
+        sndcp_network_endpoint_identifier: None,
+        m_bit: false,
+        nsapi_additional: vec![],
+    };
+    let mut buf = BitBuffer::new_autoexpand(64);
+    req.to_bitbuf(&mut buf).expect("encode data transmit request");
+    buf.seek(0);
+    with_discriminator(&buf)
+}
+
+/// Build an SN-DATA (type 5) PDU with the SNDCP protocol discriminator prepended.
+fn build_sn_data_pdu(nsapi: u8, payload: &[u8]) -> BitBuffer {
+    let d = SnData { nsapi: Nsapi(nsapi), pcomp: 0, dcomp: 0, n_pdu: payload.to_vec() };
+    let mut buf = BitBuffer::new_autoexpand(256);
+    d.to_bitbuf(&mut buf).expect("encode sn data");
     buf.seek(0);
     with_discriminator(&buf)
 }
@@ -511,6 +542,109 @@ fn activate_uplink_downlink_deactivate() {
     assert!(
         mac_res.chan_alloc_element.is_some(),
         "P3: MAC-RESOURCE must carry chan_alloc_element (channel_allocation_flag=1)"
+    );
+
+    // ── Phase 3.5: SN-DATA-TRANSMIT-REQUEST / SN-DATA (acknowledged flow) ────
+    //
+    // A Motorola MTM800E, after receiving ACTIVATE ACCEPT, sends
+    // SN-DATA-TRANSMIT-REQUEST (type 6) to negotiate acknowledged packet-data
+    // transfer. SNDCP must respond with SN-DATA-TRANSMIT-RESPONSE (type 7,
+    // accept=true) and transition to WaitingForAlSetup.
+    //
+    // The first uplink SN-DATA (type 5) that follows acts as the implicit AL
+    // setup confirmation (PD-4b NOTE). SNDCP delivers it to the gateway queue
+    // exactly like an SN-UNITDATA.
+    //
+    // For the downlink direction, `feed_downlink_ip_acknowledged` must emit an
+    // SN-DATA PDU (type 5) via `LtpdMleUnitdataReq { layer2service: Acknowledged }`.
+
+    // Inject minimal SN-DATA-TRANSMIT-REQUEST (no enhanced mode, no o_bit).
+    stack.queue.push_back(make_uplink_ind(
+        build_data_transmit_request_pdu(TEST_NSAPI),
+        TEST_ISSI,
+    ));
+    let phase35a_msgs = tick_stack(&mut stack);
+
+    // [P3.5-A] SNDCP emitted SN-DATA-TRANSMIT-RESPONSE with accept=true.
+    let ltpd_txr = find_ltpd_unitdata_req(&phase35a_msgs)
+        .expect("P3.5: SNDCP must emit LtpdMleUnitdataReq for DATA-TRANSMIT-RESPONSE");
+    assert_eq!(ltpd_txr.layer2service, Layer2Service::Acknowledged,
+        "P3.5: TRANSMIT-RESPONSE uses Acknowledged service");
+    assert!(!ltpd_txr.packet_data_flag, "P3.5: TRANSMIT-RESPONSE is signalling, not IP data");
+    match decode_dl_from_sdu(&ltpd_txr.sdu) {
+        SnPdu::DataTransmitResponse(r) => {
+            assert_eq!(r.nsapi.0, TEST_NSAPI, "P3.5: TRANSMIT-RESPONSE NSAPI");
+            assert!(r.accept, "P3.5: TRANSMIT-RESPONSE must be accept=true");
+        }
+        other => panic!("P3.5: expected DataTransmitResponse, got {other:?}"),
+    }
+
+    // [P3.5-B] MLE forwarded TRANSMIT-RESPONSE as TlaTlDataReqBl (Acknowledged service).
+    // NOTE: LLC defers it (blocked by ACTIVATE ACCEPT BL-ACK, same as Phase 7).
+    assert!(
+        find_tla_data_req_bl(&phase35a_msgs).is_some(),
+        "P3.5: MLE must produce TlaTlDataReqBl for DATA-TRANSMIT-RESPONSE"
+    );
+
+    // Inject uplink SN-DATA (type 5, acknowledged IP data).
+    let icmp_req2: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x02, 0x00, 0x00,
+        0x40, 0x01, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x02, // src: 192.168.100.2
+        0xc0, 0xa8, 0x64, 0x01, // dst: 192.168.100.1
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
+    ];
+    stack.queue.push_back(make_uplink_ind(
+        build_sn_data_pdu(TEST_NSAPI, &icmp_req2),
+        TEST_ISSI,
+    ));
+    let phase35b_msgs = tick_stack(&mut stack);
+
+    // [P3.5-C] SN-DATA uplink → gateway queue; no downlink produced.
+    assert!(
+        find_ltpd_unitdata_req(&phase35b_msgs).is_none(),
+        "P3.5: uplink SN-DATA must NOT produce any LtpdMleUnitdataReq"
+    );
+    let ul_data = stack.sndcp.uplink_ip_queue.pop_front()
+        .expect("P3.5: SNDCP must push uplink SN-DATA to gateway queue");
+    assert_eq!(ul_data.main_address.ssi, TEST_ISSI, "P3.5: SN-DATA uplink SSI");
+    assert_eq!(ul_data.nsapi, TEST_NSAPI, "P3.5: SN-DATA uplink NSAPI");
+    assert_eq!(ul_data.payload, icmp_req2, "P3.5: SN-DATA uplink payload");
+    assert!(stack.sndcp.uplink_ip_queue.is_empty(), "P3.5: no leftover uplink items");
+
+    // Gateway sends acknowledged IP reply via feed_downlink_ip_acknowledged.
+    let icmp_reply2: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x02, 0x00, 0x00,
+        0x40, 0x01, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x01, // src: 192.168.100.1
+        0xc0, 0xa8, 0x64, 0x02, // dst: 192.168.100.2
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
+    ];
+    stack.sndcp.feed_downlink_ip_acknowledged(
+        &mut stack.queue,
+        GatewayDownlink { dest_ipv4: allocated_ip, payload: icmp_reply2.clone() },
+    );
+    let phase35c_msgs = tick_stack(&mut stack);
+
+    // [P3.5-D] SNDCP emitted LtpdMleUnitdataReq(Acknowledged, packet_data_flag=true) with SN-DATA.
+    let ltpd_data_dl = find_ltpd_unitdata_req(&phase35c_msgs)
+        .expect("P3.5: SNDCP must emit LtpdMleUnitdataReq for acknowledged downlink SN-DATA");
+    assert_eq!(ltpd_data_dl.layer2service, Layer2Service::Acknowledged,
+        "P3.5: acknowledged downlink must use Acknowledged service");
+    assert!(ltpd_data_dl.packet_data_flag,
+        "P3.5: SN-DATA downlink must carry packet_data_flag=true");
+    match decode_dl_from_sdu(&ltpd_data_dl.sdu) {
+        SnPdu::Data(d) => {
+            assert_eq!(d.nsapi.0, TEST_NSAPI, "P3.5: SN-DATA downlink NSAPI");
+            assert_eq!(d.n_pdu, icmp_reply2, "P3.5: SN-DATA downlink payload");
+        }
+        other => panic!("P3.5: expected SnData (type 5), got {other:?}"),
+    }
+    // [P3.5-E] MLE forwarded SN-DATA downlink as TlaTlDataReqBl (Acknowledged service).
+    // NOTE: LLC defers it (blocked by pending ACTIVATE ACCEPT BL-ACK, same as Phase 7).
+    assert!(
+        find_tla_data_req_bl(&phase35c_msgs).is_some(),
+        "P3.5: MLE must produce TlaTlDataReqBl for acknowledged SN-DATA downlink"
     );
 
     // ── Phase 7: MS sends SN-DEACTIVATE PDP CONTEXT DEMAND ───────────────────
