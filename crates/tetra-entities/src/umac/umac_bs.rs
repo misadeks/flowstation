@@ -90,9 +90,6 @@ pub struct UmacBs {
     pdch_allocator: PdchAllocator,
     /// Queued packet-data PDUs to be drained onto the chosen PDCH slot.
     pdch_dl_queue: std::collections::VecDeque<BitBuffer>,
-    /// Hook flag: set to `true` each hyperframe when packet data is enabled AND
-    /// a PDCH timeslot was successfully chosen. Used as a test observable.
-    pub pdch_broadcast_hook_fired: bool,
     /// Serialised ACCESS-DEFINE PDU built once at PDCH bring-up and stored here
     /// until a broadcast slot is available to inject it.
     ///
@@ -149,7 +146,6 @@ impl UmacBs {
             packet_data_enabled: PACKET_DATA_ENABLED,
             pdch_allocator: PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES),
             pdch_dl_queue: std::collections::VecDeque::new(),
-            pdch_broadcast_hook_fired: false,
             pdch_access_define_buf: None,
             pdch_access_define_emitted: false,
         }
@@ -1801,22 +1797,6 @@ impl UmacBs {
         buf
     }
 
-    /// Placeholder for the future `D-CHANNEL-ALLOCATION-BROADCAST` AACH emission.
-    ///
-    /// The real implementation is blocked pending the corrected ETSI EN 300 392-2
-    /// clause 21.4.3.4 wire format (field widths and ordering TBD).  For now this
-    /// method sets a test-observable bool flag so tests can verify the hook fires
-    /// at the right hyperframe cadence without depending on a specific bit pattern.
-    fn trigger_pdch_broadcast_hook(&mut self, pdch_ts: u8) {
-        // TODO(PD-5-schema): replace with real DChannelAllocationBroadcast codec
-        // once corrected wire format arrives.
-        tracing::debug!(
-            "UMAC: PDCH broadcast hook fired for TS{} (codec pending)",
-            pdch_ts
-        );
-        self.pdch_broadcast_hook_fired = true;
-    }
-
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
         tracing::trace!("rx_tlmb_prim");
         tracing::error!("BUG: unexpected message or state -- routing error");
@@ -2439,11 +2419,6 @@ impl TetraEntityTrait for UmacBs {
                             "UMAC: PDCH ACCESS-DEFINE built for TS{} bring-up (broadcast pending)",
                             chosen_ts
                         );
-                    }
-
-                    // 5. Trigger the PDCH broadcast hook on the hyperframe gate.
-                    if ts.t == 1 && ts.f == 1 && self.channel_scheduler.allow_common_control_aach() {
-                        self.trigger_pdch_broadcast_hook(chosen_ts);
                     }
                 }
             }

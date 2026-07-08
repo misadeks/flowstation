@@ -109,10 +109,6 @@ fn default_off_scheduler_behaviour_unchanged() {
         .expect("downcast to UmacBs");
 
     assert!(
-        !umac.pdch_broadcast_hook_fired,
-        "PDCH broadcast hook must not fire when packet_data_enabled = false"
-    );
-    assert!(
         umac.pdch_access_define_buf.is_none(),
         "ACCESS-DEFINE must not be built when packet_data_enabled = false"
     );
@@ -507,7 +503,7 @@ fn pdch_release_req_removes_assignment() {
 // ── test 8 ────────────────────────────────────────────────────────────────────
 /// When TS2, TS3, and TS4 are all occupied by voice circuits, the PDCH
 /// allocator must not pick any timeslot (`current_timeslot = None`) and
-/// no `pdch_broadcast_hook_fired` must be set.
+/// no MAC-RESOURCE-with-channel-allocation must be emitted.
 #[test]
 fn pdch_yields_to_voice_when_all_slots_taken() {
     debug::setup_logging_verbose();
@@ -577,6 +573,8 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
     // Run one tick at t=1, f=1 — the PDCH broadcast gate.
     test.run_stack(Some(1));
 
+    let sink_msgs = test.dump_sinks();
+
     let umac = test
         .router
         .get_entity(TetraEntity::Umac)
@@ -592,9 +590,9 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
         "PDCH must yield when all eligible timeslots (TS2/3/4) are occupied by voice"
     );
 
-    // Broadcast hook must NOT have fired.
+    // No MAC-RESOURCE-with-channel-allocation must have been emitted.
     assert!(
-        !umac.pdch_broadcast_hook_fired,
-        "PDCH broadcast hook must NOT fire when PDCH yields to voice pressure"
+        find_pdch_mac_resource(&sink_msgs, 0).is_none(),
+        "no PDCH MAC-RESOURCE should be emitted when PDCH yields to voice pressure"
     );
 }
