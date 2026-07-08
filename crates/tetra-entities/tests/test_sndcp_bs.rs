@@ -591,6 +591,53 @@ fn transmit_request_for_known_nsapi_accepted() {
     }
 }
 
+/// 14b. Regression: a REPEATED SN-DATA-TRANSMIT-REQUEST for the same NSAPI (as MSes
+///      send when AL doesn't come up in time) must be idempotently ACCEPTED, not
+///      rejected as UnknownNsapi. Before this fix, the second REQUEST hit
+///      WaitingForAlSetup state and was rejected — captured in live hardware log
+///      2026-07-08 22:19:03 UTC+2.
+#[test]
+fn transmit_request_retry_in_waiting_for_al_setup_is_accepted() {
+    let (mut sndcp, mut queue) = make_sndcp();
+    activate(&mut sndcp, &mut queue, 21002, demand_dynamic(1)).expect("no ACCEPT");
+    drain_queue(&mut queue);
+
+    let req = SnDataTransmitRequest {
+        nsapi: Nsapi(1),
+        logical_link_status: LogicalLinkStatus::NotConnected,
+        enhanced_pi4_dqpsk_service: false,
+        resource_request: None,
+        o_bit: false,
+        sndcp_network_endpoint_identifier: None,
+        m_bit: false,
+        nsapi_additional: vec![],
+    };
+    let sdu = with_discriminator(&encode_data_transmit_request(&req));
+
+    // First REQUEST: accepted, transitions to WaitingForAlSetup.
+    sndcp.rx_prim(&mut queue, make_ind(sdu.clone(), 21002));
+    let first = decode_dl(&unwrap_req(queue.pop_front().expect("first response")));
+    match first {
+        SnPdu::DataTransmitResponse(r) => assert!(r.accept, "first REQUEST must be accepted"),
+        other => panic!("expected first DataTransmitResponse, got {other:?}"),
+    }
+    drain_queue(&mut queue);
+
+    // MS retries because AL never came up. Must also be accepted (idempotent), NOT rejected.
+    sndcp.rx_prim(&mut queue, make_ind(sdu, 21002));
+    let second = decode_dl(&unwrap_req(queue.pop_front().expect("second response")));
+    match second {
+        SnPdu::DataTransmitResponse(r) => {
+            assert!(r.accept, "retry REQUEST in WaitingForAlSetup must be accepted, not rejected");
+            assert!(
+                r.transmit_response_reject_cause.is_none(),
+                "no reject cause on idempotent accept"
+            );
+        }
+        other => panic!("expected second DataTransmitResponse, got {other:?}"),
+    }
+}
+
 /// 15. Uplink SN-DATA (type 5) after ACTIVATE pushes the payload to `uplink_ip_queue`.
 #[test]
 fn uplink_sn_data_reaches_gateway() {

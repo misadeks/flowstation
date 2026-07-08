@@ -540,9 +540,11 @@ impl Sndcp {
 
     /// Handle an MS-initiated SN-DATA-TRANSMIT-REQUEST.
     ///
-    /// If the NSAPI context is not found or is in an incompatible state, emit
-    /// SN-DATA-TRANSMIT-RESPONSE with `accept = false`.  Otherwise accept and
-    /// transition the context to `WaitingForAlSetup`.
+    /// Semantics:
+    /// - Context in Ready / Standby / WaitingForAlSetup: accept (idempotent for retries).
+    /// - Context in WaitForAccept / Deactivating / WaitForPageResponse: reject with
+    ///   SndcpServiceTemporarilyNotAvailable (34) so the MS backs off and retries.
+    /// - No context at all: reject with UnknownNsapi (1).
     ///
     /// Ref: ETSI TS 100 392-2 v3.10.1 clause 28.4.4.5.
     fn on_data_transmit_request(
@@ -555,21 +557,34 @@ impl Sndcp {
         let nsapi = req.nsapi.0;
         let key = PdpKey::new(main_address, nsapi);
 
-        let accept = match self.contexts.get(&key) {
-            Some(ctx) if matches!(ctx.state, PdpState::Ready | PdpState::Standby) => true,
-            Some(_) => false,
-            None => false,
+        // Accept in Ready or Standby (fresh request) or WaitingForAlSetup (idempotent retry:
+        // the MS has not yet observed AL come up and is asking again). Reject in Idle /
+        // WaitForAccept / Deactivating / WaitForPageResponse with a semantically correct cause.
+        // NOTE: spec ambiguous — chosen behaviour: WaitingForAlSetup retries return accept
+        // again rather than a "service temporarily not available" (34) reject, so the MS keeps
+        // whatever backoff behaviour it already had after the first accept.
+        let reject_cause: Option<TransmitResponseRejectCause> = match self.contexts.get(&key) {
+            Some(ctx) => match ctx.state {
+                PdpState::Ready | PdpState::Standby | PdpState::WaitingForAlSetup => None,
+                PdpState::WaitForAccept
+                | PdpState::Deactivating
+                | PdpState::WaitForPageResponse => {
+                    Some(TransmitResponseRejectCause::SndcpServiceTemporarilyNotAvailable)
+                }
+            },
+            None => Some(TransmitResponseRejectCause::UnknownNsapi),
         };
 
-        if !accept {
+        if let Some(cause) = reject_cause {
             tracing::info!(
-                "SNDCP: -> SN-DATA-TRANSMIT-RESPONSE reject (UnknownNsapi) to {:?} NSAPI={nsapi}",
+                "SNDCP: -> SN-DATA-TRANSMIT-RESPONSE reject ({:?}) to {:?} NSAPI={nsapi}",
+                cause,
                 main_address
             );
             let resp = SnDataTransmitResponse {
                 nsapi: req.nsapi,
                 accept: false,
-                transmit_response_reject_cause: Some(TransmitResponseRejectCause::UnknownNsapi),
+                transmit_response_reject_cause: Some(cause),
                 o_bit: false,
                 sndcp_network_endpoint_identifier: None,
                 m_bit: false,
@@ -588,7 +603,8 @@ impl Sndcp {
             return;
         }
 
-        // Context found in Ready/Standby: accept and transition to WaitingForAlSetup.
+        // Accept: transition (or keep) the context in WaitingForAlSetup. Reset the response-wait
+        // timer so retries don't age out the state prematurely.
         if let Some(ctx) = self.contexts.get_mut(&key) {
             ctx.state = PdpState::WaitingForAlSetup;
             ctx.resp_wait_deadline = Some(self.dltime.add_timeslots(RESP_WAIT_TIMER_SLOTS));
