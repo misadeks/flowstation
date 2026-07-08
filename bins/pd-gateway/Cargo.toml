@@ -1,0 +1,28 @@
+[package]
+name = "pd-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pd-gateway"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tetra-core = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros", "sync", "io-util", "process", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = "1"
+thiserror = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# NOTE: spec specified 0.13; latest stable is 0.15 — using 0.15 for current API.
+tokio-tun = "0.15"
+
+[lints]
+workspace = true
