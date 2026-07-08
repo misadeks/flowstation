@@ -754,25 +754,29 @@ impl Sndcp {
         ind: &LtpdMleUnitdataInd,
         eod: tetra_pdus::sndcp::pdus::EndOfData,
     ) {
+        // END-OF-DATA is per-MS, not per-NSAPI (clause 28.4.4.7). Move all
+        // currently-Ready contexts for this MS to Standby. immediate_service_change
+        // is currently logged but not acted on (V1 doesn't differentiate immediate
+        // vs deferred service change).
         let main_address = ind.received_tetra_address;
-        let nsapi = eod.nsapi.0;
-        let key = PdpKey::new(main_address, nsapi);
-
-        if let Some(ctx) = self.contexts.get_mut(&key) {
-            if ctx.state == PdpState::Ready {
+        let mut moved = 0usize;
+        for (key, ctx) in self.contexts.iter_mut() {
+            if key.ssi == main_address.ssi && ctx.state == PdpState::Ready {
                 ctx.state = PdpState::Standby;
                 ctx.standby_deadline = Some(self.dltime.add_timeslots(STANDBY_TIMER_SLOTS));
                 ctx.ready_deadline = None;
-                tracing::info!("SNDCP: {:?} NSAPI={nsapi} Ready->Standby (END OF DATA)", main_address);
-            } else {
-                tracing::warn!(
-                    "SNDCP: END OF DATA from {:?} NSAPI={nsapi} in unexpected state {:?}",
-                    main_address, ctx.state
-                );
+                moved += 1;
             }
+        }
+        if moved > 0 {
+            tracing::info!(
+                "SNDCP: {:?} END OF DATA (immediate={}): moved {} contexts Ready->Standby",
+                main_address, eod.immediate_service_change, moved
+            );
         } else {
-            tracing::warn!(
-                "SNDCP: END OF DATA from {:?} NSAPI={nsapi}: context not found", main_address
+            tracing::debug!(
+                "SNDCP: END OF DATA from {:?} (immediate={}): no Ready contexts to transition",
+                main_address, eod.immediate_service_change
             );
         }
     }
@@ -784,26 +788,58 @@ impl Sndcp {
         ind: &LtpdMleUnitdataInd,
         rc: tetra_pdus::sndcp::pdus::Reconnect,
     ) {
+        // RECONNECT NSAPI is conditional (clause 28.4.4.8). If present, target that
+        // context; if absent, move any Standby context for this MS back to Ready
+        // (V1: apply to the first Standby one found; multi-context RECONNECT is rare).
         let main_address = ind.received_tetra_address;
-        let nsapi = rc.nsapi.0;
-        let key = PdpKey::new(main_address, nsapi);
-
-        if let Some(ctx) = self.contexts.get_mut(&key) {
-            if ctx.state == PdpState::Standby {
-                ctx.state = PdpState::Ready;
-                ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
-                ctx.standby_deadline = None;
-                tracing::info!("SNDCP: {:?} NSAPI={nsapi} Standby->Ready (RECONNECT)", main_address);
-            } else {
-                tracing::warn!(
-                    "SNDCP: RECONNECT from {:?} NSAPI={nsapi} in unexpected state {:?}",
-                    main_address, ctx.state
-                );
+        match rc.nsapi.map(|n| n.0) {
+            Some(nsapi) => {
+                let key = PdpKey::new(main_address, nsapi);
+                if let Some(ctx) = self.contexts.get_mut(&key) {
+                    if ctx.state == PdpState::Standby {
+                        ctx.state = PdpState::Ready;
+                        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                        ctx.standby_deadline = None;
+                        tracing::info!(
+                            "SNDCP: {:?} NSAPI={nsapi} Standby->Ready (RECONNECT data_to_send)",
+                            main_address
+                        );
+                    } else {
+                        tracing::warn!(
+                            "SNDCP: RECONNECT from {:?} NSAPI={nsapi} in unexpected state {:?}",
+                            main_address, ctx.state
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "SNDCP: RECONNECT from {:?} NSAPI={nsapi}: context not found",
+                        main_address
+                    );
+                }
             }
-        } else {
-            tracing::warn!(
-                "SNDCP: RECONNECT from {:?} NSAPI={nsapi}: context not found", main_address
-            );
+            None => {
+                // No NSAPI carried: apply to any Standby context for the MS.
+                let mut moved = 0usize;
+                for (key, ctx) in self.contexts.iter_mut() {
+                    if key.ssi == main_address.ssi && ctx.state == PdpState::Standby {
+                        ctx.state = PdpState::Ready;
+                        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                        ctx.standby_deadline = None;
+                        moved += 1;
+                    }
+                }
+                if moved > 0 {
+                    tracing::info!(
+                        "SNDCP: {:?} RECONNECT (no data_to_send): moved {} contexts Standby->Ready",
+                        main_address, moved
+                    );
+                } else {
+                    tracing::debug!(
+                        "SNDCP: RECONNECT from {:?} (no data_to_send): no Standby contexts",
+                        main_address
+                    );
+                }
+            }
         }
     }
 

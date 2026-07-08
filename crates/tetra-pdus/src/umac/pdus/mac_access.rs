@@ -35,7 +35,12 @@ impl MacAccess {
     pub fn from_bitbuf(buf: &mut BitBuffer) -> Result<Self, PduParseErr> {
         // required constant mac_pdu_type
         let mac_pdu_type = buf.read_field(1, "mac_pdu_type")?;
-        assert!(mac_pdu_type == 0);
+        if mac_pdu_type != 0 {
+            // Not a MAC-ACCESS (spec: MAC-ACCESS always has type bit = 0). Reject
+            // rather than panic — a noise-corrupted uplink burst that fools the
+            // burst-type classifier can otherwise crash the process here.
+            return Err(PduParseErr::InvalidValue { field: "mac_pdu_type", value: mac_pdu_type });
+        }
         let fill_bits = buf.read_field(1, "fill_bits")? != 0;
         let encrypted = buf.read_field(1, "encrypted")? != 0;
 
@@ -67,7 +72,10 @@ impl MacAccess {
                 (Some(address), None)
             }
             _ => {
-                panic!();
+                // Unreachable: addr_type is a 2-bit field so val is always in 0..=3
+                // and all four arms are handled above. Return an error rather than
+                // panic to keep the codec panic-free on future refactors.
+                return Err(PduParseErr::InvalidValue { field: "addr_type", value: addr_type as u64 });
             }
         };
 

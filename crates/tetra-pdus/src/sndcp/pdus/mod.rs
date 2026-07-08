@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn dispatch_end_of_data_ul() {
-        let pdu = EndOfData { nsapi: Nsapi(3) };
+        let pdu = EndOfData { immediate_service_change: false };
         let mut buf = BitBuffer::new_autoexpand(32);
         pdu.to_bitbuf(&mut buf).unwrap();
         buf.seek(0);

@@ -383,7 +383,7 @@ fn downlink_ip_when_standby_sends_page_request() {
     };
 
     // Transition to Standby via SN-END OF DATA
-    let eod = EndOfData { nsapi: Nsapi(5) };
+    let eod = EndOfData { immediate_service_change: false };
     sndcp.rx_prim(&mut queue, make_ind(with_discriminator(&encode_end_of_data(&eod)), 8001));
     drain_queue(&mut queue); // END OF DATA produces no output
 
@@ -415,7 +415,7 @@ fn page_response_drains_queued_downlink() {
     };
 
     // Transition to Standby
-    let eod = EndOfData { nsapi: Nsapi(6) };
+    let eod = EndOfData { immediate_service_change: false };
     sndcp.rx_prim(&mut queue, make_ind(with_discriminator(&encode_end_of_data(&eod)), 9001));
     drain_queue(&mut queue);
 

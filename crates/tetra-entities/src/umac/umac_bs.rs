@@ -792,7 +792,9 @@ impl UmacBs {
             Err(e) => {
                 // A candidate UL burst that isn't a valid MAC-ACCESS — typically a false-positive
                 // training-sequence detection or a noise-corrupted burst. Dropped; normal on RF.
-                tracing::debug!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
+                // Logged at trace to keep debug-level output clean; escalate manually when
+                // investigating a real access-related failure.
+                tracing::trace!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
                 return;
             }
         };
