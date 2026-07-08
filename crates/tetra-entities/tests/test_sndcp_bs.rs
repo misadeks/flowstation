@@ -690,3 +690,55 @@ fn downlink_ip_acknowledged_sends_sn_data() {
         other => panic!("expected SN-DATA, got {other:?}"),
     }
 }
+
+/// PD-4g. SN-DATA-TRANSMIT-REQUEST(accept) must emit a `PdchReserveReq` directed at UMAC.
+///
+/// After SNDCP sends TRANSMIT-RESPONSE(accept) it must enqueue a
+/// `SapMsgInner::PdchReserveReq { issi, nsapi }` targeting `TetraEntity::Umac`
+/// so that UMAC can grant the PDCH before the MS sends SN-UNITDATA.
+#[test]
+fn transmit_request_accept_emits_pdch_reserve_req() {
+    let (mut sndcp, mut queue) = make_sndcp();
+    // Activate a PDP context so the context exists in Ready state.
+    activate(&mut sndcp, &mut queue, 30001, demand_dynamic(3)).expect("no ACCEPT");
+    drain_queue(&mut queue);
+
+    // Send TRANSMIT-REQUEST for the activated NSAPI.
+    let req = SnDataTransmitRequest {
+        nsapi: Nsapi(3),
+        logical_link_status: LogicalLinkStatus::NotConnected,
+        enhanced_pi4_dqpsk_service: false,
+        resource_request: None,
+        o_bit: false,
+        sndcp_network_endpoint_identifier: None,
+        m_bit: false,
+        nsapi_additional: vec![],
+    };
+    let sdu = with_discriminator(&encode_data_transmit_request(&req));
+    sndcp.rx_prim(&mut queue, make_ind(sdu, 30001));
+
+    // Drain all outbound messages.
+    let msgs = drain_queue(&mut queue);
+
+    // First message must be the TRANSMIT-RESPONSE(accept) downlink PDU.
+    assert!(!msgs.is_empty(), "expected at least one outbound message");
+
+    // Find the PdchReserveReq among the outbound messages.
+    let reserve_req = msgs.iter().find(|m| {
+        matches!(m.msg, SapMsgInner::PdchReserveReq { .. })
+    });
+    let reserve_req = reserve_req.expect(
+        "TRANSMIT-REQUEST accept must emit PdchReserveReq directed at UMAC"
+    );
+
+    // Verify destination and payload.
+    assert_eq!(reserve_req.dest, TetraEntity::Umac, "PdchReserveReq must be destined for UMAC");
+    assert_eq!(reserve_req.src, TetraEntity::Sndcp, "PdchReserveReq must come from SNDCP");
+    match reserve_req.msg {
+        SapMsgInner::PdchReserveReq { issi, nsapi } => {
+            assert_eq!(issi, 30001, "PdchReserveReq issi must match the requesting MS");
+            assert_eq!(nsapi, 3, "PdchReserveReq nsapi must match the context NSAPI");
+        }
+        _ => panic!("expected PdchReserveReq"),
+    }
+}

@@ -1672,6 +1672,49 @@ impl UmacBs {
         self.pdch_allocator.release(issi);
     }
 
+    /// Handle `PdchReserveReq` from SNDCP (PD-4g).
+    ///
+    /// Called right after SNDCP sends TRANSMIT-RESPONSE(accept) so a PDCH slot
+    /// is granted before the MS sends SN-UNITDATA.  Uses the same TS4 > TS3 > TS2
+    /// dynamic-allocation policy as the hyperframe PDCH tick and
+    /// `handle_pdch_unitdata_req`.
+    ///
+    /// On the first call for an ISSI: reserve + emit MAC-RESOURCE with
+    /// chan_alloc_element.  On idempotent retry (ISSI already reserved): refresh
+    /// `last_used_at` and re-emit MAC-RESOURCE so a stale PDCH assignment is
+    /// refreshed on the MS side.  If no eligible timeslot is available (voice
+    /// occupies TS2/3/4), the message is logged and dropped; the PDCH-unitdata
+    /// path will retry when SN-UNITDATA arrives.
+    fn handle_pdch_reserve_req(&mut self, issi: u32, nsapi: u8) {
+        if !self.packet_data_enabled {
+            return;
+        }
+
+        // Pick the highest-numbered free timeslot (TS4 > TS3 > TS2, yield to voice).
+        // Same policy as the hyperframe PDCH tick.
+        let chosen_ts = [4u8, 3, 2]
+            .iter()
+            .find(|&&ts| !self.channel_scheduler.circuit_is_active(Direction::Dl, ts))
+            .copied();
+
+        let Some(ts) = chosen_ts else {
+            tracing::info!(
+                "UMAC: PdchReserveReq deferred: no free timeslot for issi={} nsapi={}",
+                issi, nsapi
+            );
+            return;
+        };
+
+        // reserve() is idempotent: true = newly created, false = refreshed.
+        self.pdch_allocator.reserve(issi, nsapi, self.dltime);
+
+        tracing::info!(
+            "UMAC: PdchReserveReq issi={} nsapi={} ts={} → emitting MAC-RESOURCE grant",
+            issi, nsapi, ts
+        );
+        self.emit_pdch_mac_resource(issi, ts);
+    }
+
     /// Handle a `TmaUnitdataReq` with `packet_data_flag = true` (PDCH path).
     /// Reserves the PDCH slot for the ISSI. On the first PDU for a new ISSI,
     /// emits a `MAC-RESOURCE` with a `ChanAllocElement` granting the PDCH so
@@ -2337,6 +2380,11 @@ impl TetraEntityTrait for UmacBs {
                 // ── PD-5: PdchReleaseReq (gated) ────────────────────────────
                 if let SapMsgInner::PdchReleaseReq { issi, nsapi } = message.msg {
                     self.handle_pdch_release_req(issi, nsapi);
+                    return;
+                }
+                // ── PD-4g: PdchReserveReq (gated) ───────────────────────────
+                if let SapMsgInner::PdchReserveReq { issi, nsapi } = message.msg {
+                    self.handle_pdch_reserve_req(issi, nsapi);
                     return;
                 }
                 self.rx_control(queue, message);

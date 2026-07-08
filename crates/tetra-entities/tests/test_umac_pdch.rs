@@ -644,3 +644,86 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
         "no PDCH MAC-RESOURCE should be emitted when PDCH yields to voice pressure"
     );
 }
+
+// ── test PD-4g ────────────────────────────────────────────────────────────────
+/// Sending a `SapMsgInner::PdchReserveReq { issi: 1234, nsapi: 1 }` to UMAC
+/// (with `packet_data_enabled = true`) must cause UMAC to emit a `MAC-RESOURCE`
+/// PDU with a `chan_alloc_element` granting the PDCH timeslot.
+///
+/// This reproduces the PD-4g fix: SNDCP emits PdchReserveReq right after
+/// TRANSMIT-RESPONSE(accept) so the MS gets a PDCH grant before it sends
+/// SN-UNITDATA.
+#[test]
+fn pdch_reserve_req_triggers_mac_resource_with_channel_allocation() {
+    debug::setup_logging_verbose();
+
+    const TEST_ISSI: u32 = 1234;
+    const TEST_NSAPI: u8 = 1;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Enable PDCH so the packet-data path is active.
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("downcast");
+        umac.set_packet_data_enabled_for_test(true);
+    }
+
+    // Submit a PdchReserveReq directly — as SNDCP would after TRANSMIT-RESPONSE(accept).
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::PdchReserveReq { issi: TEST_ISSI, nsapi: TEST_NSAPI },
+    });
+    // Run enough ticks for the message to be processed and reach LMAC.
+    test.run_stack(Some(4));
+
+    let sink_msgs = test.dump_sinks();
+
+    let pdu = find_pdch_mac_resource(&sink_msgs, TEST_ISSI)
+        .expect("PdchReserveReq must trigger a MAC-RESOURCE with ChanAllocElement for the MS");
+
+    let chan_alloc = pdu.chan_alloc_element
+        .expect("chan_alloc_element must be present in the MAC-RESOURCE grant");
+
+    // SSI address must match.
+    assert_eq!(
+        pdu.addr.map(|a| a.ssi),
+        Some(TEST_ISSI),
+        "MAC-RESOURCE must be addressed to ISSI={TEST_ISSI}"
+    );
+
+    // Exactly one timeslot assigned.
+    let assigned_count = chan_alloc.ts_assigned.iter().filter(|&&b| b).count();
+    assert_eq!(assigned_count, 1, "exactly one timeslot must be assigned in the PDCH grant");
+
+    // TS1 must never be the PDCH slot (it's the control channel).
+    assert!(!chan_alloc.ts_assigned[0], "TS1 must never be assigned as a PDCH timeslot");
+
+    // With no voice circuits active, TS4 is the preferred PDCH slot.
+    assert!(
+        chan_alloc.ts_assigned[3],
+        "with no voice circuits, PDCH must prefer TS4 (highest eligible)"
+    );
+
+    // UL+DL must both be assigned.
+    use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
+    assert_eq!(
+        chan_alloc.ul_dl_assigned,
+        UlDlAssignment::Both,
+        "ul_dl_assigned must be Both for symmetric PDCH"
+    );
+
+    // The carrier must be the main carrier.
+    assert_eq!(
+        chan_alloc.carrier_num, MAIN_CARRIER,
+        "PDCH carrier must be the main carrier"
+    );
+}
