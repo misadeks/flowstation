@@ -409,6 +409,7 @@ impl Llc {
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
                 tx_reporter: prim.tx_reporter.take(),
+                packet_data_flag: prim.packet_data_flag,
             }),
         };
 
@@ -475,6 +476,7 @@ impl Llc {
                         data_category: prim.data_class_info,
                         chan_alloc: prim.chan_alloc,
                         tx_reporter: prim.tx_reporter.take(),
+                        packet_data_flag: false,
                     }),
                 };
                 self.outbound_udata_messages.push_back(sapmsg);
@@ -511,6 +513,7 @@ impl Llc {
                     data_category: prim.data_class_info,
                     chan_alloc: prim.chan_alloc,
                     tx_reporter: prim.tx_reporter.take(),
+                    packet_data_flag: false,
                 }),
             };
             self.outbound_udata_messages.push_back(sapmsg);
@@ -583,6 +586,7 @@ impl Llc {
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
                 tx_reporter: Some(tx_reporter.clone()),
+                packet_data_flag: false, // TlaTlDataReqBl carries signalling, not packet data
             }),
         };
 
@@ -714,6 +718,7 @@ impl Llc {
                     data_category: None,
                     chan_alloc: None,
                     tx_reporter: None,
+                    packet_data_flag: false, // AL unack segments are signalling
                 }),
             });
         }
@@ -1172,6 +1177,7 @@ impl Llc {
                     data_category: None,            // TODO FIXME
                     chan_alloc,
                     tx_reporter: None, // By definition, no higher layer entity is interested
+                    packet_data_flag: false, // ACK replies are never packet data
                 }),
             };
             queue.push_back(sapmsg);
@@ -1994,6 +2000,7 @@ impl Llc {
                                         data_category: None,
                                         chan_alloc: None,
                                         tx_reporter: None,
+                                        packet_data_flag: false, // AL retransmissions are signalling
                                     }),
                                 });
                             }
@@ -2307,6 +2314,7 @@ impl Llc {
                 data_category: None,
                 chan_alloc: None,
                 tx_reporter: None,
+                packet_data_flag: false, // AL raw messages are signalling (ACKs, setup, etc.)
             }),
         }
     }
@@ -2393,6 +2401,7 @@ impl Llc {
                         data_category: None,
                         chan_alloc: None,
                         tx_reporter: None,
+                        packet_data_flag: false, // AL SDU segments are signalling
                     }),
                 });
             }

@@ -18,3 +18,5 @@ pub mod mac_u_signal;
 
 pub mod mac_sync;
 pub mod mac_sysinfo;
+
+pub mod d_channel_alloc_broadcast;
