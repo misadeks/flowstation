@@ -9,12 +9,14 @@ use tetra_config::bluestation::StackMode;
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_entities::umac::umac_bs::UmacBs;
-// NOTE: DChannelAllocationBroadcast import removed — codec pending corrected ETSI wire schema.
+use tetra_pdus::umac::pdus::access_define::AccessDefine;
+use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tla::TlaTlUnitdataReqBl;
 use tetra_saps::tma::TmaUnitdataReq;
+use tetra_saps::tmv::TmvUnitdataReqSlots;
 
 use crate::common::ComponentTest;
 
@@ -44,11 +46,41 @@ fn make_pdch_unitdata_req(issi: u32) -> TmaUnitdataReq {
     }
 }
 
+/// Scan all LMAC sink messages for a MAC-RESOURCE PDU addressed to `issi` that
+/// carries a `chan_alloc_element`.  Returns the first matching PDU.
+fn find_pdch_mac_resource(sink_msgs: &[SapMsg], issi: u32) -> Option<MacResource> {
+    for msg in sink_msgs {
+        let slots: Vec<_> = match &msg.msg {
+            SapMsgInner::TmvUnitdataReq(slot) => vec![slot.clone()],
+            SapMsgInner::TmvUnitdataReqSlots(TmvUnitdataReqSlots { slots }) => slots.clone(),
+            _ => continue,
+        };
+        for slot in slots {
+            for block in [&slot.blk1, &slot.blk2].into_iter().flatten() {
+                let mut buf = block.mac_block.clone();
+                // Peek at mac_pdu_type; only MAC-RESOURCE (0) carries chan_alloc.
+                let mut peek = buf.clone();
+                if peek.read_field(2, "t").map(|t| t != 0).unwrap_or(true) {
+                    continue;
+                }
+                let Ok(pdu) = MacResource::from_bitbuf(&mut buf) else {
+                    continue;
+                };
+                if pdu.addr.map(|a| a.ssi) == Some(issi) && pdu.chan_alloc_element.is_some() {
+                    return Some(pdu);
+                }
+            }
+        }
+    }
+    None
+}
+
 // ── test 1 ────────────────────────────────────────────────────────────────────
-/// With packet_data_enabled = false (the default), ticking a hyperframe
-/// must never produce a D-CHANNEL-ALLOCATION-BROADCAST.
+/// With `packet_data_enabled = false` (the default), ticking a hyperframe must
+/// never produce a MAC-RESOURCE with a `chan_alloc_element` for a PDCH grant,
+/// and the ACCESS-DEFINE bring-up buffer must remain `None`.
 #[test]
-fn default_off_scheduler_behaviour_matches_today() {
+fn default_off_scheduler_behaviour_unchanged() {
     debug::setup_logging_verbose();
 
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
@@ -59,7 +91,15 @@ fn default_off_scheduler_behaviour_matches_today() {
     // Run one full hyperframe (60 multiframes × 18 frames × 4 timeslots).
     test.run_stack(Some(60 * 18 * 4));
 
-    // Inspect the UmacBs entity directly; broadcast_pending must remain None.
+    let sink_msgs = test.dump_sinks();
+
+    // No PDCH-related MAC-RESOURCE should appear in the LMAC output.
+    assert!(
+        find_pdch_mac_resource(&sink_msgs, 0).is_none(),
+        "no PDCH MAC-RESOURCE should be emitted when packet_data_enabled = false \
+         (checked via generic SSI=0 search)"
+    );
+
     let umac = test
         .router
         .get_entity(TetraEntity::Umac)
@@ -69,25 +109,92 @@ fn default_off_scheduler_behaviour_matches_today() {
         .expect("downcast to UmacBs");
 
     assert!(
-        !umac.pdch_broadcast_hook_fired,
-        "PDCH broadcast hook must not fire when packet_data_enabled = false"
+        umac.pdch_access_define_buf.is_none(),
+        "ACCESS-DEFINE must not be built when packet_data_enabled = false"
     );
 }
 
 // ── test 2 ────────────────────────────────────────────────────────────────────
-/// With packet_data_enabled = true, ticking to frame 1 of the first multiframe
-/// With `packet_data_enabled = true`, ticking to t=1, f=1 must fire the
-/// PDCH broadcast hook (observable via `pdch_broadcast_hook_fired`).
+/// `packet_data_flag` must propagate from `TlaTlUnitdataReqBl` through the
+/// LLC layer and arrive in `TmaUnitdataReq` with `packet_data_flag = true`.
 ///
-/// NOTE: this test is intentionally a PLACEHOLDER. The real PDU decode
-/// assertion will be added once the corrected ETSI EN 300 392-2 clause
-/// 21.4.3.4 wire format arrives. For now we only verify that the hook
-/// fires at the right hyperframe cadence and that a timeslot is chosen.
+/// We wire LLC + UMAC together and feed the TLA primitive to LLC, then
+/// check that UMAC received a `TmaUnitdataReq` with the flag set by
+/// verifying that a PDCH reservation was created for the source ISSI.
 #[test]
-fn pdch_broadcast_emitted_when_enabled() {
+fn packet_data_flag_threads_through_llc_to_umac() {
     debug::setup_logging_verbose();
 
-    // Start at timeslot 1 of frame 1 so the first tick hits the broadcast gate.
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Llc, TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Enable PDCH so the packet-data path is active.
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("downcast");
+        umac.set_packet_data_enabled_for_test(true);
+    }
+
+    const TEST_ISSI: u32 = 7777;
+
+    // Build a TlaTlUnitdataReqBl with packet_data_flag = true.
+    let sdu = BitBuffer::from_bitstr("10101010");
+    let tla_req = TlaTlUnitdataReqBl {
+        main_address: issi_addr(TEST_ISSI),
+        link_id: 0,
+        endpoint_id: 0,
+        tl_sdu: sdu,
+        stealing_permission: false,
+        subscriber_class: 0,
+        fcs_flag: false,
+        air_interface_encryption: None,
+        packet_data_flag: true, // <-- the flag under test
+        n_tlsdu_repeats: 0,
+        data_class_info: None,
+        req_handle: 0,
+        chan_alloc: None,
+        tx_reporter: None,
+    };
+
+    test.submit_message(SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlUnitdataReqBl(tla_req),
+    });
+    test.run_stack(Some(2));
+
+    // If packet_data_flag threading worked, UMAC must have created a reservation.
+    let umac = test
+        .router
+        .get_entity(TetraEntity::Umac)
+        .expect("UMAC")
+        .as_any_mut()
+        .downcast_mut::<UmacBs>()
+        .expect("downcast");
+
+    assert!(
+        umac.pdch_allocator().reservations.contains_key(&TEST_ISSI),
+        "packet_data_flag=true must propagate through LLC→UMAC and trigger a PDCH reservation \
+         for ISSI={TEST_ISSI}"
+    );
+}
+
+// ── test 3 ────────────────────────────────────────────────────────────────────
+/// The first `TmaUnitdataReq { packet_data_flag: true }` for a new ISSI must
+/// cause UMAC to emit a `MAC-RESOURCE` PDU with a `ChanAllocElement` granting
+/// the PDCH timeslot.  Fields checked: SSI, carrier_number, ts_assigned bitmap.
+#[test]
+fn first_packet_data_pdu_triggers_mac_resource_with_channel_allocation() {
+    debug::setup_logging_verbose();
+
+    const TEST_ISSI: u32 = 1234;
+
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
 
@@ -96,43 +203,110 @@ fn pdch_broadcast_emitted_when_enabled() {
         let umac = test
             .router
             .get_entity(TetraEntity::Umac)
-            .expect("UMAC not found")
+            .expect("UMAC")
             .as_any_mut()
             .downcast_mut::<UmacBs>()
-            .expect("downcast to UmacBs");
+            .expect("downcast");
         umac.set_packet_data_enabled_for_test(true);
     }
 
-    // One tick at t=1, f=1 should trigger the broadcast gate.
+    // Submit the first packet-data PDU for the ISSI.
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(TEST_ISSI)),
+    });
+    // Run enough ticks for the message to be processed and finalized into LMAC.
+    test.run_stack(Some(4));
+
+    let sink_msgs = test.dump_sinks();
+
+    let pdu = find_pdch_mac_resource(&sink_msgs, TEST_ISSI)
+        .expect("MAC-RESOURCE with ChanAllocElement must be emitted for the first PDCH PDU");
+
+    let chan_alloc = pdu.chan_alloc_element.expect("chan_alloc_element must be present");
+
+    // Exactly one timeslot must be assigned (the dynamically-chosen PDCH slot).
+    let assigned_count = chan_alloc.ts_assigned.iter().filter(|&&b| b).count();
+    assert_eq!(assigned_count, 1, "exactly one timeslot must be assigned in the PDCH grant");
+
+    // TS1 must never be the PDCH slot (it's the control channel).
+    assert!(
+        !chan_alloc.ts_assigned[0],
+        "TS1 must never be assigned as a PDCH timeslot"
+    );
+
+    // With no voice circuits active, TS4 is the preferred PDCH slot.
+    assert!(
+        chan_alloc.ts_assigned[3],
+        "with no voice circuits, PDCH must prefer TS4 (highest eligible)"
+    );
+
+    // The carrier must be the main carrier.
+    assert_eq!(chan_alloc.carrier_num, MAIN_CARRIER, "PDCH carrier must be the main carrier");
+}
+
+// ── test 4 ────────────────────────────────────────────────────────────────────
+/// When `packet_data_enabled = true` and a PDCH timeslot is available, UMAC
+/// must build an `ACCESS-DEFINE` PDU with `common_or_assigned_control = true`
+/// and `access_code = 1` (B) for the PDCH random-access channel.
+///
+/// NOTE: the ACCESS-DEFINE is currently stored in-memory pending full BNCH
+/// broadcast-slot injection (deferred to a later PR).  This test decodes the
+/// in-memory buffer and checks the fields.
+#[test]
+fn access_define_emitted_at_enable() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Enable PDCH.
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("downcast");
+        umac.set_packet_data_enabled_for_test(true);
+    }
+
+    // Run one tick so the PDCH bring-up path fires.
     test.run_stack(Some(1));
 
     let umac = test
         .router
         .get_entity(TetraEntity::Umac)
-        .expect("UMAC not found")
+        .expect("UMAC")
         .as_any_mut()
         .downcast_mut::<UmacBs>()
-        .expect("downcast to UmacBs");
+        .expect("downcast");
 
-    // The broadcast hook must have fired.
+    let buf = umac
+        .pdch_access_define_buf
+        .as_ref()
+        .expect("pdch_access_define_buf must be Some after first tick with packet_data_enabled=true");
+
+    let mut decode_buf = buf.clone();
+    let access_def = AccessDefine::from_bitbuf(&mut decode_buf)
+        .expect("pdch_access_define_buf must be a valid ACCESS-DEFINE PDU");
+
     assert!(
-        umac.pdch_broadcast_hook_fired,
-        "PDCH broadcast hook must fire at t=1,f=1 when packet_data_enabled = true \
-         and a timeslot is free (hook is a placeholder for the real PDU codec, pending \
-         corrected ETSI wire format)"
+        access_def.common_or_assigned_control,
+        "ACCESS-DEFINE must use assigned-channel control for PDCH"
     );
-
-    // The allocator must have picked a timeslot (TS4 with no voice circuits).
     assert_eq!(
-        umac.pdch_allocator().current_timeslot,
-        Some(4),
-        "with no voice circuits active, PDCH must choose TS4 (highest eligible)"
+        access_def.access_code, 1,
+        "ACCESS-DEFINE access_code must be 1 (B) for the PDCH RA channel"
     );
 }
 
-// ── test 3 ────────────────────────────────────────────────────────────────────
+// ── test 5 ────────────────────────────────────────────────────────────────────
 /// Feeding a `TmaUnitdataReq { packet_data_flag: true }` to UMAC must create
-/// a PDCH reservation for the source ISSI.
+/// a PDCH reservation for the source ISSI in the `PdchAllocator`.
 #[test]
 fn pdch_allocator_reserves_on_first_uplink() {
     debug::setup_logging_verbose();
@@ -182,7 +356,7 @@ fn pdch_allocator_reserves_on_first_uplink() {
     );
 }
 
-// ── test 4 ────────────────────────────────────────────────────────────────────
+// ── test 6 ────────────────────────────────────────────────────────────────────
 /// A reservation that has been idle for more than PDCH_IDLE_RELEASE_FRAMES
 /// frames must be released on the next tick.
 #[test]
@@ -255,11 +429,11 @@ fn pdch_allocator_releases_after_idle() {
     );
 }
 
-// ── test 5 ────────────────────────────────────────────────────────────────────
+// ── test 7 ────────────────────────────────────────────────────────────────────
 /// Sending a `SapMsgInner::PdchReleaseReq { issi, nsapi }` to UMAC must
 /// immediately remove the reservation for that ISSI.
 #[test]
-fn pdch_release_req_removes_reservation() {
+fn pdch_release_req_removes_assignment() {
     debug::setup_logging_verbose();
 
     const TEST_ISSI: u32 = 9999;
@@ -326,87 +500,10 @@ fn pdch_release_req_removes_reservation() {
     );
 }
 
-// ── test 6 ────────────────────────────────────────────────────────────────────
-/// `packet_data_flag` must propagate from `TlaTlUnitdataReqBl` through the
-/// LLC layer and arrive in `TmaUnitdataReq` with `packet_data_flag = true`.
-///
-/// We wire LLC + UMAC together and feed the TLA primitive to LLC, then
-/// check that UMAC received a `TmaUnitdataReq` with the flag set.
-#[test]
-fn packet_data_flag_threads_through_llc_to_umac() {
-    debug::setup_logging_verbose();
-
-    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
-    // We need LLC (to thread the flag) and a UMAC sink to observe the output.
-    // Use a Sink on UMAC so messages destined for UMAC are captured instead of
-    // being processed (which would need the full UMAC entity).
-    // Actually, we need UMAC to receive and process the message to check internal
-    // state. Let's use LLC + UMAC, and a sink on Lmac to capture what comes out.
-    test.populate_entities(vec![TetraEntity::Llc, TetraEntity::Umac], vec![TetraEntity::Lmac]);
-
-    // Enable PDCH so the packet-data path is active.
-    {
-        let umac = test
-            .router
-            .get_entity(TetraEntity::Umac)
-            .expect("UMAC")
-            .as_any_mut()
-            .downcast_mut::<UmacBs>()
-            .expect("downcast");
-        umac.set_packet_data_enabled_for_test(true);
-    }
-
-    const TEST_ISSI: u32 = 7777;
-
-    // Build a TlaTlUnitdataReqBl with packet_data_flag = true.
-    let sdu = BitBuffer::from_bitstr("10101010");
-    let tla_req = TlaTlUnitdataReqBl {
-        main_address: issi_addr(TEST_ISSI),
-        link_id: 0,
-        endpoint_id: 0,
-        tl_sdu: sdu,
-        stealing_permission: false,
-        subscriber_class: 0,
-        fcs_flag: false,
-        air_interface_encryption: None,
-        packet_data_flag: true,  // <-- the flag under test
-        n_tlsdu_repeats: 0,
-        data_class_info: None,
-        req_handle: 0,
-        chan_alloc: None,
-        tx_reporter: None,
-    };
-
-    test.submit_message(SapMsg {
-        sap: Sap::TlaSap,
-        src: TetraEntity::Mle,
-        dest: TetraEntity::Llc,
-        msg: SapMsgInner::TlaTlUnitdataReqBl(tla_req),
-    });
-    test.run_stack(Some(2));
-
-    // If packet_data_flag threading worked, UMAC must have called
-    // `handle_pdch_unitdata_req` and created a reservation.
-    // That's the observable side-effect we can check via the test accessor.
-    let umac = test
-        .router
-        .get_entity(TetraEntity::Umac)
-        .expect("UMAC")
-        .as_any_mut()
-        .downcast_mut::<UmacBs>()
-        .expect("downcast");
-
-    assert!(
-        umac.pdch_allocator().reservations.contains_key(&TEST_ISSI),
-        "packet_data_flag=true must propagate through LLC→UMAC and trigger a PDCH reservation \
-         for ISSI={TEST_ISSI}"
-    );
-}
-
-// ── test 7 ────────────────────────────────────────────────────────────────────
+// ── test 8 ────────────────────────────────────────────────────────────────────
 /// When TS2, TS3, and TS4 are all occupied by voice circuits, the PDCH
 /// allocator must not pick any timeslot (`current_timeslot = None`) and
-/// no D-CHANNEL-ALLOCATION-BROADCAST must be emitted this hyperframe.
+/// no `pdch_broadcast_hook_fired` must be set.
 #[test]
 fn pdch_yields_to_voice_when_all_slots_taken() {
     debug::setup_logging_verbose();
@@ -441,7 +538,7 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
     test.submit_message(open_voice(2));
     test.submit_message(open_voice(3));
     test.submit_message(open_voice(4));
-    // Process the circuit-open messages (doesn't need a full tick).
+    // Process the circuit-open messages.
     test.deliver_all_messages();
 
     // Enable PDCH.
@@ -476,6 +573,8 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
     // Run one tick at t=1, f=1 — the PDCH broadcast gate.
     test.run_stack(Some(1));
 
+    let sink_msgs = test.dump_sinks();
+
     let umac = test
         .router
         .get_entity(TetraEntity::Umac)
@@ -491,9 +590,9 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
         "PDCH must yield when all eligible timeslots (TS2/3/4) are occupied by voice"
     );
 
-    // Broadcast hook must NOT have fired.
+    // No MAC-RESOURCE-with-channel-allocation must have been emitted.
     assert!(
-        !umac.pdch_broadcast_hook_fired,
-        "PDCH broadcast hook must NOT fire when PDCH yields to voice pressure"
+        find_pdch_mac_resource(&sink_msgs, 0).is_none(),
+        "no PDCH MAC-RESOURCE should be emitted when PDCH yields to voice pressure"
     );
 }

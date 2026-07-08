@@ -18,6 +18,11 @@ pub struct PdchReservation {
     pub reserved_at: TdmaTime,
     /// Frame of the most recent packet-data activity for this ISSI.
     pub last_used_at: TdmaTime,
+    /// Traffic usage marker (UMt) assigned to this PDCH reservation so the MS
+    /// can identify the PDCH slot in the AACH per ETSI TS 100 392-2 §23.5.1.
+    /// NOTE: spec ambiguous — chosen behaviour: assigned at reservation time,
+    /// advertised in MAC-RESOURCE, echoed in AACH Traffic(UMt) field.
+    pub umt: u8,
 }
 
 /// Tracks per-ISSI PDCH reservations and handles idle-release.
@@ -30,6 +35,11 @@ pub struct PdchAllocator {
     /// could be picked this hyperframe (e.g. voice took all eligible slots).
     /// Updated each hyperframe by the UMAC scheduler.
     pub current_timeslot: Option<u8>,
+    /// Rotating cursor for UMt allocation. Valid range is [4, 62] per ETSI TS 100 392-2
+    /// §23.5.1 (0 = unallocated, 1–3 and 63 reserved). Wraps back to 4 after 62.
+    /// NOTE: spec ambiguous — chosen behaviour: per-allocator cursor, not per-timeslot,
+    /// since PDCH uses a single dynamic timeslot per cell.
+    next_umt: u8,
 }
 
 impl PdchAllocator {
@@ -38,23 +48,39 @@ impl PdchAllocator {
             reservations: HashMap::new(),
             idle_release_frames,
             current_timeslot: None,
+            next_umt: 4, // Start at 4; range [4, 62] per spec
         }
+    }
+
+    /// Allocate the next traffic usage marker (UMt) from the rotating cursor.
+    /// Wraps in the range [4, 62]; 0 is "unallocated", 1–3 and 63 are reserved.
+    pub fn alloc_umt(&mut self) -> u8 {
+        let umt = self.next_umt;
+        self.next_umt = if umt >= 62 { 4 } else { umt + 1 };
+        umt
     }
 
     /// Create or refresh a reservation for `issi`.
     /// If a reservation already exists it is refreshed (last_used_at updated).
-    pub fn reserve(&mut self, issi: u32, nsapi: u8, now: TdmaTime) {
-        self.reservations
-            .entry(issi)
-            .and_modify(|r| {
-                r.last_used_at = now;
-            })
-            .or_insert_with(|| PdchReservation {
+    /// Returns `true` if this was a NEW reservation (not a refresh).
+    pub fn reserve(&mut self, issi: u32, nsapi: u8, now: TdmaTime) -> bool {
+        if self.reservations.contains_key(&issi) {
+            self.reservations.get_mut(&issi).unwrap().last_used_at = now;
+            false
+        } else {
+            let umt = self.alloc_umt();
+            self.reservations.insert(
                 issi,
-                nsapi,
-                reserved_at: now,
-                last_used_at: now,
-            });
+                PdchReservation {
+                    issi,
+                    nsapi,
+                    reserved_at: now,
+                    last_used_at: now,
+                    umt,
+                },
+            );
+            true
+        }
     }
 
     /// Update `last_used_at` for `issi` without creating a new reservation.
@@ -104,9 +130,12 @@ mod tests {
     #[test]
     fn reserve_creates_entry() {
         let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
-        alloc.reserve(1234, 0, t(0, 1, 1, 1));
+        let is_new = alloc.reserve(1234, 0, t(0, 1, 1, 1));
+        assert!(is_new, "first reserve must return true");
         assert!(alloc.reservations.contains_key(&1234));
         assert_eq!(alloc.reservations[&1234].nsapi, 0);
+        // UMt must be in the valid range [4, 62]
+        assert!((4..=62).contains(&alloc.reservations[&1234].umt));
     }
 
     #[test]
@@ -114,8 +143,10 @@ mod tests {
         let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
         let t0 = t(0, 1, 1, 1);
         let t1 = t(0, 1, 5, 1);
-        alloc.reserve(1234, 0, t0);
-        alloc.reserve(1234, 0, t1);
+        let first = alloc.reserve(1234, 0, t0);
+        let second = alloc.reserve(1234, 0, t1);
+        assert!(first, "first reserve must be new");
+        assert!(!second, "second reserve must be a refresh");
         assert_eq!(alloc.reservations[&1234].last_used_at, t1);
         assert_eq!(alloc.reservations[&1234].reserved_at, t0);
     }

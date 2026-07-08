@@ -12,7 +12,7 @@ use tetra_pdus::umac::enums::sysinfo_opt_field_flag::SysinfoOptFieldFlag;
 use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
 use tetra_pdus::umac::fields::sysinfo_ext_services::SysinfoExtendedServices;
-// NOTE: DChannelAllocationBroadcast import removed — codec pending corrected ETSI wire schema.
+use tetra_pdus::umac::pdus::access_define::AccessDefine;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_data::MacData;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
@@ -90,11 +90,15 @@ pub struct UmacBs {
     pdch_allocator: PdchAllocator,
     /// Queued packet-data PDUs to be drained onto the chosen PDCH slot.
     pdch_dl_queue: std::collections::VecDeque<BitBuffer>,
-    /// Hook flag: set to `true` each hyperframe when packet data is enabled AND
-    /// a PDCH timeslot was successfully chosen. Used as a test observable until
-    /// the real `D-CHANNEL-ALLOCATION-BROADCAST` codec arrives (schema TBD —
-    /// pending corrected ETSI EN 300 392-2 clause 21.4.3.4 wire format).
-    pub pdch_broadcast_hook_fired: bool,
+    /// Serialised ACCESS-DEFINE PDU built once at PDCH bring-up and stored here
+    /// until a broadcast slot is available to inject it.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour: emit exactly once at bring-up.
+    /// Full broadcast-slot injection via BNCH is deferred to a later PR; for
+    /// now this field is the test-observable representation.
+    pub pdch_access_define_buf: Option<BitBuffer>,
+    /// Guard: prevents re-building the ACCESS-DEFINE on every subsequent tick.
+    pdch_access_define_emitted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -142,7 +146,8 @@ impl UmacBs {
             packet_data_enabled: PACKET_DATA_ENABLED,
             pdch_allocator: PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES),
             pdch_dl_queue: std::collections::VecDeque::new(),
-            pdch_broadcast_hook_fired: false,
+            pdch_access_define_buf: None,
+            pdch_access_define_emitted: false,
         }
     }
 
@@ -1664,32 +1669,132 @@ impl UmacBs {
     }
 
     /// Handle a `TmaUnitdataReq` with `packet_data_flag = true` (PDCH path).
-    /// Reserves the PDCH slot for the ISSI and enqueues the PDU for TS4.
+    /// Reserves the PDCH slot for the ISSI. On the first PDU for a new ISSI,
+    /// emits a `MAC-RESOURCE` with a `ChanAllocElement` granting the PDCH so
+    /// the MS learns which (carrier, timeslot) to use.
     fn handle_pdch_unitdata_req(&mut self, prim: &tetra_saps::tma::TmaUnitdataReq) {
         let issi = prim.main_address.ssi;
-        self.pdch_allocator.reserve(issi, 0, self.dltime);
+
+        // `reserve` returns true only for the very first PDU from this ISSI.
+        let is_new = self.pdch_allocator.reserve(issi, 0, self.dltime);
+
         tracing::debug!(
-            "UMAC: PDCH reserve issi={} enqueuing {} bits",
+            "UMAC: PDCH reserve issi={} enqueuing {} bits (new={})",
             issi,
-            prim.pdu.get_len()
+            prim.pdu.get_len(),
+            is_new
         );
         self.pdch_dl_queue.push_back(prim.pdu.clone());
+
+        if is_new {
+            // First packet-data PDU from this ISSI: pick the highest-numbered
+            // free timeslot and grant it via MAC-RESOURCE.
+            // NOTE: spec ambiguous — chosen behaviour: dynamic allocation using the
+            // same policy as the hyperframe PDCH tick (TS4 > TS3 > TS2).
+            let chosen_ts = [4u8, 3, 2]
+                .iter()
+                .find(|&&ts| !self.channel_scheduler.circuit_is_active(Direction::Dl, ts))
+                .copied();
+
+            if let Some(ts) = chosen_ts {
+                self.emit_pdch_mac_resource(issi, ts);
+            } else {
+                tracing::info!(
+                    "UMAC: PDCH MAC-RESOURCE for issi={} deferred — all TS2/3/4 occupied by voice/SDS",
+                    issi
+                );
+            }
+        }
     }
 
-    /// Placeholder for the future `D-CHANNEL-ALLOCATION-BROADCAST` AACH emission.
+    /// Build and enqueue a `MAC-RESOURCE` PDU with a `ChanAllocElement` granting
+    /// `issi` the PDCH on timeslot `ts`.
     ///
-    /// The real implementation is blocked pending the corrected ETSI EN 300 392-2
-    /// clause 21.4.3.4 wire format (field widths and ordering TBD).  For now this
-    /// method sets a test-observable bool flag so tests can verify the hook fires
-    /// at the right hyperframe cadence without depending on a specific bit pattern.
-    fn trigger_pdch_broadcast_hook(&mut self, pdch_ts: u8) {
-        // TODO(PD-5-schema): replace with real DChannelAllocationBroadcast codec
-        // once corrected wire format arrives.
-        tracing::debug!(
-            "UMAC: PDCH broadcast hook fired for TS{} (codec pending)",
-            pdch_ts
+    /// NOTE: spec ambiguous — chosen behaviour:
+    ///   alloc_type = Additional (01) so MS keeps MCCH presence.
+    ///   ul_dl_assigned = Both (11) for symmetric UL+DL PDCH.
+    ///   mon_pattern = 0 with frame18_mon_pattern = Some(0).
+    fn emit_pdch_mac_resource(&mut self, issi: u32, ts: u8) {
+        let carrier = self.main_carrier();
+
+        // ts_assigned bitmap: TS1 = index 0 (MSB), TS4 = index 3 (LSB).
+        let ts_assigned = [ts == 1, ts == 2, ts == 3, ts == 4];
+
+        let umt = self.pdch_allocator.alloc_umt();
+
+        let chan_alloc = ChanAllocElement {
+            // NOTE: spec ambiguous — chosen behaviour: Additional (01) so the MS
+            // can retain its MCCH presence and the PDCH is an additional resource.
+            alloc_type: ChanAllocType::Additional,
+            ts_assigned,
+            // NOTE: spec ambiguous — chosen behaviour: Both (11), symmetric UL+DL
+            // for V1 PDCH; asymmetric modes deferred to a future PR.
+            ul_dl_assigned: UlDlAssignment::Both,
+            clch_permission: false,
+            cell_change_flag: false,
+            carrier_num: carrier,
+            ext: None,
+            // NOTE: spec ambiguous — chosen behaviour: monitoring pattern 0
+            // (standard pattern) with frame18_mon_pattern = 0.
+            mon_pattern: 0,
+            frame18_mon_pattern: Some(0),
+        };
+
+        let mut pdu = MacResource {
+            addr: Some(TetraAddress { ssi: issi, ssi_type: SsiType::Issi }),
+            // Usage marker so the MS can identify this PDCH reservation in AACH.
+            // NOTE: spec ambiguous — chosen behaviour: include UMt in the initial
+            // MAC-RESOURCE so the MS can correlate AACH Traffic(UMt) with the grant.
+            usage_marker: Some(umt),
+            chan_alloc_element: Some(chan_alloc),
+            ..Default::default()
+        };
+
+        let sdu = BitBuffer::new(0);
+        pdu.update_len_and_fill_ind(sdu.get_len());
+
+        tracing::info!(
+            "UMAC: PDCH MAC-RESOURCE grant issi={} ts={} umt={} carrier={}",
+            issi, ts, umt, carrier
         );
-        self.pdch_broadcast_hook_fired = true;
+
+        self.channel_scheduler.dl_enqueue_tma(pdu, sdu, None);
+    }
+
+    /// Build the ACCESS-DEFINE PDU for PDCH random-access parameters and return
+    /// it serialised as a `BitBuffer`.
+    ///
+    /// Emitted once at PDCH bring-up to tell MSs which access code applies to
+    /// the PDCH random-access channel.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour:
+    ///   common_or_assigned_control = true (assigned channel).
+    ///   access_code = 1 (B) — the assigned access code for the PDCH.
+    ///   imm/wt/nu/ts_pointer: conservative V1 defaults.
+    fn build_pdch_access_define(&self) -> BitBuffer {
+        let access_def = AccessDefine {
+            // NOTE: spec ambiguous — chosen behaviour: true = assigned-channel
+            // control, so MSs know this defines the PDCH RA parameters.
+            common_or_assigned_control: true,
+            // NOTE: spec ambiguous — chosen behaviour: access_code = 1 (B)
+            // for the PDCH RA channel per ETSI TS 100 392-2 §21.4.4.3.
+            access_code: 1,
+            // NOTE: spec ambiguous — conservative V1 defaults below.
+            imm: 0,
+            wt: 4,
+            nu: 4,
+            frame_len_factor: false,
+            ts_pointer: 0,
+            min_pdu_prio: 0,
+            opt_field_flag: 0,
+            subscriber_class: None,
+            gssi: None,
+        };
+
+        let mut buf = BitBuffer::new_autoexpand(32);
+        access_def.to_bitbuf(&mut buf);
+        buf.seek(0); // Reset read position so consumers can decode from the start
+        buf
     }
 
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
@@ -2302,13 +2407,18 @@ impl TetraEntityTrait for UmacBs {
                         );
                     }
 
-                    // 4. Trigger the PDCH broadcast hook on the hyperframe gate.
-                    //    The real D-CHANNEL-ALLOCATION-BROADCAST codec is blocked until
-                    //    the corrected ETSI EN 300 392-2 clause 21.4.3.4 wire format
-                    //    arrives. For now we set `pdch_broadcast_hook_fired` so tests
-                    //    can observe that the broadcast WOULD fire at the right cadence.
-                    if ts.t == 1 && ts.f == 1 && self.channel_scheduler.allow_common_control_aach() {
-                        self.trigger_pdch_broadcast_hook(chosen_ts);
+                    // 4. Emit ACCESS-DEFINE once at PDCH bring-up so MSs learn the
+                    //    RA parameters for the PDCH.
+                    //    NOTE: spec ambiguous — chosen behaviour: emit once on the
+                    //    first successful PDCH tick; full BNCH injection deferred to
+                    //    a later PR.
+                    if !self.pdch_access_define_emitted {
+                        self.pdch_access_define_buf = Some(self.build_pdch_access_define());
+                        self.pdch_access_define_emitted = true;
+                        tracing::info!(
+                            "UMAC: PDCH ACCESS-DEFINE built for TS{} bring-up (broadcast pending)",
+                            chosen_ts
+                        );
                     }
                 }
             }
