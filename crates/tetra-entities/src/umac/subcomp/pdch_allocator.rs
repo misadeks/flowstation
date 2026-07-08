@@ -26,6 +26,10 @@ pub struct PdchAllocator {
     pub reservations: HashMap<u32, PdchReservation>,
     /// Number of idle frames before a reservation is auto-released.
     pub idle_release_frames: u32,
+    /// The timeslot currently allocated for PDCH use, or `None` if no PDCH slot
+    /// could be picked this hyperframe (e.g. voice took all eligible slots).
+    /// Updated each hyperframe by the UMAC scheduler.
+    pub current_timeslot: Option<u8>,
 }
 
 impl PdchAllocator {
@@ -33,6 +37,7 @@ impl PdchAllocator {
         Self {
             reservations: HashMap::new(),
             idle_release_frames,
+            current_timeslot: None,
         }
     }
 

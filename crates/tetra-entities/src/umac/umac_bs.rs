@@ -1678,18 +1678,20 @@ impl UmacBs {
     }
 
     /// Build a `D-CHANNEL-ALLOCATION-BROADCAST` AACH advertisement block for TS1.
+    /// `pdch_ts` is the timeslot index (1-based) that was dynamically chosen for PDCH.
     /// NOTE: spec ambiguous — chosen behaviour: emitted on the SCH/HD half-slot
     /// of TS1 once per hyperframe (when TS1 is in MCCH/broadcast mode).
-    fn build_pdch_aach_broadcast(&self) -> BitBuffer {
+    fn build_pdch_aach_broadcast(&self, pdch_ts: u8) -> BitBuffer {
         let cfg = self.config.config();
+        // Convert 1-based timeslot to 0-based wire index.
+        // NOTE: spec ambiguous — chosen behaviour: wire value = timeslot_number - 1.
+        let ts_wire = pdch_ts.saturating_sub(1);
         let pdu = DChannelAllocationBroadcast {
             // NOTE: spec ambiguous — chosen behaviour: use cell freq_band as DL band.
             dl_frequency_band: cfg.cell.freq_band,
             // NOTE: spec ambiguous — chosen behaviour: main_carrier as the PDCH LCN.
             carrier_number: cfg.cell.main_carrier,
-            // TS4 = index 3 (0-based)
-            // NOTE: spec ambiguous — chosen behaviour: TS4 reserved for PDCH.
-            timeslot: 3,
+            timeslot: ts_wire,
             // NOTE: spec ambiguous — chosen behaviour: symmetric UL+DL.
             ul_dl_mode: UlDlMode::Symmetric,
             encoding: 0,
@@ -2274,34 +2276,57 @@ impl TetraEntityTrait for UmacBs {
                 tracing::info!("UMAC: PDCH idle-release issi={}", issi);
             }
 
-            // 2. TS4 PDCH slot: drain queued packet-data PDU if available, else
-            //    advertise the PDCH via D-CHANNEL-ALLOCATION-BROADCAST on AACH.
-            //    NOTE: spec ambiguous — chosen behaviour: broadcast emitted every
-            //    frame on the TS1 AACH downlink half when TS4 is free.
-            if !self.pdch_dl_queue.is_empty() {
-                // TS4 carries queued packet data — placeholder; actual TS4 wiring
-                // into finalize_ts_for_tick is deferred to when PDCH traffic
-                // scheduling is fully implemented in a later PR. For now just drain
-                // the queue so it doesn't grow unboundedly.
-                let _ = self.pdch_dl_queue.pop_front();
-                tracing::debug!("UMAC: PDCH drained one PDU for TS4 (scheduler integration pending)");
-            }
+            // 2. Dynamic PDCH timeslot allocation.
+            //    Policy: prefer the highest-numbered free timeslot (TS4 > TS3 > TS2).
+            //    TS1 is always the control channel and never eligible.
+            //    If all eligible slots are busy with voice/circuit traffic, PDCH
+            //    yields for this hyperframe and no broadcast is emitted.
+            //    NOTE: spec ambiguous — chosen behaviour: query the main-carrier
+            //    scheduler's DL circuit occupancy; any non-active slot is eligible.
+            let pdch_ts_chosen: Option<u8> = [4u8, 3, 2]
+                .iter()
+                .find(|&&ts_candidate| {
+                    !self
+                        .channel_scheduler
+                        .circuit_is_active(Direction::Dl, ts_candidate)
+                })
+                .copied();
 
-            // 3. Emit D-CHANNEL-ALLOCATION-BROADCAST on the AACH of TS1 once per
-            //    hyperframe (on frame 1, multiframe 1 of each hyperframe).
-            //    NOTE: spec ambiguous — chosen behaviour: every frame that has TS1
-            //    in MCCH mode we queue the broadcast PDU as an AACH annotation.
-            //    Actual injection into the AACH bitstream is handled when the
-            //    scheduler emits the AACH block for TS1.
-            if ts.t == 1 && ts.f == 1 && self.channel_scheduler.allow_common_control_aach() {
-                let broadcast_buf = self.build_pdch_aach_broadcast();
-                // Store for this hyperframe's AACH emission — the scheduler reads it
-                // from `pdch_aach_pending` (set here, consumed in generate_bbk_block).
-                // For PD-5 we record it in the queue and log it; full AACH injection
-                // is wired in a follow-up. The broadcast is observable via the public
-                // accessor in tests.
-                self.pdch_aach_broadcast_pending = Some(broadcast_buf);
-                tracing::debug!("UMAC: PDCH D-CHANNEL-ALLOCATION-BROADCAST queued for AACH");
+            // Update the allocator with the chosen slot for this hyperframe.
+            self.pdch_allocator.current_timeslot = pdch_ts_chosen;
+
+            match pdch_ts_chosen {
+                None => {
+                    // All eligible timeslots are occupied by voice/SDS — yield.
+                    tracing::info!(
+                        "UMAC: PDCH deferred this hyperframe — all TS2/3/4 in use by voice/circuit"
+                    );
+                }
+                Some(chosen_ts) => {
+                    // 3. Drain queued packet-data PDU for the chosen slot (placeholder;
+                    //    actual integration into finalize_ts_for_tick is deferred to
+                    //    when full PDCH traffic scheduling is implemented in a later PR).
+                    if !self.pdch_dl_queue.is_empty() {
+                        let _ = self.pdch_dl_queue.pop_front();
+                        tracing::debug!(
+                            "UMAC: PDCH drained one PDU for TS{} (scheduler integration pending)",
+                            chosen_ts
+                        );
+                    }
+
+                    // 4. Emit D-CHANNEL-ALLOCATION-BROADCAST on the AACH of TS1 once
+                    //    per hyperframe (on frame 1 of multiframe 1).
+                    //    NOTE: spec ambiguous — chosen behaviour: emit every frame
+                    //    where t=1, f=1 and TS1 AACH is available for common control.
+                    if ts.t == 1 && ts.f == 1 && self.channel_scheduler.allow_common_control_aach() {
+                        let broadcast_buf = self.build_pdch_aach_broadcast(chosen_ts);
+                        self.pdch_aach_broadcast_pending = Some(broadcast_buf);
+                        tracing::debug!(
+                            "UMAC: PDCH D-CHANNEL-ALLOCATION-BROADCAST queued for AACH (TS{})",
+                            chosen_ts
+                        );
+                    }
+                }
             }
         }
 

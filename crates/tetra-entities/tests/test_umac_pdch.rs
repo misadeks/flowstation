@@ -6,12 +6,14 @@
 mod common;
 
 use tetra_config::bluestation::StackMode;
-use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_pdus::umac::pdus::d_channel_alloc_broadcast::DChannelAllocationBroadcast;
+use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
+use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
-use tetra_saps::tla::{TlaTlUnitdataReqBl};
+use tetra_saps::tla::TlaTlUnitdataReqBl;
 use tetra_saps::tma::TmaUnitdataReq;
 
 use crate::common::ComponentTest;
@@ -124,9 +126,10 @@ fn pdch_broadcast_emitted_when_enabled() {
     let pdu = DChannelAllocationBroadcast::from_bitbuf(&mut buf)
         .expect("D-CHANNEL-ALLOCATION-BROADCAST must parse without error");
 
-    // TS4 = index 3 per spec scope decision.
-    // NOTE: spec ambiguous — chosen behaviour: TS4 (index 3) reserved for PDCH.
-    assert_eq!(pdu.timeslot, 3, "PDCH must be on TS4 (index 3)");
+    // With no voice circuits active, the allocator should pick TS4 (highest free).
+    // Wire value is 0-based: TS4 → wire index 3.
+    // NOTE: spec ambiguous — chosen behaviour: dynamic allocation prefers TS4 when free.
+    assert_eq!(pdu.timeslot, 3, "with no voice circuits, PDCH must be dynamically placed on TS4 (wire index 3)");
     // Encoding 0 = π/4-DQPSK.
     assert_eq!(pdu.encoding, 0, "encoding must be 0 (π/4-DQPSK)");
     // Bandwidth 0 = 25 kHz.
@@ -403,5 +406,100 @@ fn packet_data_flag_threads_through_llc_to_umac() {
         umac.pdch_allocator().reservations.contains_key(&TEST_ISSI),
         "packet_data_flag=true must propagate through LLC→UMAC and trigger a PDCH reservation \
          for ISSI={TEST_ISSI}"
+    );
+}
+
+// ── test 7 ────────────────────────────────────────────────────────────────────
+/// When TS2, TS3, and TS4 are all occupied by voice circuits, the PDCH
+/// allocator must not pick any timeslot (`current_timeslot = None`) and
+/// no D-CHANNEL-ALLOCATION-BROADCAST must be emitted this hyperframe.
+#[test]
+fn pdch_yields_to_voice_when_all_slots_taken() {
+    debug::setup_logging_verbose();
+
+    // Start at t=1, f=1 so the first tick is the hyperframe broadcast gate.
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Helper: send a CallControl::Open for a voice circuit on the given timeslot.
+    let open_voice = |ts: u8| -> SapMsg {
+        SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+                direction: Direction::Both,
+                carrier_num: MAIN_CARRIER,
+                ts,
+                peer_carrier_num: None,
+                peer_ts: None,
+                usage: 4, // TCH/S group call
+                circuit_mode: CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+                dl_media_source: CircuitDlMediaSource::SwMI,
+            })),
+        }
+    };
+
+    // Occupy TS2, TS3, TS4 with voice circuits.
+    test.submit_message(open_voice(2));
+    test.submit_message(open_voice(3));
+    test.submit_message(open_voice(4));
+    // Process the circuit-open messages (doesn't need a full tick).
+    test.deliver_all_messages();
+
+    // Enable PDCH.
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("downcast");
+        umac.set_packet_data_enabled_for_test(true);
+    }
+
+    // Verify the circuits are actually registered (pre-condition).
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("downcast");
+        for ts in [2u8, 3, 4] {
+            assert!(
+                umac.channel_scheduler.circuit_is_active(Direction::Dl, ts),
+                "pre-condition: TS{ts} must have an active voice circuit"
+            );
+        }
+    }
+
+    // Run one tick at t=1, f=1 — the PDCH broadcast gate.
+    test.run_stack(Some(1));
+
+    let umac = test
+        .router
+        .get_entity(TetraEntity::Umac)
+        .expect("UMAC")
+        .as_any_mut()
+        .downcast_mut::<UmacBs>()
+        .expect("downcast");
+
+    // No PDCH timeslot should have been chosen.
+    assert_eq!(
+        umac.pdch_allocator().current_timeslot,
+        None,
+        "PDCH must yield when all eligible timeslots (TS2/3/4) are occupied by voice"
+    );
+
+    // No D-CHANNEL-ALLOCATION-BROADCAST must be staged.
+    assert!(
+        umac.pdch_aach_broadcast_pending.is_none(),
+        "D-CHANNEL-ALLOCATION-BROADCAST must NOT be emitted when PDCH yields to voice"
     );
 }
