@@ -142,6 +142,15 @@ pub enum SapMsgInner {
         issi: u32,
         nsapi: u8,
     },
+
+    /// SNDCP → UMAC: reserve a PDCH channel for the given ISSI/NSAPI.
+    /// Emitted right after SNDCP sends TRANSMIT-RESPONSE(accept) so that UMAC
+    /// assigns the PDCH before the MS attempts to send SN-UNITDATA there.
+    /// Mirrors `PdchReleaseReq` (added in PD-4g).
+    PdchReserveReq {
+        issi: u32,
+        nsapi: u8,
+    },
 }
 
 impl Display for SapMsgInner {
@@ -226,6 +235,9 @@ impl Display for SapMsgInner {
             // SapMsgInner::TlbTlSysinfoInd(_) => write!(f, "TlbTlSysinfoInd"),
             SapMsgInner::PdchReleaseReq { issi, nsapi } => {
                 write!(f, "PdchReleaseReq(issi={}, nsapi={})", issi, nsapi)
+            }
+            SapMsgInner::PdchReserveReq { issi, nsapi } => {
+                write!(f, "PdchReserveReq(issi={}, nsapi={})", issi, nsapi)
             }
         }
     }

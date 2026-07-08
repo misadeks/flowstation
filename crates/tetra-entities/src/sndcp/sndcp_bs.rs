@@ -633,6 +633,23 @@ impl Sndcp {
             queue, main_address, ind.link_id, ind.endpoint_id,
             sdu, Layer2Service::Acknowledged, false,
         );
+
+        // PD-4g: trigger PDCH allocation immediately after TRANSMIT-RESPONSE(accept)
+        // so the MS receives a MAC-RESOURCE with chan_alloc_element before it tries
+        // to send SN-UNITDATA.  Without this, the only PDCH grant trigger was a
+        // TmaUnitdataReq with packet_data_flag=true (SN-UNITDATA), creating a
+        // chicken-and-egg: no SN-UNITDATA until PDCH assigned, no PDCH until
+        // SN-UNITDATA arrives.
+        // NOTE: spec ambiguous — chosen behaviour: re-emit PdchReserveReq on retry,
+        // allocator is idempotent per reserve() outcome (existing entry = refresh only,
+        // no duplicate MAC-RESOURCE since emit_pdch_mac_resource is only called on
+        // the NewlyAssigned / first-reserve path in handle_pdch_reserve_req).
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Sndcp,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::PdchReserveReq { issi: main_address.ssi, nsapi },
+        });
     }
 
     // -- SN-DATA uplink (type 5, acknowledged data) ----------------------------
