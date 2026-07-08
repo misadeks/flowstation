@@ -358,22 +358,23 @@ fn pdch_allocator_reserves_on_first_uplink() {
 }
 
 // ── test 6 ────────────────────────────────────────────────────────────────────
-/// A reservation that has been idle for more than PDCH_IDLE_RELEASE_FRAMES
-/// frames must be released on the next tick.
+/// A reservation that has been idle for more than the configured idle-release
+/// threshold must be released on the next tick. Uses a compact 12-frame threshold
+/// via the packet_data config so the test itself finishes quickly, rather than
+/// waiting the production 300-frame default (~17 s).
 #[test]
 fn pdch_allocator_releases_after_idle() {
     debug::setup_logging_verbose();
 
-    use tetra_entities::umac::subcomp::pdch_allocator::PDCH_IDLE_RELEASE_FRAMES;
-
     const TEST_ISSI: u32 = 5678;
+    const TEST_IDLE_FRAMES: u32 = 12;
 
     // Start at a known time.
     let start = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(start));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
 
-    // Enable PDCH.
+    // Enable PDCH and shorten the idle threshold for this test.
     {
         let umac = test
             .router
@@ -383,6 +384,7 @@ fn pdch_allocator_releases_after_idle() {
             .downcast_mut::<UmacBs>()
             .expect("downcast");
         umac.set_packet_data_enabled_for_test(true);
+        umac.pdch_allocator_mut().idle_release_frames = TEST_IDLE_FRAMES;
     }
 
     // Submit a packet-data uplink so a reservation is created.
@@ -411,8 +413,7 @@ fn pdch_allocator_releases_after_idle() {
     }
 
     // Advance past the idle threshold.
-    // PDCH_IDLE_RELEASE_FRAMES frames = PDCH_IDLE_RELEASE_FRAMES * 4 timeslots.
-    let idle_timeslots = (PDCH_IDLE_RELEASE_FRAMES * 4 + 4) as usize; // +4 for safety margin
+    let idle_timeslots = (TEST_IDLE_FRAMES * 4 + 4) as usize; // +4 for safety margin
     test.run_stack(Some(idle_timeslots));
 
     // After the ticks the allocator's expire_idle must have fired and removed the entry.
@@ -426,7 +427,7 @@ fn pdch_allocator_releases_after_idle() {
 
     assert!(
         !umac.pdch_allocator().reservations.contains_key(&TEST_ISSI),
-        "idle reservation must be released after {PDCH_IDLE_RELEASE_FRAMES} frames"
+        "idle reservation must be released after {TEST_IDLE_FRAMES} frames"
     );
 }
 

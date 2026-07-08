@@ -5,7 +5,7 @@ use tetra_core::TdmaTime;
 /// How many frames of idle time before a PDCH reservation is automatically
 /// released. At 18 frames/second this is approximately 1 second.
 /// NOTE: spec ambiguous — chosen behaviour: 18 frames (~1 s idle release).
-pub const PDCH_IDLE_RELEASE_FRAMES: u32 = 18;
+pub const PDCH_IDLE_RELEASE_FRAMES: u32 = 300;
 
 /// A single per-ISSI PDCH reservation.
 #[derive(Debug, Clone)]

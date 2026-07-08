@@ -2345,6 +2345,13 @@ impl UmacBs {
     pub fn pdch_allocator(&self) -> &PdchAllocator {
         &self.pdch_allocator
     }
+
+    /// Mutable accessor for the `PdchAllocator`, used by tests that need to
+    /// override configured defaults (e.g. shrinking the idle-release window
+    /// so a test finishes quickly).
+    pub fn pdch_allocator_mut(&mut self) -> &mut PdchAllocator {
+        &mut self.pdch_allocator
+    }
 }
 
 impl TetraEntityTrait for UmacBs {

@@ -603,11 +603,23 @@ impl Sndcp {
             return;
         }
 
-        // Accept: transition (or keep) the context in WaitingForAlSetup. Reset the response-wait
-        // timer so retries don't age out the state prematurely.
+        // Accept: transition context directly to Ready. In earlier PD-4b work we
+        // parked in WaitingForAlSetup to signal "waiting for the MS to bring AL up",
+        // but hardware verification 2026-07-08 confirmed real Motorola MTM800E MSes
+        // run the whole handshake over Basic Link (BL-DATA / BL-ADATA) and never
+        // send AL-SETUP. Sitting in WaitingForAlSetup caused:
+        //   * END-OF-DATA to log "no Ready contexts to transition" (per-MS scan
+        //     looks for Ready only)
+        //   * Standby/Ready transitions to never fire
+        //   * downlink IP path to be gated on a state the MS never reaches
+        // NOTE: spec ambiguous — chosen behaviour: promote directly to Ready on
+        // TRANSMIT-RESPONSE(accept). If we ever wire real SNDCP↔AL bridging, restore
+        // the WaitingForAlSetup transition here and gate the promotion on receipt
+        // of AL-SETUP from the peer.
         if let Some(ctx) = self.contexts.get_mut(&key) {
-            ctx.state = PdpState::WaitingForAlSetup;
-            ctx.resp_wait_deadline = Some(self.dltime.add_timeslots(RESP_WAIT_TIMER_SLOTS));
+            ctx.state = PdpState::Ready;
+            ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+            ctx.resp_wait_deadline = None;
         }
 
         tracing::info!(

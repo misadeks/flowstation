@@ -610,8 +610,11 @@ voice_service = true
 #
 # # PDCH allocator settings (consumed by UMAC).
 # [packet_data.pdch]
-# # Release a PDCH assignment after this many idle frames (default ~1 s at 18 fps).
-# idle_release_frames = 18
+# # Release a PDCH assignment after this many idle frames.
+# # Default 300 (~17 s at 18 fps) — enough for a real MS to move to the assigned
+# # timeslot, exchange a few packets, and pause between bursts. Set lower to
+# # release faster (frees TS4 for voice sooner); higher to hold PDCH open longer.
+# idle_release_frames = 300
 # # Whether to permit multi-slot PDCH (V1: false).
 # multi_slot          = false
 # # Channel width: 0 = 25 kHz (V1 default); 1 = 50 kHz TEDS; 2 = 100; 3 = 150.
