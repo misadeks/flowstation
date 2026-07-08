@@ -134,6 +134,14 @@ pub enum SapMsgInner {
     // TNMM-SAP (MM-User)
     TnmmTestDemand(TnmmTestDemand),
     TnmmTestResponse(TnmmTestResponse),
+
+    /// SNDCP → UMAC: release the PDCH reservation for the given ISSI/NSAPI.
+    /// Emitted on END-OF-DATA in a future PR (PD-6+). Variant added in PD-5 so
+    /// UMAC can handle it when SNDCP starts sending it.
+    PdchReleaseReq {
+        issi: u32,
+        nsapi: u8,
+    },
 }
 
 impl Display for SapMsgInner {
@@ -216,6 +224,9 @@ impl Display for SapMsgInner {
             // TLB-SAP
             // SapMsgInner::TlbTlSyncInd(_) => write!(f, "TlbTlSyncInd"),
             // SapMsgInner::TlbTlSysinfoInd(_) => write!(f, "TlbTlSysinfoInd"),
+            SapMsgInner::PdchReleaseReq { issi, nsapi } => {
+                write!(f, "PdchReleaseReq(issi={}, nsapi={})", issi, nsapi)
+            }
         }
     }
 }

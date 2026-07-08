@@ -69,6 +69,12 @@ pub struct TmaUnitdataReq {
     /// Optional Channel Allocation Request that may be included by CMCE
     pub chan_alloc: Option<CmceChanAllocReq>,
     pub tx_reporter: Option<TxReporter>,
+
+    /// True when this SDU carries SNDCP/packet-data payload (set by LLC from
+    /// `TlaTlUnitdataReqBl::packet_data_flag`). When false the PDU is plain
+    /// signalling and UMAC routes it to the signalling timeslot as normal.
+    /// Added by PD-5; gated by `PACKET_DATA_ENABLED` in `umac_bs.rs`.
+    pub packet_data_flag: bool,
 }
 
 /// Clause 20.4.1.1.4

@@ -207,6 +207,7 @@ fn test_secondary_carrier_normal_signalling_falls_back_to_primary_mcch() {
             ul_dl_assigned: UlDlAssignment::Both,
         }),
         tx_reporter: None,
+        packet_data_flag: false,
     };
 
     test.submit_message(SapMsg {
@@ -284,6 +285,7 @@ fn test_secondary_ts1_channel_allocation_encodes_secondary_carrier_without_css()
             ul_dl_assigned: UlDlAssignment::Both,
         }),
         tx_reporter: None,
+        packet_data_flag: false,
     };
 
     test.submit_message(SapMsg {
@@ -355,6 +357,7 @@ fn test_main_ts1_ordinary_traffic_allocation_is_rejected() {
             ul_dl_assigned: UlDlAssignment::Both,
         }),
         tx_reporter: None,
+        packet_data_flag: false,
     };
 
     test.submit_message(SapMsg {
@@ -737,6 +740,7 @@ fn test_facch_stealing_does_not_set_random_access_flag_without_pending_ra() {
             ul_dl_assigned: UlDlAssignment::Both,
         }),
         tx_reporter: None,
+        packet_data_flag: false,
     };
 
     test.submit_message(SapMsg {
@@ -857,6 +861,7 @@ fn test_traffic_mac_access_does_not_mark_next_facch_as_random_access() {
             alloc_type: ChanAllocType::Replace,
             ul_dl_assigned: UlDlAssignment::Both,
         }),
+        packet_data_flag: false,
         tx_reporter: None,
     };
 
@@ -974,6 +979,7 @@ fn test_stealing_large_sdu_fragments_without_panic() {
             alloc_type: ChanAllocType::Replace,
             ul_dl_assigned: UlDlAssignment::Dl,
         }),
+        packet_data_flag: false,
         tx_reporter: None,
     };
 

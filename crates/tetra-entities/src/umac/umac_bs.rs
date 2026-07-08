@@ -12,6 +12,7 @@ use tetra_pdus::umac::enums::sysinfo_opt_field_flag::SysinfoOptFieldFlag;
 use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
 use tetra_pdus::umac::fields::sysinfo_ext_services::SysinfoExtendedServices;
+use tetra_pdus::umac::pdus::access_define::AccessDefine;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_data::MacData;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
@@ -36,9 +37,18 @@ use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
 use crate::umac::subcomp::bs_frag::BsFragger;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, CarrierDownlinkMode, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
+use crate::umac::subcomp::pdch_allocator::{PdchAllocator, PDCH_IDLE_RELEASE_FRAMES};
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 use super::subcomp::bs_defrag::BsDefrag;
+
+/// When false (default) the PDCH scheduler path is completely disabled and
+/// the BS behaves byte-identically to the pre-PD-5 baseline. PD-7 will
+/// replace this const with a config-driven field.
+/// IMPORTANT: all PDCH code paths in this file are gated on
+/// `self.packet_data_enabled`, NOT on this const directly, so tests can
+/// override the field without recompiling.
+const PACKET_DATA_ENABLED: bool = false;
 
 pub struct UmacBs {
     self_component: TetraEntity,
@@ -69,6 +79,29 @@ pub struct UmacBs {
     /// has had a scheduler turn to leave the BS.
     pending_circuit_closes: HashMap<(u16, u8), PendingCircuitClose>,
     telemetry: Option<TelemetrySink>,
+
+    // ── PD-5: Packet Data Channel (PDCH) ─────────────────────────────────────
+    /// When false (the default), all PDCH code paths are bypassed and the
+    /// scheduler is byte-identical to the pre-PD-5 baseline.
+    /// Initialised from `PACKET_DATA_ENABLED`; tests override it via
+    /// `set_packet_data_enabled_for_test`.
+    packet_data_enabled: bool,
+    /// Tracks per-ISSI PDCH reservations and handles idle-release.
+    pdch_allocator: PdchAllocator,
+    /// Queued packet-data PDUs to be drained onto the chosen PDCH slot.
+    pdch_dl_queue: std::collections::VecDeque<BitBuffer>,
+    /// Hook flag: set to `true` each hyperframe when packet data is enabled AND
+    /// a PDCH timeslot was successfully chosen. Used as a test observable.
+    pub pdch_broadcast_hook_fired: bool,
+    /// Serialised ACCESS-DEFINE PDU built once at PDCH bring-up and stored here
+    /// until a broadcast slot is available to inject it.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour: emit exactly once at bring-up.
+    /// Full broadcast-slot injection via BNCH is deferred to a later PR; for
+    /// now this field is the test-observable representation.
+    pub pdch_access_define_buf: Option<BitBuffer>,
+    /// Guard: prevents re-building the ACCESS-DEFINE on every subsequent tick.
+    pdch_access_define_emitted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -113,6 +146,12 @@ impl UmacBs {
             ul_signal_owner: HashMap::new(),
             pending_circuit_closes: HashMap::new(),
             telemetry,
+            packet_data_enabled: PACKET_DATA_ENABLED,
+            pdch_allocator: PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES),
+            pdch_dl_queue: std::collections::VecDeque::new(),
+            pdch_broadcast_hook_fired: false,
+            pdch_access_define_buf: None,
+            pdch_access_define_emitted: false,
         }
     }
 
@@ -1491,6 +1530,13 @@ impl UmacBs {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
+
+        // ── PD-5: PDCH routing (gated: no-op when PACKET_DATA_ENABLED = false) ──
+        if self.packet_data_enabled && prim.packet_data_flag {
+            self.handle_pdch_unitdata_req(&prim);
+            return; // PDU is queued for TS4; do NOT fall through to signalling path
+        }
+
         let preferred_carrier = prim.carrier_num.unwrap_or_else(|| self.main_carrier());
         let mut sdu = prim.pdu;
 
@@ -1613,6 +1659,162 @@ impl UmacBs {
                 tracing::warn!("unhandled match variant, ignoring");
             }
         }
+    }
+
+    /// Handle `PdchReleaseReq` from SNDCP (when packet data is enabled).
+    /// SNDCP does NOT send this in PD-5; the handler stub is here so PD-6+
+    /// can start sending the variant without further UMAC changes.
+    fn handle_pdch_release_req(&mut self, issi: u32, nsapi: u8) {
+        if !self.packet_data_enabled {
+            return;
+        }
+        tracing::info!("UMAC: PdchReleaseReq issi={} nsapi={} → releasing reservation", issi, nsapi);
+        self.pdch_allocator.release(issi);
+    }
+
+    /// Handle a `TmaUnitdataReq` with `packet_data_flag = true` (PDCH path).
+    /// Reserves the PDCH slot for the ISSI. On the first PDU for a new ISSI,
+    /// emits a `MAC-RESOURCE` with a `ChanAllocElement` granting the PDCH so
+    /// the MS learns which (carrier, timeslot) to use.
+    fn handle_pdch_unitdata_req(&mut self, prim: &tetra_saps::tma::TmaUnitdataReq) {
+        let issi = prim.main_address.ssi;
+
+        // `reserve` returns true only for the very first PDU from this ISSI.
+        let is_new = self.pdch_allocator.reserve(issi, 0, self.dltime);
+
+        tracing::debug!(
+            "UMAC: PDCH reserve issi={} enqueuing {} bits (new={})",
+            issi,
+            prim.pdu.get_len(),
+            is_new
+        );
+        self.pdch_dl_queue.push_back(prim.pdu.clone());
+
+        if is_new {
+            // First packet-data PDU from this ISSI: pick the highest-numbered
+            // free timeslot and grant it via MAC-RESOURCE.
+            // NOTE: spec ambiguous — chosen behaviour: dynamic allocation using the
+            // same policy as the hyperframe PDCH tick (TS4 > TS3 > TS2).
+            let chosen_ts = [4u8, 3, 2]
+                .iter()
+                .find(|&&ts| !self.channel_scheduler.circuit_is_active(Direction::Dl, ts))
+                .copied();
+
+            if let Some(ts) = chosen_ts {
+                self.emit_pdch_mac_resource(issi, ts);
+            } else {
+                tracing::info!(
+                    "UMAC: PDCH MAC-RESOURCE for issi={} deferred — all TS2/3/4 occupied by voice/SDS",
+                    issi
+                );
+            }
+        }
+    }
+
+    /// Build and enqueue a `MAC-RESOURCE` PDU with a `ChanAllocElement` granting
+    /// `issi` the PDCH on timeslot `ts`.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour:
+    ///   alloc_type = Additional (01) so MS keeps MCCH presence.
+    ///   ul_dl_assigned = Both (11) for symmetric UL+DL PDCH.
+    ///   mon_pattern = 0 with frame18_mon_pattern = Some(0).
+    fn emit_pdch_mac_resource(&mut self, issi: u32, ts: u8) {
+        let carrier = self.main_carrier();
+
+        // ts_assigned bitmap: TS1 = index 0 (MSB), TS4 = index 3 (LSB).
+        let ts_assigned = [ts == 1, ts == 2, ts == 3, ts == 4];
+
+        let umt = self.pdch_allocator.alloc_umt();
+
+        let chan_alloc = ChanAllocElement {
+            // NOTE: spec ambiguous — chosen behaviour: Additional (01) so the MS
+            // can retain its MCCH presence and the PDCH is an additional resource.
+            alloc_type: ChanAllocType::Additional,
+            ts_assigned,
+            // NOTE: spec ambiguous — chosen behaviour: Both (11), symmetric UL+DL
+            // for V1 PDCH; asymmetric modes deferred to a future PR.
+            ul_dl_assigned: UlDlAssignment::Both,
+            clch_permission: false,
+            cell_change_flag: false,
+            carrier_num: carrier,
+            ext: None,
+            // NOTE: spec ambiguous — chosen behaviour: monitoring pattern 0
+            // (standard pattern) with frame18_mon_pattern = 0.
+            mon_pattern: 0,
+            frame18_mon_pattern: Some(0),
+        };
+
+        let mut pdu = MacResource {
+            addr: Some(TetraAddress { ssi: issi, ssi_type: SsiType::Issi }),
+            // Usage marker so the MS can identify this PDCH reservation in AACH.
+            // NOTE: spec ambiguous — chosen behaviour: include UMt in the initial
+            // MAC-RESOURCE so the MS can correlate AACH Traffic(UMt) with the grant.
+            usage_marker: Some(umt),
+            chan_alloc_element: Some(chan_alloc),
+            ..Default::default()
+        };
+
+        let sdu = BitBuffer::new(0);
+        pdu.update_len_and_fill_ind(sdu.get_len());
+
+        tracing::info!(
+            "UMAC: PDCH MAC-RESOURCE grant issi={} ts={} umt={} carrier={}",
+            issi, ts, umt, carrier
+        );
+
+        self.channel_scheduler.dl_enqueue_tma(pdu, sdu, None);
+    }
+
+    /// Build the ACCESS-DEFINE PDU for PDCH random-access parameters and return
+    /// it serialised as a `BitBuffer`.
+    ///
+    /// Emitted once at PDCH bring-up to tell MSs which access code applies to
+    /// the PDCH random-access channel.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour:
+    ///   common_or_assigned_control = true (assigned channel).
+    ///   access_code = 1 (B) — the assigned access code for the PDCH.
+    ///   imm/wt/nu/ts_pointer: conservative V1 defaults.
+    fn build_pdch_access_define(&self) -> BitBuffer {
+        let access_def = AccessDefine {
+            // NOTE: spec ambiguous — chosen behaviour: true = assigned-channel
+            // control, so MSs know this defines the PDCH RA parameters.
+            common_or_assigned_control: true,
+            // NOTE: spec ambiguous — chosen behaviour: access_code = 1 (B)
+            // for the PDCH RA channel per ETSI TS 100 392-2 §21.4.4.3.
+            access_code: 1,
+            // NOTE: spec ambiguous — conservative V1 defaults below.
+            imm: 0,
+            wt: 4,
+            nu: 4,
+            frame_len_factor: false,
+            ts_pointer: 0,
+            min_pdu_prio: 0,
+            opt_field_flag: 0,
+            subscriber_class: None,
+            gssi: None,
+        };
+
+        let mut buf = BitBuffer::new_autoexpand(32);
+        access_def.to_bitbuf(&mut buf);
+        buf.seek(0); // Reset read position so consumers can decode from the start
+        buf
+    }
+
+    /// Placeholder for the future `D-CHANNEL-ALLOCATION-BROADCAST` AACH emission.
+    ///
+    /// The real implementation is blocked pending the corrected ETSI EN 300 392-2
+    /// clause 21.4.3.4 wire format (field widths and ordering TBD).  For now this
+    /// method sets a test-observable bool flag so tests can verify the hook fires
+    /// at the right hyperframe cadence without depending on a specific bit pattern.
+    fn trigger_pdch_broadcast_hook(&mut self, pdch_ts: u8) {
+        // TODO(PD-5-schema): replace with real DChannelAllocationBroadcast codec
+        // once corrected wire format arrives.
+        tracing::debug!(
+            "UMAC: PDCH broadcast hook fired for TS{} (codec pending)",
+            pdch_ts
+        );
+        self.pdch_broadcast_hook_fired = true;
     }
 
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
@@ -2094,6 +2296,23 @@ impl UmacBs {
     }
 }
 
+/// Test-only helpers for `UmacBs`.
+/// These are public (no `#[cfg(test)]`) so integration tests in `tests/` can
+/// call them. The `_for_test` suffix signals that they must not be called in
+/// production code paths.
+impl UmacBs {
+    /// Override the `packet_data_enabled` flag at runtime.
+    /// Used by PD-5 integration tests to exercise the PDCH code paths.
+    pub fn set_packet_data_enabled_for_test(&mut self, enabled: bool) {
+        self.packet_data_enabled = enabled;
+    }
+
+    /// Expose the `PdchAllocator` for assertion in tests.
+    pub fn pdch_allocator(&self) -> &PdchAllocator {
+        &self.pdch_allocator
+    }
+}
+
 impl TetraEntityTrait for UmacBs {
     fn entity(&self) -> TetraEntity {
         TetraEntity::Umac
@@ -2124,6 +2343,11 @@ impl TetraEntityTrait for UmacBs {
                 unimplemented!();
             }
             Sap::Control => {
+                // ── PD-5: PdchReleaseReq (gated) ────────────────────────────
+                if let SapMsgInner::PdchReleaseReq { issi, nsapi } = message.msg {
+                    self.handle_pdch_release_req(issi, nsapi);
+                    return;
+                }
                 self.rx_control(queue, message);
             }
             _ => {
@@ -2153,6 +2377,77 @@ impl TetraEntityTrait for UmacBs {
 
         // Check for UL inactivity (stuck transmitter detection)
         self.check_ul_inactivity(queue);
+
+        // Feed the health monitor's Congestion domain: current downlink scheduling backlog.
+        crate::health::registry().set_dl_queue_depth(self.channel_scheduler.dl_queue_depth());
+
+        // ── PD-5: PDCH tick (gated: no-op when packet_data_enabled = false) ─
+        if self.packet_data_enabled {
+            // 1. Release idle reservations.
+            let released = self.pdch_allocator.expire_idle(ts);
+            for issi in released {
+                tracing::info!("UMAC: PDCH idle-release issi={}", issi);
+            }
+
+            // 2. Dynamic PDCH timeslot allocation.
+            //    Policy: prefer the highest-numbered free timeslot (TS4 > TS3 > TS2).
+            //    TS1 is always the control channel and never eligible.
+            //    If all eligible slots are busy with voice/circuit traffic, PDCH
+            //    yields for this hyperframe and no broadcast is emitted.
+            //    NOTE: spec ambiguous — chosen behaviour: query the main-carrier
+            //    scheduler's DL circuit occupancy; any non-active slot is eligible.
+            let pdch_ts_chosen: Option<u8> = [4u8, 3, 2]
+                .iter()
+                .find(|&&ts_candidate| {
+                    !self
+                        .channel_scheduler
+                        .circuit_is_active(Direction::Dl, ts_candidate)
+                })
+                .copied();
+
+            // Update the allocator with the chosen slot for this hyperframe.
+            self.pdch_allocator.current_timeslot = pdch_ts_chosen;
+
+            match pdch_ts_chosen {
+                None => {
+                    // All eligible timeslots are occupied by voice/SDS — yield.
+                    tracing::info!(
+                        "UMAC: PDCH deferred this hyperframe — all TS2/3/4 in use by voice/circuit"
+                    );
+                }
+                Some(chosen_ts) => {
+                    // 3. Drain queued packet-data PDU for the chosen slot (placeholder;
+                    //    actual integration into finalize_ts_for_tick is deferred to
+                    //    when full PDCH traffic scheduling is implemented in a later PR).
+                    if !self.pdch_dl_queue.is_empty() {
+                        let _ = self.pdch_dl_queue.pop_front();
+                        tracing::debug!(
+                            "UMAC: PDCH drained one PDU for TS{} (scheduler integration pending)",
+                            chosen_ts
+                        );
+                    }
+
+                    // 4. Emit ACCESS-DEFINE once at PDCH bring-up so MSs learn the
+                    //    RA parameters for the PDCH.
+                    //    NOTE: spec ambiguous — chosen behaviour: emit once on the
+                    //    first successful PDCH tick; full BNCH injection deferred to
+                    //    a later PR.
+                    if !self.pdch_access_define_emitted {
+                        self.pdch_access_define_buf = Some(self.build_pdch_access_define());
+                        self.pdch_access_define_emitted = true;
+                        tracing::info!(
+                            "UMAC: PDCH ACCESS-DEFINE built for TS{} bring-up (broadcast pending)",
+                            chosen_ts
+                        );
+                    }
+
+                    // 5. Trigger the PDCH broadcast hook on the hyperframe gate.
+                    if ts.t == 1 && ts.f == 1 && self.channel_scheduler.allow_common_control_aach() {
+                        self.trigger_pdch_broadcast_hook(chosen_ts);
+                    }
+                }
+            }
+        }
 
         // Feed the health monitor's Congestion domain: current downlink scheduling backlog.
         crate::health::registry().set_dl_queue_depth(self.channel_scheduler.dl_queue_depth());
