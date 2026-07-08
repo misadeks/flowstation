@@ -14,14 +14,16 @@ use tetra_entities::sndcp::sndcp_bs::{GatewayDownlink, Sndcp};
 use tetra_entities::{MessageQueue, TetraEntityTrait};
 use tetra_pdus::sndcp::enums::configuration_protocol::ConfigurationProtocol;
 use tetra_pdus::sndcp::enums::deactivation_type::DeactivationType;
+use tetra_pdus::sndcp::enums::logical_link_status::LogicalLinkStatus;
 use tetra_pdus::sndcp::enums::pdms_type::PdmsType;
 use tetra_pdus::sndcp::enums::protocol_identity::ProtocolIdentity;
 use tetra_pdus::sndcp::enums::reject_cause::RejectCause;
+use tetra_pdus::sndcp::enums::transmit_response_reject_cause::TransmitResponseRejectCause;
 use tetra_pdus::sndcp::fields::nsapi::Nsapi;
 use tetra_pdus::sndcp::fields::pco::{Pco, PcoEntry};
 use tetra_pdus::sndcp::pdus::{
     ActivatePdpContextAccept, ActivatePdpContextDemand, DeactivatePdpContextDemand,
-    EndOfData, PageResponse, SnPdu, Unitdata,
+    EndOfData, PageResponse, SnData, SnDataTransmitRequest, SnPdu, Unitdata,
 };
 use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
@@ -62,6 +64,20 @@ fn encode_demand(d: &ActivatePdpContextDemand) -> BitBuffer {
 fn encode_unitdata(u: &Unitdata) -> BitBuffer {
     let mut buf = BitBuffer::new_autoexpand(256);
     u.to_bitbuf(&mut buf).expect("encode unitdata");
+    buf.seek(0);
+    buf
+}
+
+fn encode_sn_data(d: &SnData) -> BitBuffer {
+    let mut buf = BitBuffer::new_autoexpand(256);
+    d.to_bitbuf(&mut buf).expect("encode sn_data");
+    buf.seek(0);
+    buf
+}
+
+fn encode_data_transmit_request(r: &SnDataTransmitRequest) -> BitBuffer {
+    let mut buf = BitBuffer::new_autoexpand(64);
+    r.to_bitbuf(&mut buf).expect("encode data_transmit_request");
     buf.seek(0);
     buf
 }
@@ -316,7 +332,7 @@ fn uplink_unitdata_pushes_to_gateway_queue() {
     drain_queue(&mut queue); // discard ACCEPT
 
     let payload = vec![0x45u8, 0x00, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00];
-    let ud = Unitdata { nsapi: Nsapi(3), pdu_priority: 0, payload: payload.clone() };
+    let ud = Unitdata { nsapi: Nsapi(3), pcomp: 0, dcomp: 0, payload: payload.clone() };
     let sdu = with_discriminator(&encode_unitdata(&ud));
     sndcp.rx_prim(&mut queue, make_ind(sdu, 6001));
 
@@ -453,19 +469,22 @@ fn retransmitted_demand_returns_cached_accept_verbatim() {
     assert_eq!(bitstr1, bitstr2, "retransmitted ACCEPT should be bit-for-bit identical");
 }
 
-/// 11. An unrecognised SN-PDU type (SN-DATA, type 5) is dropped without panic.
+/// 11. An SN-DATA PDU (type 5) with no active context is dropped without panic.
 #[test]
 fn unknown_pdu_type_dropped_without_panic() {
     let (mut sndcp, mut queue) = make_sndcp();
-    // type=5 (SN-DATA=0b0101), rest zeroed — results in SnPdu::Unhandled
+    // type=5 (SN-DATA) with nsapi=1 for which no context exists — decoded OK by
+    // the new codec but dropped by the entity because no PDP context is active.
     let mut sn_bits = BitBuffer::new_autoexpand(16);
     sn_bits.write_bits(0b0101, 4); // SN-DATA type (type=5)
-    sn_bits.write_bits(0, 12);     // padding
+    sn_bits.write_bits(1, 4);     // nsapi=1
+    sn_bits.write_bits(0, 4);     // pcomp=0
+    sn_bits.write_bits(0, 4);     // dcomp=0
     sn_bits.seek(0);
     let sdu = with_discriminator(&sn_bits);
 
     sndcp.rx_prim(&mut queue, make_ind(sdu, 11001));
-    assert!(queue.pop_front().is_none(), "unhandled PDU type should not produce output");
+    assert!(queue.pop_front().is_none(), "SN-DATA with no context should not produce output");
 }
 
 /// 12 (PD-7). A non-default `ipv4_pool_base` set in `CfgPacketData` is
@@ -499,4 +518,128 @@ fn custom_ipv4_pool_from_config_is_used() {
         ip >= Ipv4Addr::new(10, 0, 0, 2) && ip <= Ipv4Addr::new(10, 0, 0, 254),
         "IP {ip} should come from custom 10.0.0.0/24 pool"
     );
+}
+
+// ─── Bug-3 entity tests ────────────────────────────────────────────────────────
+
+/// 13. SN-DATA-TRANSMIT-REQUEST for an unknown NSAPI is rejected with UnknownNsapi.
+#[test]
+fn transmit_request_for_unknown_nsapi_rejected() {
+    let (mut sndcp, mut queue) = make_sndcp();
+
+    // Send TRANSMIT-REQUEST without a prior ACTIVATE — no context exists.
+    let req = SnDataTransmitRequest {
+        nsapi: Nsapi(5),
+        logical_link_status: LogicalLinkStatus::NotConnected,
+        enhanced_pi4_dqpsk_service: false,
+        resource_request: None,
+        o_bit: false,
+        sndcp_network_endpoint_identifier: None,
+        m_bit: false,
+        nsapi_additional: vec![],
+    };
+    let sdu = with_discriminator(&encode_data_transmit_request(&req));
+    sndcp.rx_prim(&mut queue, make_ind(sdu, 20001));
+
+    let msg = queue.pop_front().expect("expected TRANSMIT-RESPONSE reject");
+    let dl_req = unwrap_req(msg);
+    assert_eq!(dl_req.layer2service, Layer2Service::Acknowledged, "reject must be acknowledged");
+    let pdu = decode_dl(&dl_req);
+    match pdu {
+        SnPdu::DataTransmitResponse(r) => {
+            assert!(!r.accept, "response should be a reject");
+            assert_eq!(
+                r.transmit_response_reject_cause,
+                Some(TransmitResponseRejectCause::UnknownNsapi),
+                "reject cause should be UnknownNsapi"
+            );
+        }
+        other => panic!("expected DataTransmitResponse, got {other:?}"),
+    }
+}
+
+/// 14. SN-DATA-TRANSMIT-REQUEST for a known, Ready NSAPI is accepted.
+#[test]
+fn transmit_request_for_known_nsapi_accepted() {
+    let (mut sndcp, mut queue) = make_sndcp();
+    activate(&mut sndcp, &mut queue, 21001, demand_dynamic(4)).expect("no ACCEPT");
+    drain_queue(&mut queue);
+
+    let req = SnDataTransmitRequest {
+        nsapi: Nsapi(4),
+        logical_link_status: LogicalLinkStatus::NotConnected,
+        enhanced_pi4_dqpsk_service: false,
+        resource_request: None,
+        o_bit: false,
+        sndcp_network_endpoint_identifier: None,
+        m_bit: false,
+        nsapi_additional: vec![],
+    };
+    let sdu = with_discriminator(&encode_data_transmit_request(&req));
+    sndcp.rx_prim(&mut queue, make_ind(sdu, 21001));
+
+    let msg = queue.pop_front().expect("expected TRANSMIT-RESPONSE accept");
+    let dl_req = unwrap_req(msg);
+    assert_eq!(dl_req.layer2service, Layer2Service::Acknowledged, "accept must be acknowledged");
+    let pdu = decode_dl(&dl_req);
+    match pdu {
+        SnPdu::DataTransmitResponse(r) => {
+            assert!(r.accept, "response should be an accept");
+            assert!(r.transmit_response_reject_cause.is_none(), "no reject cause on accept");
+        }
+        other => panic!("expected DataTransmitResponse accept, got {other:?}"),
+    }
+}
+
+/// 15. Uplink SN-DATA (type 5) after ACTIVATE pushes the payload to `uplink_ip_queue`.
+#[test]
+fn uplink_sn_data_reaches_gateway() {
+    let (mut sndcp, mut queue) = make_sndcp();
+    activate(&mut sndcp, &mut queue, 22001, demand_dynamic(6)).expect("no ACCEPT");
+    drain_queue(&mut queue);
+
+    let payload = vec![0x60u8, 0x00, 0x00, 0x14, 0x11, 0x40]; // minimal IPv6-ish bytes
+    let sn_data_pdu = SnData { nsapi: Nsapi(6), pcomp: 0, dcomp: 0, n_pdu: payload.clone() };
+    let sdu = with_discriminator(&encode_sn_data(&sn_data_pdu));
+    sndcp.rx_prim(&mut queue, make_ind(sdu, 22001));
+
+    // SN-DATA uplink must not produce any downlink messages.
+    let msgs = drain_queue(&mut queue);
+    assert!(msgs.is_empty(), "uplink SN-DATA should not produce downlink messages");
+
+    let ul = sndcp.uplink_ip_queue.pop_front().expect("no uplink in gateway queue");
+    assert_eq!(ul.payload, payload, "payload mismatch");
+    assert_eq!(ul.nsapi, 6, "NSAPI mismatch");
+}
+
+/// 16. `feed_downlink_ip_acknowledged` in Ready state sends SN-DATA (type 5) with
+///     `layer2service = Acknowledged`.
+#[test]
+fn downlink_ip_acknowledged_sends_sn_data() {
+    let (mut sndcp, mut queue) = make_sndcp();
+    let msg = activate(&mut sndcp, &mut queue, 23001, demand_dynamic(7)).expect("no ACCEPT");
+    let ip = match decode_dl(&unwrap_req(msg)) {
+        SnPdu::ActivatePdpContextAccept(a) => a.ip4_address.unwrap(),
+        other => panic!("expected ACCEPT, got {other:?}"),
+    };
+
+    let payload = vec![0xCA, 0xFE, 0xBA, 0xBE];
+    sndcp.feed_downlink_ip_acknowledged(
+        &mut queue,
+        GatewayDownlink { dest_ipv4: ip, payload: payload.clone() },
+    );
+
+    let msg = queue.pop_front().expect("no downlink SN-DATA");
+    let req = unwrap_req(msg);
+    assert_eq!(req.layer2service, Layer2Service::Acknowledged, "SN-DATA must be acknowledged");
+    assert!(req.packet_data_flag, "packet_data_flag must be true");
+
+    let pdu = decode_dl(&req);
+    match pdu {
+        SnPdu::Data(d) => {
+            assert_eq!(d.n_pdu, payload, "payload mismatch");
+            assert_eq!(d.nsapi.0, 7, "NSAPI mismatch");
+        }
+        other => panic!("expected SN-DATA, got {other:?}"),
+    }
 }

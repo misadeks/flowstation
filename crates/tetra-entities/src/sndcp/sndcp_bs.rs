@@ -29,13 +29,14 @@ use tetra_pdus::sndcp::enums::configuration_protocol::ConfigurationProtocol;
 use tetra_pdus::sndcp::enums::protocol_identity::ProtocolIdentity;
 use tetra_pdus::sndcp::enums::reject_cause::RejectCause;
 use tetra_pdus::sndcp::enums::tia::Tia;
+use tetra_pdus::sndcp::enums::transmit_response_reject_cause::TransmitResponseRejectCause;
 use tetra_pdus::sndcp::fields::mtu::Mtu;
 use tetra_pdus::sndcp::fields::nsapi::Nsapi;
 use tetra_pdus::sndcp::fields::pco::{Pco, PcoEntry};
 use tetra_pdus::sndcp::fields::timer_value::{ReadyTimer, ResponseWaitTimer, StandbyTimer};
 use tetra_pdus::sndcp::pdus::{
     ActivatePdpContextAccept, ActivatePdpContextReject, DeactivatePdpContextAccept, PageRequest,
-    SnPdu, Unitdata,
+    SnData, SnDataTransmitRequest, SnDataTransmitResponse, SnPdu, Unitdata,
 };
 
 use crate::{MessageQueue, TetraEntityTrait};
@@ -142,8 +143,16 @@ pub enum PdpState {
     /// ACCEPT sent; awaiting Ready (V1: immediate transition to Ready).
     /// Activation timestamp is stored in `PdpContext::last_activity`.
     WaitForAccept,
-    /// Fully active; can send/receive SN-UNITDATA.
+    /// Fully active; can send/receive SN-UNITDATA or SN-DATA.
     Ready,
+    /// SN-DATA-TRANSMIT-REQUEST accepted; waiting for the MS to establish
+    /// an Advanced Link before sending SN-DATA.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour: V1 transitions from
+    /// WaitingForAlSetup directly to Ready on the first SN-DATA uplink,
+    /// without verifying the AL link state (PD-3 currently BL-routes
+    /// everything; full AL inspection deferred to a later PR).
+    WaitingForAlSetup,
     /// Ready timer expired; MS must be paged before more downlink data.
     Standby,
     /// SN-PAGE REQUEST sent; awaiting SN-PAGE RESPONSE.
@@ -240,6 +249,8 @@ impl Sndcp {
             SnPdu::DeactivatePdpContextDemand(d) => self.on_deactivate_demand(queue, ind, d),
             SnPdu::DeactivatePdpContextAccept(a) => self.on_deactivate_accept(ind, a),
             SnPdu::Unitdata(u) => self.on_uplink_unitdata(ind, u),
+            SnPdu::Data(d) => self.on_uplink_data(queue, ind, d),
+            SnPdu::DataTransmitRequest(r) => self.on_data_transmit_request(queue, ind, r),
             SnPdu::PageResponse(pr) => self.on_page_response(queue, ind, pr),
             SnPdu::EndOfData(eod) => self.on_end_of_data(ind, eod),
             SnPdu::Reconnect(rc) => self.on_reconnect(ind, rc),
@@ -525,6 +536,141 @@ impl Sndcp {
         });
     }
 
+    // -- SN-DATA-TRANSMIT-REQUEST (type 6, MS → BS) ----------------------------
+
+    /// Handle an MS-initiated SN-DATA-TRANSMIT-REQUEST.
+    ///
+    /// If the NSAPI context is not found or is in an incompatible state, emit
+    /// SN-DATA-TRANSMIT-RESPONSE with `accept = false`.  Otherwise accept and
+    /// transition the context to `WaitingForAlSetup`.
+    ///
+    /// Ref: ETSI TS 100 392-2 v3.10.1 clause 28.4.4.5.
+    fn on_data_transmit_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        ind: &LtpdMleUnitdataInd,
+        req: SnDataTransmitRequest,
+    ) {
+        let main_address = ind.received_tetra_address;
+        let nsapi = req.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        let accept = match self.contexts.get(&key) {
+            Some(ctx) if matches!(ctx.state, PdpState::Ready | PdpState::Standby) => true,
+            Some(_) => false,
+            None => false,
+        };
+
+        if !accept {
+            tracing::info!(
+                "SNDCP: -> SN-DATA-TRANSMIT-RESPONSE reject (UnknownNsapi) to {:?} NSAPI={nsapi}",
+                main_address
+            );
+            let resp = SnDataTransmitResponse {
+                nsapi: req.nsapi,
+                accept: false,
+                transmit_response_reject_cause: Some(TransmitResponseRejectCause::UnknownNsapi),
+                o_bit: false,
+                sndcp_network_endpoint_identifier: None,
+                m_bit: false,
+                nsapi_additional: vec![],
+            };
+            let mut sdu = BitBuffer::new_autoexpand(32);
+            if let Err(e) = resp.to_bitbuf(&mut sdu) {
+                tracing::warn!("SNDCP: failed to encode DATA-TRANSMIT-RESPONSE reject: {e:?}");
+                return;
+            }
+            sdu.seek(0);
+            send_downlink(
+                queue, main_address, ind.link_id, ind.endpoint_id,
+                sdu, Layer2Service::Acknowledged, false,
+            );
+            return;
+        }
+
+        // Context found in Ready/Standby: accept and transition to WaitingForAlSetup.
+        if let Some(ctx) = self.contexts.get_mut(&key) {
+            ctx.state = PdpState::WaitingForAlSetup;
+            ctx.resp_wait_deadline = Some(self.dltime.add_timeslots(RESP_WAIT_TIMER_SLOTS));
+        }
+
+        tracing::info!(
+            "SNDCP: -> SN-DATA-TRANSMIT-RESPONSE accept to {:?} NSAPI={nsapi}",
+            main_address
+        );
+        let resp = SnDataTransmitResponse {
+            nsapi: req.nsapi,
+            accept: true,
+            transmit_response_reject_cause: None,
+            o_bit: false,
+            sndcp_network_endpoint_identifier: None,
+            m_bit: false,
+            nsapi_additional: vec![],
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        if let Err(e) = resp.to_bitbuf(&mut sdu) {
+            tracing::warn!("SNDCP: failed to encode DATA-TRANSMIT-RESPONSE accept: {e:?}");
+            return;
+        }
+        sdu.seek(0);
+        send_downlink(
+            queue, main_address, ind.link_id, ind.endpoint_id,
+            sdu, Layer2Service::Acknowledged, false,
+        );
+    }
+
+    // -- SN-DATA uplink (type 5, acknowledged data) ----------------------------
+
+    /// Handle an uplink SN-DATA PDU (acknowledged N-PDU).
+    ///
+    /// Accepts data from contexts in Ready, WaitingForAlSetup, or Standby.
+    /// If in WaitingForAlSetup, promotes directly to Ready — V1 shortcut since
+    /// PD-3 routes everything over BL and AL setup cannot be directly observed.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour: treat first SN-DATA in
+    /// WaitingForAlSetup as implicit AL setup confirmation and promote to Ready.
+    fn on_uplink_data(&mut self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, data: SnData) {
+        let _ = queue; // no downlink response for uplink data
+        let main_address = ind.received_tetra_address;
+        let nsapi = data.nsapi.0;
+        let key = PdpKey::new(main_address, nsapi);
+
+        let ctx = match self.contexts.get_mut(&key) {
+            Some(c) if matches!(
+                c.state,
+                PdpState::Ready | PdpState::WaitingForAlSetup | PdpState::Standby
+            ) => c,
+            Some(c) => {
+                tracing::warn!(
+                    "SNDCP: uplink SN-DATA from {:?} NSAPI={nsapi} in unexpected state {:?}",
+                    main_address, c.state
+                );
+                return;
+            }
+            None => {
+                tracing::warn!(
+                    "SNDCP: uplink SN-DATA from {:?} NSAPI={nsapi}: context not found",
+                    main_address
+                );
+                return;
+            }
+        };
+
+        // NOTE: spec ambiguous — chosen behaviour: WaitingForAlSetup → Ready on first
+        // SN-DATA uplink. Full AL link inspection deferred (PD-3 currently BL-routes).
+        ctx.state = PdpState::Ready;
+        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+        ctx.standby_deadline = None;
+        ctx.resp_wait_deadline = None;
+        ctx.last_activity = self.dltime;
+
+        self.uplink_ip_queue.push_back(GatewayUplink {
+            main_address,
+            nsapi,
+            payload: data.n_pdu,
+        });
+    }
+
     // -- SN-PAGE RESPONSE ------------------------------------------------------
 
     fn on_page_response(
@@ -567,7 +713,7 @@ impl Sndcp {
         let pending: Vec<Vec<u8>> = ctx.pending_downlink.drain(..).collect();
 
         for payload in pending {
-            let ud = Unitdata { nsapi: nsapi_field, pdu_priority: 0, payload };
+            let ud = Unitdata { nsapi: nsapi_field, pcomp: 0, dcomp: 0, payload };
             let mut sdu = BitBuffer::new_autoexpand(256);
             if let Err(e) = ud.to_bitbuf(&mut sdu) {
                 tracing::warn!("SNDCP: failed to encode UNITDATA for pending downlink: {e:?}");
@@ -678,7 +824,7 @@ impl Sndcp {
             PdpState::Ready => {
                 ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
                 ctx.last_activity = self.dltime;
-                let ud = Unitdata { nsapi, pdu_priority: 0, payload: downlink.payload };
+                let ud = Unitdata { nsapi, pcomp: 0, dcomp: 0, payload: downlink.payload };
                 let mut sdu = BitBuffer::new_autoexpand(256);
                 if let Err(e) = ud.to_bitbuf(&mut sdu) {
                     tracing::warn!("SNDCP: failed to encode downlink UNITDATA: {e:?}");
@@ -712,6 +858,68 @@ impl Sndcp {
                 );
             }
         }
+    }
+
+    /// Inject a downlink IP datagram using acknowledged transfer (SN-DATA).
+    ///
+    /// Sends SN-DATA via `LtpdMleUnitdataReq { layer2service: Acknowledged,
+    /// packet_data_flag: true }`.  Only sends when the context is in `Ready`
+    /// state; drops with a warning in all other states.
+    ///
+    /// The existing `feed_downlink_ip` (unacknowledged, SN-UNITDATA) signature
+    /// is intentionally unchanged — this is a companion method.
+    pub fn feed_downlink_ip_acknowledged(
+        &mut self,
+        queue: &mut MessageQueue,
+        downlink: GatewayDownlink,
+    ) {
+        let key = match self.ipv4_to_key.get(&downlink.dest_ipv4).copied() {
+            Some(k) => k,
+            None => {
+                tracing::info!(
+                    "SNDCP: ack downlink drop — no context for IPv4 {}",
+                    downlink.dest_ipv4
+                );
+                return;
+            }
+        };
+
+        let ctx = match self.contexts.get_mut(&key) {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    "SNDCP: ack downlink drop — context for {} disappeared",
+                    downlink.dest_ipv4
+                );
+                return;
+            }
+        };
+
+        if ctx.state != PdpState::Ready {
+            tracing::warn!(
+                "SNDCP: ack downlink drop for NSAPI={} — context not Ready (state={:?})",
+                key.nsapi, ctx.state
+            );
+            return;
+        }
+
+        let main_address = TetraAddress::issi(key.ssi);
+        let nsapi = Nsapi(key.nsapi);
+        let link_id = ctx.link_id;
+        let endpoint_id = ctx.endpoint_id;
+
+        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+        ctx.last_activity = self.dltime;
+
+        let sn_data = SnData { nsapi, pcomp: 0, dcomp: 0, n_pdu: downlink.payload };
+        let mut sdu = BitBuffer::new_autoexpand(256);
+        if let Err(e) = sn_data.to_bitbuf(&mut sdu) {
+            tracing::warn!("SNDCP: failed to encode downlink SN-DATA: {e:?}");
+            return;
+        }
+        sdu.seek(0);
+        send_downlink(queue, main_address, link_id, endpoint_id, sdu,
+            Layer2Service::Acknowledged, true);
     }
 
     // -- Timer housekeeping ----------------------------------------------------

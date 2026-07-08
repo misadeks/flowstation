@@ -248,21 +248,20 @@ fn first_packet_data_pdu_triggers_mac_resource_with_channel_allocation() {
 }
 
 // ── test 4 ────────────────────────────────────────────────────────────────────
-/// When `packet_data_enabled = true` and a PDCH timeslot is available, UMAC
-/// must build an `ACCESS-DEFINE` PDU with `common_or_assigned_control = true`
-/// and `access_code = 1` (B) for the PDCH random-access channel.
+/// `build_pdch_access_define_for_override` must produce a valid ACCESS-DEFINE PDU
+/// with `common_or_assigned_control = true` and the supplied `access_code`.
 ///
-/// NOTE: the ACCESS-DEFINE is currently stored in-memory pending full BNCH
-/// broadcast-slot injection (deferred to a later PR).  This test decodes the
-/// in-memory buffer and checks the fields.
+/// This tests the builder helper directly without asserting any emission cadence
+/// from the tick loop (DIMETRA does not emit ACCESS-DEFINE on tick; see
+/// `build_pdch_access_define_for_override` docs).
 #[test]
-fn access_define_emitted_at_enable() {
+fn access_define_builder_produces_valid_pdu() {
     debug::setup_logging_verbose();
 
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
 
-    // Enable PDCH.
+    // Enable PDCH so the UmacBs is fully constructed with PDCH support.
     {
         let umac = test
             .router
@@ -274,7 +273,7 @@ fn access_define_emitted_at_enable() {
         umac.set_packet_data_enabled_for_test(true);
     }
 
-    // Run one tick so the PDCH bring-up path fires.
+    // Run one tick (not needed for builder, but ensures the tick path doesn't panic).
     test.run_stack(Some(1));
 
     let umac = test
@@ -285,22 +284,24 @@ fn access_define_emitted_at_enable() {
         .downcast_mut::<UmacBs>()
         .expect("downcast");
 
-    let buf = umac
-        .pdch_access_define_buf
-        .as_ref()
-        .expect("pdch_access_define_buf must be Some after first tick with packet_data_enabled=true");
-
-    let mut decode_buf = buf.clone();
-    let access_def = AccessDefine::from_bitbuf(&mut decode_buf)
-        .expect("pdch_access_define_buf must be a valid ACCESS-DEFINE PDU");
+    // Builder invocation: access_code=1 (B), timeslot=4.
+    let mut buf = umac.build_pdch_access_define_for_override(1, 4);
+    let access_def = AccessDefine::from_bitbuf(&mut buf)
+        .expect("build_pdch_access_define_for_override must produce a valid ACCESS-DEFINE PDU");
 
     assert!(
         access_def.common_or_assigned_control,
-        "ACCESS-DEFINE must use assigned-channel control for PDCH"
+        "ACCESS-DEFINE must use assigned-channel control"
     );
     assert_eq!(
         access_def.access_code, 1,
-        "ACCESS-DEFINE access_code must be 1 (B) for the PDCH RA channel"
+        "ACCESS-DEFINE access_code must be 1 (B) when requested"
+    );
+
+    // The tick loop must NOT have set pdch_access_define_buf — no automatic emission.
+    assert!(
+        umac.pdch_access_define_buf.is_none(),
+        "pdch_access_define_buf must remain None after tick (no automatic ACCESS-DEFINE emission)"
     );
 }
 

@@ -89,15 +89,19 @@ pub struct UmacBs {
     pdch_allocator: PdchAllocator,
     /// Queued packet-data PDUs to be drained onto the chosen PDCH slot.
     pdch_dl_queue: std::collections::VecDeque<BitBuffer>,
-    /// Serialised ACCESS-DEFINE PDU built once at PDCH bring-up and stored here
-    /// until a broadcast slot is available to inject it.
+    /// Serialised ACCESS-DEFINE PDU built by `build_pdch_access_define_for_override`
+    /// and stored here for consumers that need to send a non-default access-code
+    /// override (access codes B/C/D or assigned-channel parameter overrides).
     ///
-    /// NOTE: spec ambiguous — chosen behaviour: emit exactly once at bring-up.
-    /// Full broadcast-slot injection via BNCH is deferred to a later PR; for
-    /// now this field is the test-observable representation.
+    /// Not populated automatically on tick; callers invoke the builder explicitly
+    /// when DIMETRA-style override semantics are needed.
+    ///
+    /// NOTE: per live rlj_app trace, DIMETRA does NOT emit standalone ACCESS-DEFINE
+    /// at cell boot, packet-data-enable, or first grant.  Access-code-A parameters
+    /// are embedded in SYSINFO's optional field (Table 21.66, optional_field_flag=10).
+    /// ACCESS-DEFINE is only emitted once when parameters for a specific access code
+    /// (B/C/D) or an assigned-channel set differ from the SYSINFO defaults.
     pub pdch_access_define_buf: Option<BitBuffer>,
-    /// Guard: prevents re-building the ACCESS-DEFINE on every subsequent tick.
-    pdch_access_define_emitted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,7 +150,6 @@ impl UmacBs {
             pdch_allocator: PdchAllocator::new(c.packet_data.pdch.idle_release_frames),
             pdch_dl_queue: std::collections::VecDeque::new(),
             pdch_access_define_buf: None,
-            pdch_access_define_emitted: false,
         }
     }
 
@@ -1760,24 +1763,31 @@ impl UmacBs {
         self.channel_scheduler.dl_enqueue_tma(pdu, sdu, None);
     }
 
-    /// Build the ACCESS-DEFINE PDU for PDCH random-access parameters and return
+    /// Build an ACCESS-DEFINE PDU for a PDCH access-code override and return
     /// it serialised as a `BitBuffer`.
     ///
-    /// Emitted once at PDCH bring-up to tell MSs which access code applies to
-    /// the PDCH random-access channel.
+    /// Intended for use only when an access-code (B/C/D) or assigned-channel
+    /// parameter set differs from the SYSINFO defaults. DIMETRA does not emit
+    /// ACCESS-DEFINE at cell boot, packet-data-enable, or first grant; access-code-A
+    /// parameters are instead embedded in SYSINFO's optional field (Table 21.66,
+    /// `optional_field_flag=10`).
+    ///
+    /// `access_code`: 0=A, 1=B, 2=C, 3=D.
+    /// `timeslot`: the PDCH timeslot the override applies to (used for logging only).
     ///
     /// NOTE: spec ambiguous — chosen behaviour:
-    ///   common_or_assigned_control = true (assigned channel).
-    ///   access_code = 1 (B) — the assigned access code for the PDCH.
-    ///   imm/wt/nu/ts_pointer: conservative V1 defaults.
-    fn build_pdch_access_define(&self) -> BitBuffer {
+    ///   `common_or_assigned_control = true` (assigned-channel control).
+    ///   `imm/wt/nu/ts_pointer`: conservative V1 defaults.
+    pub fn build_pdch_access_define_for_override(&self, access_code: u8, timeslot: u8) -> BitBuffer {
+        tracing::debug!(
+            "UMAC: building ACCESS-DEFINE override for access_code={} timeslot={}",
+            access_code, timeslot
+        );
         let access_def = AccessDefine {
             // NOTE: spec ambiguous — chosen behaviour: true = assigned-channel
             // control, so MSs know this defines the PDCH RA parameters.
             common_or_assigned_control: true,
-            // NOTE: spec ambiguous — chosen behaviour: access_code = 1 (B)
-            // for the PDCH RA channel per ETSI TS 100 392-2 §21.4.4.3.
-            access_code: 1,
+            access_code,
             // NOTE: spec ambiguous — conservative V1 defaults below.
             imm: 0,
             wt: 4,
@@ -1792,7 +1802,7 @@ impl UmacBs {
 
         let mut buf = BitBuffer::new_autoexpand(32);
         access_def.to_bitbuf(&mut buf);
-        buf.seek(0); // Reset read position so consumers can decode from the start
+        buf.seek(0); // reset read position so consumers can decode from the start
         buf
     }
 
@@ -2405,20 +2415,12 @@ impl TetraEntityTrait for UmacBs {
                             chosen_ts
                         );
                     }
-
-                    // 4. Emit ACCESS-DEFINE once at PDCH bring-up so MSs learn the
-                    //    RA parameters for the PDCH.
-                    //    NOTE: spec ambiguous — chosen behaviour: emit once on the
-                    //    first successful PDCH tick; full BNCH injection deferred to
-                    //    a later PR.
-                    if !self.pdch_access_define_emitted {
-                        self.pdch_access_define_buf = Some(self.build_pdch_access_define());
-                        self.pdch_access_define_emitted = true;
-                        tracing::info!(
-                            "UMAC: PDCH ACCESS-DEFINE built for TS{} bring-up (broadcast pending)",
-                            chosen_ts
-                        );
-                    }
+                    // ACCESS-DEFINE is NOT emitted here. Per rlj_app symbol trace,
+                    // DIMETRA embeds access-code-A parameters in SYSINFO's optional
+                    // field and only emits ACCESS-DEFINE when a non-default access-code
+                    // (B/C/D) or assigned-channel parameter differs from SYSINFO defaults.
+                    // Use `build_pdch_access_define_for_override` directly when that
+                    // override emission is needed.
                 }
             }
         }

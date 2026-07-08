@@ -1,7 +1,10 @@
 pub mod configuration_protocol;
+pub mod connection_symmetry;
 pub mod deactivation_type;
+pub mod logical_link_status;
 pub mod pdms_type;
 pub mod protocol_identity;
 pub mod reject_cause;
 pub mod sn_pdu_type;
 pub mod tia;
+pub mod transmit_response_reject_cause;

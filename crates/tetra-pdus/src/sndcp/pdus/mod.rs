@@ -3,6 +3,9 @@
 pub mod activate_pdp_context_accept;
 pub mod activate_pdp_context_demand;
 pub mod activate_pdp_context_reject;
+pub mod data;
+pub mod data_transmit_request;
+pub mod data_transmit_response;
 pub mod deactivate_pdp_context_accept;
 pub mod deactivate_pdp_context_demand;
 pub mod end_of_data;
@@ -14,6 +17,9 @@ pub mod unitdata;
 pub use activate_pdp_context_accept::ActivatePdpContextAccept;
 pub use activate_pdp_context_demand::ActivatePdpContextDemand;
 pub use activate_pdp_context_reject::ActivatePdpContextReject;
+pub use data::SnData;
+pub use data_transmit_request::{ResourceRequest, SnDataTransmitRequest};
+pub use data_transmit_response::SnDataTransmitResponse;
 pub use deactivate_pdp_context_accept::DeactivatePdpContextAccept;
 pub use deactivate_pdp_context_demand::DeactivatePdpContextDemand;
 pub use end_of_data::EndOfData;
@@ -76,6 +82,9 @@ pub enum SnPdu {
     DeactivatePdpContextDemand(DeactivatePdpContextDemand),
     DeactivatePdpContextAccept(DeactivatePdpContextAccept),
     Unitdata(Unitdata),
+    Data(SnData),
+    DataTransmitRequest(SnDataTransmitRequest),
+    DataTransmitResponse(SnDataTransmitResponse),
     PageRequest(PageRequest),
     PageResponse(PageResponse),
     EndOfData(EndOfData),
@@ -118,6 +127,16 @@ impl SnPdu {
                 Ok(SnPdu::ActivatePdpContextReject(ActivatePdpContextReject::from_bitbuf(buffer)?))
             }
             SnPduType::Unitdata => Ok(SnPdu::Unitdata(Unitdata::from_bitbuf(buffer)?)),
+            // SN-DATA (type 5): direction-symmetric wire layout, direction-specific semantics.
+            SnPduType::Data => Ok(SnPdu::Data(SnData::from_bitbuf(buffer)?)),
+            // SN-DATA-TRANSMIT-REQUEST (type 6): UL only (MS → BS).
+            SnPduType::DataTransmitRequest if !downlink => {
+                Ok(SnPdu::DataTransmitRequest(SnDataTransmitRequest::from_bitbuf(buffer)?))
+            }
+            // SN-DATA-TRANSMIT-RESPONSE (type 7): DL only (BS → MS).
+            SnPduType::DataTransmitResponse if downlink => {
+                Ok(SnPdu::DataTransmitResponse(SnDataTransmitResponse::from_bitbuf(buffer)?))
+            }
             SnPduType::EndOfData => Ok(SnPdu::EndOfData(EndOfData::from_bitbuf(buffer)?)),
             SnPduType::Reconnect => Ok(SnPdu::Reconnect(Reconnect::from_bitbuf(buffer)?)),
             SnPduType::Page => {
@@ -131,16 +150,20 @@ impl SnPdu {
                     Ok(SnPdu::PageResponse(PageResponse::from_bitbuf(buffer)?))
                 }
             }
-            SnPduType::Data
-            | SnPduType::DataTransmitRequest
-            | SnPduType::DataTransmitResponse
-            | SnPduType::NotSupported
+            SnPduType::NotSupported
             | SnPduType::DataPriority
             | SnPduType::Modify
             | SnPduType::Reserved(_) => Ok(SnPdu::Unhandled {
                 sn_pdu_type,
                 remaining_bits: buffer.get_len_remaining(),
             }),
+            // Direction-wrong: TRANSMIT-REQUEST in DL or TRANSMIT-RESPONSE in UL.
+            SnPduType::DataTransmitRequest | SnPduType::DataTransmitResponse => {
+                Ok(SnPdu::Unhandled {
+                    sn_pdu_type,
+                    remaining_bits: buffer.get_len_remaining(),
+                })
+            }
         }
     }
 
@@ -153,6 +176,9 @@ impl SnPdu {
             SnPdu::DeactivatePdpContextDemand(p) => p.to_bitbuf(buffer),
             SnPdu::DeactivatePdpContextAccept(p) => p.to_bitbuf(buffer),
             SnPdu::Unitdata(p) => p.to_bitbuf(buffer),
+            SnPdu::Data(p) => p.to_bitbuf(buffer),
+            SnPdu::DataTransmitRequest(p) => p.to_bitbuf(buffer),
+            SnPdu::DataTransmitResponse(p) => p.to_bitbuf(buffer),
             SnPdu::PageRequest(p) => p.to_bitbuf(buffer),
             SnPdu::PageResponse(p) => p.to_bitbuf(buffer),
             SnPdu::EndOfData(p) => p.to_bitbuf(buffer),
@@ -166,9 +192,6 @@ impl SnPdu {
 
 fn sn_pdu_type_static_name(t: SnPduType) -> &'static str {
     match t {
-        SnPduType::Data => "sn_data",
-        SnPduType::DataTransmitRequest => "sn_data_transmit_request",
-        SnPduType::DataTransmitResponse => "sn_data_transmit_response",
         SnPduType::NotSupported => "sn_not_supported",
         SnPduType::DataPriority => "sn_data_priority",
         SnPduType::Modify => "sn_modify",
@@ -213,11 +236,73 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_unhandled_data() {
-        // SN-DATA (type 5) is not handled in Step 1.
-        let mut buf = BitBuffer::from_bitstr("0101000000000000");
+    fn dispatch_sn_data_ul() {
+        use crate::sndcp::pdus::data::SnData;
+        let pdu = SnData { nsapi: Nsapi(4), pcomp: 0, dcomp: 0, n_pdu: vec![0x45] };
+        let mut buf = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut buf).unwrap();
         buf.seek(0);
         let decoded = SnPdu::from_bitbuf_ul(&mut buf).unwrap();
-        assert!(matches!(decoded, SnPdu::Unhandled { sn_pdu_type: SnPduType::Data, .. }));
+        assert!(matches!(decoded, SnPdu::Data(_)));
+    }
+
+    #[test]
+    fn dispatch_data_transmit_request_ul() {
+        use crate::sndcp::enums::logical_link_status::LogicalLinkStatus;
+        let pdu = SnDataTransmitRequest {
+            nsapi: Nsapi(3),
+            logical_link_status: LogicalLinkStatus::NotConnected,
+            enhanced_pi4_dqpsk_service: false,
+            resource_request: None,
+            o_bit: false,
+            sndcp_network_endpoint_identifier: None,
+            m_bit: false,
+            nsapi_additional: vec![],
+        };
+        let mut buf = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut buf).unwrap();
+        buf.seek(0);
+        let decoded = SnPdu::from_bitbuf_ul(&mut buf).unwrap();
+        assert!(matches!(decoded, SnPdu::DataTransmitRequest(_)));
+    }
+
+    #[test]
+    fn dispatch_data_transmit_response_dl() {
+        use crate::sndcp::enums::transmit_response_reject_cause::TransmitResponseRejectCause;
+        let pdu = SnDataTransmitResponse {
+            nsapi: Nsapi(5),
+            accept: false,
+            transmit_response_reject_cause: Some(TransmitResponseRejectCause::UnknownNsapi),
+            o_bit: false,
+            sndcp_network_endpoint_identifier: None,
+            m_bit: false,
+            nsapi_additional: vec![],
+        };
+        let mut buf = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut buf).unwrap();
+        buf.seek(0);
+        let decoded = SnPdu::from_bitbuf_dl(&mut buf).unwrap();
+        assert!(matches!(decoded, SnPdu::DataTransmitResponse(_)));
+    }
+
+    #[test]
+    fn transmit_request_in_dl_is_unhandled() {
+        // DataTransmitRequest (type 6) in a downlink context is direction-wrong → Unhandled.
+        use crate::sndcp::enums::logical_link_status::LogicalLinkStatus;
+        let pdu = SnDataTransmitRequest {
+            nsapi: Nsapi(3),
+            logical_link_status: LogicalLinkStatus::NotConnected,
+            enhanced_pi4_dqpsk_service: false,
+            resource_request: None,
+            o_bit: false,
+            sndcp_network_endpoint_identifier: None,
+            m_bit: false,
+            nsapi_additional: vec![],
+        };
+        let mut buf = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut buf).unwrap();
+        buf.seek(0);
+        let decoded = SnPdu::from_bitbuf_dl(&mut buf).unwrap();
+        assert!(matches!(decoded, SnPdu::Unhandled { sn_pdu_type: SnPduType::DataTransmitRequest, .. }));
     }
 }
