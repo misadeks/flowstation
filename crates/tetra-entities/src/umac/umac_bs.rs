@@ -1670,6 +1670,11 @@ impl UmacBs {
         }
         tracing::info!("UMAC: PdchReleaseReq issi={} nsapi={} → releasing reservation", issi, nsapi);
         self.pdch_allocator.release(issi);
+        // If this was the last reservation, deactivate PDCH AACH signalling.
+        if self.pdch_allocator.reservations.is_empty() {
+            self.channel_scheduler.set_pdch_timeslot(None);
+            self.pdch_allocator.current_timeslot = None;
+        }
     }
 
     /// Handle `PdchReserveReq` from SNDCP (PD-4g).
@@ -1806,6 +1811,13 @@ impl UmacBs {
         );
 
         self.channel_scheduler.dl_enqueue_tma(pdu, sdu, None);
+
+        // Arm PDCH AACH signalling: from this frame onward the scheduler will
+        // emit AssignedControl / AssignedOnly on `ts` so the MS knows the slot
+        // is an assigned SCCH and may transmit uplink control-plane bursts.
+        // Cleared when the last reservation expires or PdchReleaseReq arrives.
+        self.channel_scheduler.set_pdch_timeslot(Some(ts));
+        self.pdch_allocator.current_timeslot = Some(ts);
     }
 
     /// Build an ACCESS-DEFINE PDU for a PDCH access-code override and return
@@ -2431,8 +2443,17 @@ impl TetraEntityTrait for UmacBs {
         if self.packet_data_enabled {
             // 1. Release idle reservations.
             let released = self.pdch_allocator.expire_idle(ts);
-            for issi in released {
+            for issi in &released {
                 tracing::info!("UMAC: PDCH idle-release issi={}", issi);
+            }
+            // If idle expiry removed all reservations, deactivate PDCH AACH.
+            // Do NOT re-arm pdch_timeslot here — it must only be set by
+            // emit_pdch_mac_resource (i.e., MS-initiated).  Re-arming in the
+            // tick would cause ghost PDCH AACH to re-appear after voice ends
+            // without a new TRANSMIT-REQUEST from the MS.
+            if !released.is_empty() && self.pdch_allocator.reservations.is_empty() {
+                self.channel_scheduler.set_pdch_timeslot(None);
+                self.pdch_allocator.current_timeslot = None;
             }
 
             // 2. Dynamic PDCH timeslot allocation.

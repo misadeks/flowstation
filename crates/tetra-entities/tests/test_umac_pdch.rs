@@ -728,3 +728,142 @@ fn pdch_reserve_req_triggers_mac_resource_with_channel_allocation() {
         "PDCH carrier must be the main carrier"
     );
 }
+
+// ── PD-5b test 1 ──────────────────────────────────────────────────────────────
+/// After `emit_pdch_mac_resource` fires (triggered by a packet-data uplink),
+/// the scheduler's `pdch_timeslot` must be `Some(4)` so the AACH on TS4 carries
+/// `AssignedControl / AssignedOnly` on subsequent frames.
+///
+/// This is the primary regression test for PD-5b: the root cause was that
+/// `pdch_timeslot` was never set, so the MS saw `Unallocated` on TS4 and
+/// abandoned the granted timeslot within 1-2 frames.
+#[test]
+fn pdch_mac_resource_activates_assigned_control_aach_on_pdch_slot() {
+    debug::setup_logging_verbose();
+
+    const TEST_ISSI: u32 = 8888;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    {
+        let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+            .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+        umac.set_packet_data_enabled_for_test(true);
+    }
+
+    // Submit a packet-data uplink — triggers reserve + emit_pdch_mac_resource.
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(TEST_ISSI)),
+    });
+    test.run_stack(Some(4));
+
+    let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+        .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+
+    // After the grant, the scheduler must have pdch_timeslot = Some(4) (highest free slot).
+    assert_eq!(
+        umac.channel_scheduler.pdch_timeslot(),
+        Some(4),
+        "emit_pdch_mac_resource must arm pdch_timeslot=Some(4) so AACH signals AssignedControl"
+    );
+}
+
+// ── PD-5b test 2 ──────────────────────────────────────────────────────────────
+/// After voice preempts the PDCH slot and subsequently releases it, the PDCH
+/// must NOT ghost-reappear: `pdch_timeslot` must stay `None` until the MS
+/// re-requests via a new TRANSMIT-REQUEST / packet-data uplink.
+///
+/// Regression guard for the tick-loop re-arm bug: if `set_pdch_timeslot` were
+/// called in the per-hyperframe tick with the "would-choose" slot, the AACH
+/// would flip back to AssignedControl after voice ends without an MS-initiated
+/// request, causing the MS to try to access a ghost PDCH session.
+#[test]
+fn pdch_tick_reasserts_aach_after_intra_frame_change() {
+    debug::setup_logging_verbose();
+
+    const TEST_ISSI: u32 = 6543;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Enable PDCH.
+    {
+        let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+            .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+        umac.set_packet_data_enabled_for_test(true);
+    }
+
+    // Step 1: submit a packet-data uplink → PDCH granted on TS4.
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(TEST_ISSI)),
+    });
+    test.run_stack(Some(4));
+
+    {
+        let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+            .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+        assert_eq!(
+            umac.channel_scheduler.pdch_timeslot(),
+            Some(4),
+            "pre-condition: PDCH must be active on TS4 before voice preemption"
+        );
+    }
+
+    // Step 2: voice opens a circuit on TS4 → preempts PDCH.
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            carrier_num: MAIN_CARRIER,
+            ts: 4,
+            peer_carrier_num: None,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::SwMI,
+        })),
+    });
+    test.run_stack(Some(2));
+
+    {
+        let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+            .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+        assert_eq!(
+            umac.channel_scheduler.pdch_timeslot(),
+            None,
+            "voice preemption on TS4 must clear pdch_timeslot"
+        );
+    }
+
+    // Step 3: voice releases TS4.
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Both, 4)),
+    });
+    // Run several hyperframes so the PDCH tick fires at least once.
+    test.run_stack(Some(4 * 18 * 4));
+
+    let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+        .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+
+    // PDCH must NOT ghost-reappear — still None until the MS re-requests.
+    assert_eq!(
+        umac.channel_scheduler.pdch_timeslot(),
+        None,
+        "PDCH must not ghost-reappear after voice releases the preempted slot; \
+         re-activation requires an MS-initiated TRANSMIT-REQUEST"
+    );
+}
