@@ -100,8 +100,12 @@ impl SnDataTransmitResponse {
         if let Some(snei) = self.sndcp_network_endpoint_identifier {
             buffer.write_bits(snei as u64, 16);
         }
-        buffer.write_bits(self.m_bit as u64, 1);
-        if self.m_bit {
+        // NOTE: spec ambiguous — chosen behaviour: only emit the trailing m_bit +
+        // type-4 additional-NSAPI chain when there is at least one additional NSAPI
+        // to signal. Motorola MTM800E MSes verified on 2026-07-08 emit and expect
+        // the SHORTER form when the type-4 chain is empty.
+        if self.m_bit && !self.nsapi_additional.is_empty() {
+            buffer.write_bits(1, 1);
             let last = self.nsapi_additional.len().saturating_sub(1);
             for (i, &extra) in self.nsapi_additional.iter().enumerate() {
                 buffer.write_bits(extra as u64, 4);
