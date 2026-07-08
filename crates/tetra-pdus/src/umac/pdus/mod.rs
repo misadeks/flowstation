@@ -19,4 +19,5 @@ pub mod mac_u_signal;
 pub mod mac_sync;
 pub mod mac_sysinfo;
 
-pub mod d_channel_alloc_broadcast;
+// NOTE: d_channel_alloc_broadcast is pending corrected ETSI wire schema
+// (ETSI EN 300 392-2 clause 21.4.3.4). Will be added once confirmed.

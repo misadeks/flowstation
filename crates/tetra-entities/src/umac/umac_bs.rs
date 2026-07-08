@@ -12,7 +12,7 @@ use tetra_pdus::umac::enums::sysinfo_opt_field_flag::SysinfoOptFieldFlag;
 use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
 use tetra_pdus::umac::fields::sysinfo_ext_services::SysinfoExtendedServices;
-use tetra_pdus::umac::pdus::d_channel_alloc_broadcast::{DChannelAllocationBroadcast, UlDlMode};
+// NOTE: DChannelAllocationBroadcast import removed — codec pending corrected ETSI wire schema.
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_data::MacData;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
@@ -88,14 +88,13 @@ pub struct UmacBs {
     packet_data_enabled: bool,
     /// Tracks per-ISSI PDCH reservations and handles idle-release.
     pdch_allocator: PdchAllocator,
-    /// Queued packet-data PDUs to be drained onto TS4.
-    /// NOTE: spec ambiguous — chosen behaviour: single FIFO queue; TS4 is the
-    /// dedicated PDCH slot per the PD-5 scope decision.
+    /// Queued packet-data PDUs to be drained onto the chosen PDCH slot.
     pdch_dl_queue: std::collections::VecDeque<BitBuffer>,
-    /// Pending D-CHANNEL-ALLOCATION-BROADCAST to be emitted on the next TS1 AACH.
-    /// Set each frame when packet_data_enabled = true; consumed by test accessors
-    /// or future scheduler wiring.
-    pub pdch_aach_broadcast_pending: Option<BitBuffer>,
+    /// Hook flag: set to `true` each hyperframe when packet data is enabled AND
+    /// a PDCH timeslot was successfully chosen. Used as a test observable until
+    /// the real `D-CHANNEL-ALLOCATION-BROADCAST` codec arrives (schema TBD —
+    /// pending corrected ETSI EN 300 392-2 clause 21.4.3.4 wire format).
+    pub pdch_broadcast_hook_fired: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -143,7 +142,7 @@ impl UmacBs {
             packet_data_enabled: PACKET_DATA_ENABLED,
             pdch_allocator: PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES),
             pdch_dl_queue: std::collections::VecDeque::new(),
-            pdch_aach_broadcast_pending: None,
+            pdch_broadcast_hook_fired: false,
         }
     }
 
@@ -1677,31 +1676,20 @@ impl UmacBs {
         self.pdch_dl_queue.push_back(prim.pdu.clone());
     }
 
-    /// Build a `D-CHANNEL-ALLOCATION-BROADCAST` AACH advertisement block for TS1.
-    /// `pdch_ts` is the timeslot index (1-based) that was dynamically chosen for PDCH.
-    /// NOTE: spec ambiguous — chosen behaviour: emitted on the SCH/HD half-slot
-    /// of TS1 once per hyperframe (when TS1 is in MCCH/broadcast mode).
-    fn build_pdch_aach_broadcast(&self, pdch_ts: u8) -> BitBuffer {
-        let cfg = self.config.config();
-        // Convert 1-based timeslot to 0-based wire index.
-        // NOTE: spec ambiguous — chosen behaviour: wire value = timeslot_number - 1.
-        let ts_wire = pdch_ts.saturating_sub(1);
-        let pdu = DChannelAllocationBroadcast {
-            // NOTE: spec ambiguous — chosen behaviour: use cell freq_band as DL band.
-            dl_frequency_band: cfg.cell.freq_band,
-            // NOTE: spec ambiguous — chosen behaviour: main_carrier as the PDCH LCN.
-            carrier_number: cfg.cell.main_carrier,
-            timeslot: ts_wire,
-            // NOTE: spec ambiguous — chosen behaviour: symmetric UL+DL.
-            ul_dl_mode: UlDlMode::Symmetric,
-            encoding: 0,
-            channel_bandwidth: 0,
-            rand_access_group: 0,
-        };
-        let mut buf = BitBuffer::new(36);
-        pdu.to_bitbuf(&mut buf);
-        buf.seek(0);
-        buf
+    /// Placeholder for the future `D-CHANNEL-ALLOCATION-BROADCAST` AACH emission.
+    ///
+    /// The real implementation is blocked pending the corrected ETSI EN 300 392-2
+    /// clause 21.4.3.4 wire format (field widths and ordering TBD).  For now this
+    /// method sets a test-observable bool flag so tests can verify the hook fires
+    /// at the right hyperframe cadence without depending on a specific bit pattern.
+    fn trigger_pdch_broadcast_hook(&mut self, pdch_ts: u8) {
+        // TODO(PD-5-schema): replace with real DChannelAllocationBroadcast codec
+        // once corrected wire format arrives.
+        tracing::debug!(
+            "UMAC: PDCH broadcast hook fired for TS{} (codec pending)",
+            pdch_ts
+        );
+        self.pdch_broadcast_hook_fired = true;
     }
 
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
@@ -2314,17 +2302,13 @@ impl TetraEntityTrait for UmacBs {
                         );
                     }
 
-                    // 4. Emit D-CHANNEL-ALLOCATION-BROADCAST on the AACH of TS1 once
-                    //    per hyperframe (on frame 1 of multiframe 1).
-                    //    NOTE: spec ambiguous — chosen behaviour: emit every frame
-                    //    where t=1, f=1 and TS1 AACH is available for common control.
+                    // 4. Trigger the PDCH broadcast hook on the hyperframe gate.
+                    //    The real D-CHANNEL-ALLOCATION-BROADCAST codec is blocked until
+                    //    the corrected ETSI EN 300 392-2 clause 21.4.3.4 wire format
+                    //    arrives. For now we set `pdch_broadcast_hook_fired` so tests
+                    //    can observe that the broadcast WOULD fire at the right cadence.
                     if ts.t == 1 && ts.f == 1 && self.channel_scheduler.allow_common_control_aach() {
-                        let broadcast_buf = self.build_pdch_aach_broadcast(chosen_ts);
-                        self.pdch_aach_broadcast_pending = Some(broadcast_buf);
-                        tracing::debug!(
-                            "UMAC: PDCH D-CHANNEL-ALLOCATION-BROADCAST queued for AACH (TS{})",
-                            chosen_ts
-                        );
+                        self.trigger_pdch_broadcast_hook(chosen_ts);
                     }
                 }
             }
