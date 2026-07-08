@@ -8,8 +8,9 @@
 //! routes to LLC over BL (Basic Link). V1 does not distinguish AL/BL routing; that is a
 //! follow-up item.
 //!
-//! IPv4 pool: `192.168.1.180..=192.168.1.190` (11 addresses). Dynamic and static
-//! allocation supported. Static requests for IPs outside this range are rejected.
+//! The IPv4 pool, timer encoded values and MTU code are now read from
+//! `config.packet_data` (PD-7).  When no `[packet_data]` section is present the
+//! defaults reproduce the pre-PD-7 hardcodes exactly.
 //!
 //! CHAP helpers (`find_chap_response_id`, `chap_success_optional_section`) were moved to
 //! `crates/tetra-pdus/src/sndcp/fields/pco.rs` (PD-1). This module uses the structured
@@ -18,7 +19,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{CfgPacketData, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress};
 use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
@@ -41,52 +42,64 @@ use crate::{MessageQueue, TetraEntityTrait};
 
 // --- Constants ----------------------------------------------------------------
 
-/// SN-ACTIVATE PDP CONTEXT ACCEPT mandatory field defaults (clause 28.23).
-const PDU_PRIORITY_MAX: u8 = 4;        // table 28.103: mid priority
-const READY_TIMER_CODE: u8 = 8;        // table 28.112: 10 s
-const STANDBY_TIMER_CODE: u8 = 5;      // table 28.122: 10 min (600 s)
-const RESP_WAIT_TIMER_CODE: u8 = 8;    // table 28.116: 10 s
-const MTU_CODE: u8 = 4;                // table 28.79: 1500 octets
-
-/// Timer values in TETRA timeslots.
-/// 1 timeslot approx 14.167 ms (1 hyperframe = 4320 timeslots = 61.2 s).
+/// Timer values in TETRA timeslots (not read from config — these govern the
+/// internal countdown state machine, not the on-wire PDU fields).
+/// 1 timeslot ≈ 14.167 ms (1 hyperframe = 4320 timeslots = 61.2 s).
 const READY_TIMER_SLOTS: i32 = 706;        // approx 10 s
 const STANDBY_TIMER_SLOTS: i32 = 42_353;   // approx 10 min
 const RESP_WAIT_TIMER_SLOTS: i32 = 706;    // approx 10 s
 
-/// Static IPv4 pool: 192.168.1.180..=192.168.1.190 (11 addresses).
-const POOL_BASE: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 180);
-const POOL_COUNT: u32 = 11;
-
 // --- Ipv4Pool -----------------------------------------------------------------
 
-/// Tiny IPv4 address allocator. Tracks addresses within the configured range.
+/// Tiny IPv4 address allocator.
+///
+/// Holds the set of addresses available for dynamic allocation.  Built from
+/// `CfgPacketData` at `Sndcp` construction time: the full subnet
+/// (base+1 .. broadcast-1) minus tun_addr minus pre-reserved static leases.
 struct Ipv4Pool {
     available: HashSet<Ipv4Addr>,
+    /// Network address of the configured subnet (= `ipv4_pool_base`).
     base_u32: u32,
-    count: u32,
+    /// Total number of addresses in the subnet (2^(32-prefix)).
+    total: u32,
 }
 
 impl Ipv4Pool {
-    fn new(base: Ipv4Addr, count: u32) -> Self {
-        let base_u32 = u32::from(base);
-        let mut available = HashSet::with_capacity(count as usize);
-        for i in 0..count {
-            available.insert(Ipv4Addr::from(base_u32.wrapping_add(i)));
-        }
-        Self { available, base_u32, count }
+    /// Build the pool from a [`CfgPacketData`] snapshot.
+    ///
+    /// Excludes:
+    /// - the network address (`base`)
+    /// - the broadcast address (`base + 2^(32-prefix) - 1`)
+    /// - `tun_addr` (the gateway address, not handed to MSes)
+    /// - each `static_lease.ipv4` (pre-reserved; dynamic allocation skips them)
+    fn from_config(pd: &CfgPacketData) -> Self {
+        let base_u32 = u32::from(pd.ipv4_pool_base);
+        let total: u32 = 1u32 << (32 - pd.ipv4_pool_prefix);
+        let broadcast: u32 = base_u32 + total - 1;
+        let tun_u32 = u32::from(pd.tun_addr);
+        let static_u32: HashSet<u32> =
+            pd.static_lease.iter().map(|l| u32::from(l.ipv4)).collect();
+
+        let available: HashSet<Ipv4Addr> = ((base_u32 + 1)..broadcast)
+            .filter(|&a| a != tun_u32 && !static_u32.contains(&a))
+            .map(Ipv4Addr::from)
+            .collect();
+
+        Self { available, base_u32, total }
     }
 
     /// Allocate any available address.
-    /// NOTE: spec ambiguous — chosen behaviour: allocate the lowest available IP for
-    /// deterministic test output rather than a random one.
+    ///
+    /// NOTE: spec ambiguous — chosen behaviour: allocate the lowest available
+    /// address for deterministic test output rather than a random one.
     fn allocate(&mut self) -> Option<Ipv4Addr> {
         let ip = self.available.iter().copied().min()?;
         self.available.remove(&ip);
         Some(ip)
     }
 
-    /// Allocate a specific address. Returns `Some(ip)` iff `ip` is currently available.
+    /// Allocate a specific address.  Returns `Some(ip)` iff `ip` is currently
+    /// in the `available` set.
     fn allocate_specific(&mut self, ip: Ipv4Addr) -> Option<Ipv4Addr> {
         if self.available.remove(&ip) { Some(ip) } else { None }
     }
@@ -96,11 +109,12 @@ impl Ipv4Pool {
         self.available.insert(ip);
     }
 
-    /// True iff `ip` falls within the configured pool range (regardless of allocation state).
+    /// True iff `ip` falls anywhere inside the configured subnet
+    /// (regardless of allocation state or exclusions).
     #[allow(dead_code)]
     fn is_in_range(&self, ip: Ipv4Addr) -> bool {
         let v = u32::from(ip);
-        v >= self.base_u32 && v < self.base_u32.saturating_add(self.count)
+        v >= self.base_u32 && v < self.base_u32.saturating_add(self.total)
     }
 }
 
@@ -177,7 +191,6 @@ pub struct GatewayDownlink {
 // --- Sndcp entity -------------------------------------------------------------
 
 pub struct Sndcp {
-    #[allow(dead_code)]
     config: SharedConfig,
     ipv4_pool: Ipv4Pool,
     contexts: HashMap<PdpKey, PdpContext>,
@@ -191,9 +204,10 @@ pub struct Sndcp {
 
 impl Sndcp {
     pub fn new(config: SharedConfig) -> Self {
+        let pd = config.config().packet_data.clone();
         Self {
+            ipv4_pool: Ipv4Pool::from_config(&pd),
             config,
-            ipv4_pool: Ipv4Pool::new(POOL_BASE, POOL_COUNT),
             contexts: HashMap::new(),
             ipv4_to_key: HashMap::new(),
             uplink_ip_queue: VecDeque::new(),
@@ -291,7 +305,7 @@ impl Sndcp {
         // ATID == 0  => static request (MS supplies the specific IPv4 it wants).
         // ATID != 0  => dynamic request (SwMI assigns any free address).
         let (ipv4, tia) = if demand.atid == 0 {
-            let requested = demand.ip_address.unwrap_or(POOL_BASE);
+            let requested = demand.ip_address.unwrap_or_else(|| self.config.config().packet_data.ipv4_pool_base);
             match self.ipv4_pool.allocate_specific(requested) {
                 Some(ip) => (ip, Tia::Ipv4Static),
                 None => {
@@ -332,17 +346,21 @@ impl Sndcp {
             }],
         });
 
+        let pd = self.config.config().packet_data.clone();
+        // mtu_to_code is guaranteed Some after config validation.
+        let mtu_code = tetra_config::bluestation::mtu_to_code(pd.mtu)
+            .unwrap_or(4); // fallback: 4 = 1500 octets (table 28.79)
         let accept = ActivatePdpContextAccept {
             nsapi: demand.nsapi,
-            pdu_priority_max: PDU_PRIORITY_MAX,
-            ready_timer: ReadyTimer(READY_TIMER_CODE),
-            standby_timer: StandbyTimer(STANDBY_TIMER_CODE),
-            response_wait_timer: ResponseWaitTimer(RESP_WAIT_TIMER_CODE),
+            pdu_priority_max: pd.timers.pdu_priority_max,
+            ready_timer: ReadyTimer(pd.timers.ready_timer),
+            standby_timer: StandbyTimer(pd.timers.standby_timer),
+            response_wait_timer: ResponseWaitTimer(pd.timers.resp_wait_timer),
             tia,
             ip4_address: Some(ipv4),
             pcomp: 0,
             vj_slots: None,
-            mtu: Mtu(MTU_CODE),
+            mtu: Mtu(mtu_code),
             snei: None,
             pco,
         };

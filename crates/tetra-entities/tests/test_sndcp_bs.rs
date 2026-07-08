@@ -7,7 +7,7 @@ mod common;
 
 use std::net::Ipv4Addr;
 
-use tetra_config::bluestation::{SharedConfig, StackMode};
+use tetra_config::bluestation::{CfgPacketData, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TetraAddress};
 use tetra_entities::sndcp::sndcp_bs::{GatewayDownlink, Sndcp};
@@ -172,10 +172,11 @@ fn activate_demand_dynamic_ip_produces_accept_with_ipv4() {
         other => panic!("expected ACCEPT, got {other:?}"),
     };
     let ip = ip4_address.expect("no ip in ACCEPT");
-    // Pool range: 192.168.1.180..=192.168.1.190
+    // Pool: 192.168.100.0/24 (default CfgPacketData), tun_addr=.1 excluded.
+    // Dynamic IPs start at 192.168.100.2.
     assert!(
-        ip >= Ipv4Addr::new(192, 168, 1, 180) && ip <= Ipv4Addr::new(192, 168, 1, 190),
-        "IP {ip} outside pool range"
+        ip >= Ipv4Addr::new(192, 168, 100, 2) && ip <= Ipv4Addr::new(192, 168, 100, 254),
+        "IP {ip} outside default pool range 192.168.100.2..=192.168.100.254"
     );
     assert!(pco.is_none(), "expected no PCO for no-CHAP demand");
 }
@@ -235,12 +236,13 @@ fn activate_demand_static_ip_not_in_pool_rejected() {
     assert_eq!(reject.reject_cause, RejectCause::RequestedStaticIpv4NotAvailable);
 }
 
-/// 4. Exhaust the 11-address pool, then a 12th dynamic DEMAND → REJECT cause 6.
+/// 4. Exhaust the dynamic pool (192.168.100.0/24, tun=.1 excluded → 253
+/// allocatable addresses), then one more → REJECT cause NoResource.
 #[test]
 fn activate_demand_ip_pool_exhausted_rejected() {
     let (mut sndcp, mut queue) = make_sndcp();
-    // Exhaust 11 IPs (distinct SSIs share same pool)
-    for i in 0u32..11 {
+    // Exhaust all 253 dynamically allocatable IPs (.2..=.254 with tun .1 excluded).
+    for i in 0u32..253 {
         let msg = activate(&mut sndcp, &mut queue, 10_000 + i, demand_dynamic(3))
             .expect("activate failed");
         let req = unwrap_req(msg);
@@ -250,7 +252,7 @@ fn activate_demand_ip_pool_exhausted_rejected() {
             "activation {i} should succeed, got {pdu:?}"
         );
     }
-    // 12th attempt (different SSI)
+    // 254th attempt (different SSI) — pool is now empty.
     let msg = activate(&mut sndcp, &mut queue, 99_999, demand_dynamic(3))
         .expect("no response on exhausted");
     let req = unwrap_req(msg);
@@ -464,4 +466,37 @@ fn unknown_pdu_type_dropped_without_panic() {
 
     sndcp.rx_prim(&mut queue, make_ind(sdu, 11001));
     assert!(queue.pop_front().is_none(), "unhandled PDU type should not produce output");
+}
+
+/// 12 (PD-7). A non-default `ipv4_pool_base` set in `CfgPacketData` is
+/// honoured by `Sndcp::new`: the allocated IP must come from the custom pool.
+#[test]
+fn custom_ipv4_pool_from_config_is_used() {
+    // Build a config with an explicit 10.0.0.0/24 pool (non-default).
+    let mut config = common::ComponentTest::get_default_test_config(StackMode::Bs);
+    config.packet_data = CfgPacketData {
+        enabled: true,
+        ipv4_pool_base: Ipv4Addr::new(10, 0, 0, 0),
+        ipv4_pool_prefix: 24,
+        tun_addr: Ipv4Addr::new(10, 0, 0, 1),
+        ..CfgPacketData::default()
+    };
+    let shared_config = SharedConfig::from_parts(config, None);
+    let mut sndcp = Sndcp::new(shared_config);
+    let mut queue = MessageQueue::new();
+
+    let msg = activate(&mut sndcp, &mut queue, 99001, demand_dynamic(3))
+        .expect("activation with custom pool should produce ACCEPT");
+    let req = unwrap_req(msg);
+    let pdu = decode_dl(&req);
+    let ActivatePdpContextAccept { ip4_address, .. } = match pdu {
+        SnPdu::ActivatePdpContextAccept(a) => a,
+        other => panic!("expected ACCEPT, got {other:?}"),
+    };
+    let ip = ip4_address.expect("no ip in ACCEPT");
+    // Must come from the 10.0.0.x pool, skipping tun_addr .1
+    assert!(
+        ip >= Ipv4Addr::new(10, 0, 0, 2) && ip <= Ipv4Addr::new(10, 0, 0, 254),
+        "IP {ip} should come from custom 10.0.0.0/24 pool"
+    );
 }

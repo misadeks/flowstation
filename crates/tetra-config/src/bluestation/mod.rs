@@ -64,5 +64,8 @@ pub use sec_health::*;
 pub mod sec_llc;
 pub use sec_llc::*;
 
+pub mod sec_packet_data;
+pub use sec_packet_data::*;
+
 pub mod state;
 pub use state::*;

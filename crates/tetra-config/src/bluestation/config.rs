@@ -10,6 +10,7 @@ use crate::bluestation::{
 use super::sec_brew::CfgBrew;
 use super::sec_dashboard::CfgDashboard;
 use super::sec_llc::CfgLlc;
+use super::sec_packet_data::CfgPacketData;
 use super::sec_telegram::CfgTelegram;
 use super::sec_telemetry::CfgTelemetry;
 
@@ -123,6 +124,10 @@ pub struct StackConfig {
     /// LLC runtime knobs — AL state machine configuration.  Always present;
     /// defaults match AL-3's prior hardcoded values.
     pub llc: CfgLlc,
+
+    /// Packet-data runtime configuration.  Always present;
+    /// defaults match PD-4/PD-5's prior hardcoded values.
+    pub packet_data: CfgPacketData,
 }
 
 impl StackConfig {
