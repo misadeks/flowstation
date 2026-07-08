@@ -11,6 +11,7 @@ members = [
     
     # Binaries
     "bins/bluestation-bs",
+    "bins/pd-gateway",
     #"bins/bluestation-telemetry",
     #"bins/bluestation-control",
     #"bins/pdu-tool",
@@ -119,3 +120,4 @@ uuid = { version = "1", features = ["v4"] }
 ctrlc = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
+tokio = { version = "1" }
