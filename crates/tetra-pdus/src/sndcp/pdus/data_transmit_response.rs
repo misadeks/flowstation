@@ -56,18 +56,28 @@ impl SnDataTransmitResponse {
         } else {
             None
         };
-        let m_bit = buffer.read_field(1, "m_bit")? != 0;
-        let mut nsapi_additional = Vec::new();
-        if m_bit {
-            loop {
-                let extra_nsapi = buffer.read_field(4, "nsapi_additional")? as u8;
-                nsapi_additional.push(extra_nsapi);
-                let more = buffer.read_field(1, "m_bit_continued")?;
-                if more == 0 {
-                    break;
+        // NOTE: spec ambiguous — chosen behaviour: trailing m_bit and type-4
+        // additional-NSAPI chain are OPTIONAL. Real MSes omit the m_bit when
+        // no additional NSAPIs are present. Be liberal on decode: treat
+        // "no bits remaining" as m_bit=0. Encoder still writes a trailing 0
+        // for round-trip parity.
+        let (m_bit, nsapi_additional) = if buffer.get_len_remaining() >= 1 {
+            let m_bit = buffer.read_field(1, "m_bit")? != 0;
+            let mut nsapi_additional = Vec::new();
+            if m_bit {
+                loop {
+                    let extra_nsapi = buffer.read_field(4, "nsapi_additional")? as u8;
+                    nsapi_additional.push(extra_nsapi);
+                    let more = buffer.read_field(1, "m_bit_continued")?;
+                    if more == 0 {
+                        break;
+                    }
                 }
             }
-        }
+            (m_bit, nsapi_additional)
+        } else {
+            (false, Vec::new())
+        };
         Ok(SnDataTransmitResponse {
             nsapi,
             accept,
@@ -148,5 +158,20 @@ mod tests {
         let mut buf2 = BitBuffer::new_autoexpand(128);
         decoded.to_bitbuf(&mut buf2).unwrap();
         assert_eq!(buf2.to_bitstr(), bits);
+    }
+
+    #[test]
+    fn decodes_minimal_wire_without_trailing_mbit() {
+        // Regression: minimal TRANSMIT-RESPONSE has no trailing m_bit.
+        //   type(4)=0111 nsapi(4)=0001 accept(1)=1 o_bit(1)=0  → 10 bits total
+        // Before this fix, decoder returned BufferEnded { field: "m_bit" }.
+        let mut buf = BitBuffer::from_bitstr("0111000110");
+        let decoded = SnDataTransmitResponse::from_bitbuf(&mut buf).unwrap();
+        assert_eq!(decoded.nsapi, Nsapi(1));
+        assert!(decoded.accept);
+        assert!(decoded.transmit_response_reject_cause.is_none());
+        assert!(!decoded.o_bit);
+        assert!(!decoded.m_bit);
+        assert!(decoded.nsapi_additional.is_empty());
     }
 }

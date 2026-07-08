@@ -126,19 +126,29 @@ impl SnDataTransmitRequest {
             None
         };
 
-        let m_bit = buffer.read_field(1, "m_bit")? != 0;
-        let mut nsapi_additional = Vec::new();
-        if m_bit {
-            // Read additional NSAPIs until m_bit = 0 in each subsequent block.
-            loop {
-                let extra_nsapi = buffer.read_field(4, "nsapi_additional")? as u8;
-                nsapi_additional.push(extra_nsapi);
-                let more = buffer.read_field(1, "m_bit_continued")?;
-                if more == 0 {
-                    break;
+        // NOTE: spec ambiguous — chosen behaviour: the trailing m_bit and type-4
+        // additional-NSAPI chain are OPTIONAL on the wire. Motorola MTM800E MSes
+        // (verified against live captures) omit the m_bit entirely when there are
+        // no additional NSAPIs. Be liberal on decode: treat "no bits remaining"
+        // as m_bit=0. Encoder still emits a trailing 0 for round-trip parity.
+        let (m_bit, nsapi_additional) = if buffer.get_len_remaining() >= 1 {
+            let m_bit = buffer.read_field(1, "m_bit")? != 0;
+            let mut nsapi_additional = Vec::new();
+            if m_bit {
+                // Read additional NSAPIs until m_bit = 0 in each subsequent block.
+                loop {
+                    let extra_nsapi = buffer.read_field(4, "nsapi_additional")? as u8;
+                    nsapi_additional.push(extra_nsapi);
+                    let more = buffer.read_field(1, "m_bit_continued")?;
+                    if more == 0 {
+                        break;
+                    }
                 }
             }
-        }
+            (m_bit, nsapi_additional)
+        } else {
+            (false, Vec::new())
+        };
 
         Ok(SnDataTransmitRequest {
             nsapi,
@@ -233,5 +243,23 @@ mod tests {
         let mut buf2 = BitBuffer::new_autoexpand(128);
         decoded.to_bitbuf(&mut buf2).unwrap();
         assert_eq!(buf2.to_bitstr(), bits);
+    }
+
+    #[test]
+    fn decodes_minimal_wire_without_trailing_mbit() {
+        // Regression: Motorola MTM800E sends a minimal TRANSMIT-REQUEST with NO
+        // trailing m_bit when there are no additional NSAPIs. Captured on the air:
+        //   type(4)=0110 nsapi(4)=0001 lls(1)=0 enhanced(1)=0 o_bit(1)=0  → 11 bits total
+        // Before this fix, the decoder returned BufferEnded { field: "m_bit" }.
+        let mut buf = BitBuffer::from_bitstr("01100001000");
+        let decoded = SnDataTransmitRequest::from_bitbuf(&mut buf).unwrap();
+        assert_eq!(decoded.nsapi, Nsapi(1));
+        assert_eq!(decoded.logical_link_status, LogicalLinkStatus::NotConnected);
+        assert!(!decoded.enhanced_pi4_dqpsk_service);
+        assert!(decoded.resource_request.is_none());
+        assert!(!decoded.o_bit);
+        assert!(decoded.sndcp_network_endpoint_identifier.is_none());
+        assert!(!decoded.m_bit);
+        assert!(decoded.nsapi_additional.is_empty());
     }
 }
