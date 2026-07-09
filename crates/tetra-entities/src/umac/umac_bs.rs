@@ -87,8 +87,9 @@ pub struct UmacBs {
     packet_data_enabled: bool,
     /// Tracks per-ISSI PDCH reservations and handles idle-release.
     pdch_allocator: PdchAllocator,
-    /// Queued packet-data PDUs to be drained onto the chosen PDCH slot.
-    pdch_dl_queue: std::collections::VecDeque<BitBuffer>,
+    /// Queued packet-data PDUs to be drained onto the chosen PDCH slot each tick.
+    /// Each entry is `(issi, sdu)` so the drain can address the MAC-RESOURCE correctly.
+    pdch_dl_queue: std::collections::VecDeque<(u32, BitBuffer)>,
     /// Serialised ACCESS-DEFINE PDU built by `build_pdch_access_define_for_override`
     /// and stored here for consumers that need to send a non-default access-code
     /// override (access codes B/C/D or assigned-channel parameter overrides).
@@ -1736,7 +1737,7 @@ impl UmacBs {
             prim.pdu.get_len(),
             is_new
         );
-        self.pdch_dl_queue.push_back(prim.pdu.clone());
+        self.pdch_dl_queue.push_back((issi, prim.pdu.clone()));
 
         if is_new {
             // First packet-data PDU from this ISSI: pick the highest-numbered
@@ -1782,7 +1783,12 @@ impl UmacBs {
             // NOTE: spec ambiguous — chosen behaviour: Both (11), symmetric UL+DL
             // for V1 PDCH; asymmetric modes deferred to a future PR.
             ul_dl_assigned: UlDlAssignment::Both,
-            clch_permission: false,
+            // clch_permission must be true for Additional/Replace + Ul/Both allocations.
+            // Per ETSI TS 100 392-2 v3.10.1 §23.5.2.1, without CLCH permission the MS is
+            // not permitted to linearise on the assigned timeslot and will therefore never
+            // start transmitting on TS4.  Nexus-BS computes this as
+            // `(Additional||Replace) && (Ul||Both)` which is always true for our V1 case.
+            clch_permission: true,
             cell_change_flag: false,
             carrier_num: carrier,
             ext: None,
@@ -2364,6 +2370,12 @@ impl UmacBs {
     pub fn pdch_allocator_mut(&mut self) -> &mut PdchAllocator {
         &mut self.pdch_allocator
     }
+
+    /// Return the number of PDUs currently waiting in the PDCH DL queue.
+    /// Used by tests to confirm that queued data is not silently discarded.
+    pub fn pdch_dl_queue_len_for_test(&self) -> usize {
+        self.pdch_dl_queue.len()
+    }
 }
 
 impl TetraEntityTrait for UmacBs {
@@ -2483,15 +2495,24 @@ impl TetraEntityTrait for UmacBs {
                     );
                 }
                 Some(chosen_ts) => {
-                    // 3. Drain queued packet-data PDU for the chosen slot (placeholder;
-                    //    actual integration into finalize_ts_for_tick is deferred to
-                    //    when full PDCH traffic scheduling is implemented in a later PR).
-                    if !self.pdch_dl_queue.is_empty() {
-                        let _ = self.pdch_dl_queue.pop_front();
+                    // Drain one queued SNDCP PDU per tick onto the PDCH timeslot.
+                    // The PDU is wrapped in a MAC-RESOURCE addressed to the originating
+                    // ISSI and routed directly to `chosen_ts` via dl_enqueue_tma_for_link.
+                    if let Some((issi, sdu)) = self.pdch_dl_queue.pop_front() {
+                        let umt = self.pdch_allocator.reservations.get(&issi).map(|r| r.umt);
+                        let mut pdu = MacResource {
+                            addr: Some(TetraAddress { ssi: issi, ssi_type: SsiType::Issi }),
+                            usage_marker: umt,
+                            ..Default::default()
+                        };
+                        pdu.update_len_and_fill_ind(sdu.get_len());
                         tracing::debug!(
-                            "UMAC: PDCH drained one PDU for TS{} (scheduler integration pending)",
-                            chosen_ts
+                            "UMAC: PDCH DL {} bits for issi={} umt={:?} → TS{}",
+                            sdu.get_len(), issi, umt, chosen_ts
                         );
+                        self.pdch_allocator.touch(issi, self.dltime);
+                        self.channel_scheduler
+                            .dl_enqueue_tma_for_link(chosen_ts as u32, pdu, sdu, None);
                     }
                     // ACCESS-DEFINE is NOT emitted here. Per rlj_app symbol trace,
                     // DIMETRA embeds access-code-A parameters in SYSINFO's optional

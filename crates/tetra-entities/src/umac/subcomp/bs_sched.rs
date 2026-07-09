@@ -2516,4 +2516,35 @@ mod tests {
             aach.dl_usage
         );
     }
+
+    /// Prove that `dl_enqueue_tma_for_link` with `link_id = ts` routes PDCH DL data
+    /// directly to the assigned PDCH timeslot and NOT to TS1 (MCCH).
+    ///
+    /// This is the routing path used by the PDCH drain in `UmacBs::tick()` (PD-5c-H3).
+    /// Prior to the fix, `pdch_dl_queue` items were silently discarded; now each
+    /// dequeued PDU calls `dl_enqueue_tma_for_link(chosen_ts as u32, …)`.
+    #[test]
+    fn pdch_dl_data_routes_to_assigned_timeslot_not_mcch() {
+        let mut sched = get_testing_slotter();
+
+        // TS4 is free (no voice circuit), so link_id=4 must land on dltx_queues[3].
+        let addr = TetraAddress { ssi: 5001, ssi_type: SsiType::Issi };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(64); // simulates a small SNDCP packet
+
+        sched.dl_enqueue_tma_for_link(4, pdu, sdu, None);
+
+        // TS1 (index 0) must be untouched — the PDU must NOT fall back to MCCH.
+        assert_eq!(
+            sched.dltx_queues[0].len(),
+            0,
+            "PDCH data must not be routed to TS1/MCCH"
+        );
+        // TS4 (index 3) must hold exactly one PDU.
+        assert_eq!(
+            sched.dltx_queues[3].len(),
+            1,
+            "PDCH data must be queued on TS4"
+        );
+    }
 }
