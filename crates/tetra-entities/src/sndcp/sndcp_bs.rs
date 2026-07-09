@@ -46,7 +46,9 @@ use crate::{MessageQueue, TetraEntityTrait};
 /// Timer values in TETRA timeslots (not read from config — these govern the
 /// internal countdown state machine, not the on-wire PDU fields).
 /// 1 timeslot ≈ 14.167 ms (1 hyperframe = 4320 timeslots = 61.2 s).
-const READY_TIMER_SLOTS: i32 = 706;        // approx 10 s
+const READY_TIMER_SLOTS: i32 = 4237;       // approx 60 s (was 706 = ~10 s;
+                                             // widened to avoid racing the MS's END-OF-DATA,
+                                             // which arrives ~10 s after handshake completes)
 const STANDBY_TIMER_SLOTS: i32 = 42_353;   // approx 10 min
 const RESP_WAIT_TIMER_SLOTS: i32 = 706;    // approx 10 s
 
@@ -783,29 +785,53 @@ impl Sndcp {
         ind: &LtpdMleUnitdataInd,
         eod: tetra_pdus::sndcp::pdus::EndOfData,
     ) {
-        // END-OF-DATA is per-MS, not per-NSAPI (clause 28.4.4.7). Move all
-        // currently-Ready contexts for this MS to Standby. immediate_service_change
-        // is currently logged but not acted on (V1 doesn't differentiate immediate
-        // vs deferred service change).
+        // END-OF-DATA is per-MS, not per-NSAPI (clause 28.4.4.7).
+        // Semantics:
+        //   * Ready         -> Standby         (normal case, MS finished a burst)
+        //   * Standby       -> Standby         (no-op, refresh standby_deadline)
+        //   * WaitForAccept -> Standby         (edge case: activation ACK still in flight
+        //                                       when MS decides it's done; treat as Standby
+        //                                       so we don't leave the context stuck)
+        // Contexts in Deactivating / WaitForPageResponse are left alone: DEACTIVATE is
+        // in progress or a page is outstanding, both should complete on their own timer.
+        // NOTE: spec ambiguous — chosen behaviour: accept END-OF-DATA in Ready OR Standby
+        // OR WaitForAccept to avoid racing the ~10 s Ready-timer with the MS's own
+        // end-of-session signal. Live-hardware traces 2026-07-09 20:59 confirmed the MS
+        // routinely sends END-OF-DATA ~10 s after handshake, right at the timer boundary.
         let main_address = ind.received_tetra_address;
         let mut moved = 0usize;
         for (key, ctx) in self.contexts.iter_mut() {
-            if key.ssi == main_address.ssi && ctx.state == PdpState::Ready {
-                ctx.state = PdpState::Standby;
-                ctx.standby_deadline = Some(self.dltime.add_timeslots(STANDBY_TIMER_SLOTS));
-                ctx.ready_deadline = None;
-                moved += 1;
+            if key.ssi != main_address.ssi {
+                continue;
+            }
+            match ctx.state {
+                PdpState::Ready | PdpState::Standby | PdpState::WaitForAccept => {
+                    ctx.state = PdpState::Standby;
+                    ctx.standby_deadline =
+                        Some(self.dltime.add_timeslots(STANDBY_TIMER_SLOTS));
+                    ctx.ready_deadline = None;
+                    ctx.resp_wait_deadline = None;
+                    moved += 1;
+                }
+                PdpState::WaitingForAlSetup
+                | PdpState::Deactivating
+                | PdpState::WaitForPageResponse => {
+                    // leave alone
+                }
             }
         }
         if moved > 0 {
             tracing::info!(
-                "SNDCP: {:?} END OF DATA (immediate={}): moved {} contexts Ready->Standby",
-                main_address, eod.immediate_service_change, moved
+                "SNDCP: {:?} END OF DATA (immediate={}): moved {} contexts to Standby",
+                main_address,
+                eod.immediate_service_change,
+                moved
             );
         } else {
             tracing::debug!(
-                "SNDCP: END OF DATA from {:?} (immediate={}): no Ready contexts to transition",
-                main_address, eod.immediate_service_change
+                "SNDCP: END OF DATA from {:?} (immediate={}): no eligible contexts",
+                main_address,
+                eod.immediate_service_change
             );
         }
     }

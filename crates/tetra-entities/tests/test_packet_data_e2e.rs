@@ -37,8 +37,9 @@ use tetra_saps::tmv::TmvUnitdataReqSlots;
 
 const TEST_ISSI: u32 = 1234;
 const TEST_NSAPI: u8 = 3;
-/// Slightly more than READY_TIMER_SLOTS (706 slots ≈ 10 s); enough to expire it.
-const PAST_READY_TIMER: i32 = 750;
+/// Slightly more than READY_TIMER_SLOTS (4237 slots ≈ 60 s); enough to expire it.
+/// PD-4i widened the Ready timer from ~10 s to ~60 s so END-OF-DATA doesn't race it.
+const PAST_READY_TIMER: i32 = 4300;
 
 // ── TestStack ─────────────────────────────────────────────────────────────────
 
@@ -744,7 +745,7 @@ fn standby_paging_lifecycle() {
 
     // ── Phase 4: Advance past the ready timer → context → Standby ────────────
     //
-    // READY_TIMER_SLOTS ≈ 706 timeslots (10 s). Run PAST_READY_TIMER (750) real
+    // READY_TIMER_SLOTS ≈ 4237 timeslots (60 s). Run PAST_READY_TIMER (4300) real
     // ticks so the UMAC scheduler's sequential-timeslot invariant is satisfied.
     // SNDCP's tick_end calls run_timers() on every tick; the transition fires
     // once the elapsed time since last activity exceeds READY_TIMER_SLOTS.
