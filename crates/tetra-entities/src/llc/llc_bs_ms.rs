@@ -207,6 +207,43 @@ pub struct AlLink {
     pub pending_sdus: VecDeque<Vec<u8>>,
 }
 
+impl AlLink {
+    /// Discard all in-flight RX/TX AL transfer state on this link while
+    /// keeping the link registration and negotiated parameters intact.
+    ///
+    /// Called when the peer re-establishes the link via AL-SETUP
+    /// (any non-Success accepted report — Reset, ServiceDefinition,
+    /// ServiceChange) or AL-RECONNECT `Propose`. In both cases the peer
+    /// assumes a clean slate and will start sending fresh AL-DATA
+    /// fragments from `s_s = 0`; if stale reassembler slots survive,
+    /// every fresh fragment collides and is rejected as a conflicting
+    /// retransmission.
+    fn reset_transfer_state(&mut self) {
+        // RX reassembly buffers.
+        self.reassemblers.clear();
+        self.unack_reassemblers.clear();
+        self.unack_started_at.clear();
+        // TX bookkeeping.
+        self.outstanding_sdus.clear();
+        self.pending_sdus.clear();
+        self.next_n_s = 0;
+        self.needs_deferred_ack = false;
+        // Procedure timers + retry counters + pending retransmissions.
+        // Callers overwrite phase/t_setup_start/t_reconnect_start
+        // immediately after, but clear defensively so stray state from
+        // an aborted procedure cannot leak into the fresh session.
+        self.t_setup_start = None;
+        self.t_reconnect_start = None;
+        self.t_disc_start = None;
+        self.t_rnr_start = None;
+        self.setup_retries = 0;
+        self.reconnect_retries = 0;
+        self.disc_retries = 0;
+        self.pending_setup_pdu = None;
+        self.pending_reconnect_pdu = None;
+    }
+}
+
 /// Error type for AL-layer operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlError {
@@ -1418,6 +1455,11 @@ impl Llc {
             needs_deferred_ack: false,
             pending_sdus: VecDeque::new(),
         });
+        // Reset any transfer state carried over from a prior session on
+        // this same link key.  On a freshly-inserted link this is a
+        // no-op; on re-setup it discards stale RX reassemblers and TX
+        // bookkeeping so the peer's fresh N(S)/S(S) window starts clean.
+        link.reset_transfer_state();
         link.phase = AlPhase::Established;
         link.t_setup_start = None;
         link.carrier_num = carrier_num;
@@ -1427,7 +1469,10 @@ impl Llc {
         link.max_sdu_retx = pdu.max_retx_n273_or_repetition_n282;
         link.max_segment_retx = pdu.max_segment_retx_n274;
 
-        tracing::info!("AL link {:?} established (peer proposal accepted)", key);
+        tracing::info!(
+            "AL link {:?} established (peer proposal accepted, RX/TX state reset)",
+            key
+        );
 
         // Echo back with Success.
         let echo = Self::build_setup_echo(&pdu, SetupReport::Success);
@@ -1852,6 +1897,10 @@ impl Llc {
                 if let Some(link) = self.al_links.get_mut(&key) {
                     link.phase = AlPhase::Established;
                     link.carrier_num = carrier_num;
+                    // MS proposes a fresh N(S) window; discard stale
+                    // reassembler slots so the incoming s_s=0 does not
+                    // collide with a previous session's segment 0.
+                    link.reset_transfer_state();
                 } else {
                     // Create a minimal link on reconnect if none exists (e.g. BS restarted).
                     // Use config defaults for negotiated parameters since no SETUP PDU was seen.
@@ -1891,7 +1940,10 @@ impl Llc {
                     reply, carrier_num, main_address, key.link_id, key.endpoint_id,
                 );
                 queue.push_back(msg);
-                tracing::info!("AL link {:?} reconnected (peer-proposed, accepted)", key);
+                tracing::info!(
+                    "AL link {:?} reconnected (peer-proposed, accepted, RX/TX state reset)",
+                    key
+                );
             }
             ReconnectReport::Accept => {
                 // Our Propose was accepted.
