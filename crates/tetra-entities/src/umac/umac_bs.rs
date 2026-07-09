@@ -1805,6 +1805,12 @@ impl UmacBs {
             // MAC-RESOURCE so the MS can correlate AACH Traffic(UMt) with the grant.
             usage_marker: Some(umt),
             chan_alloc_element: Some(chan_alloc),
+            // The PDCH grant is emitted in response to the MS's SN-DATA-TRANSMIT-REQUEST
+            // which arrived as a random-access uplink burst. Setting this flag tells the
+            // MS "your RA succeeded"; without it, MTP3550 firmware treats the grant as
+            // stale/unrelated and refuses to move to the assigned timeslot. Verified via
+            // Nexus-BS which sets this in the same context.
+            random_access_flag: true,
             ..Default::default()
         };
 
