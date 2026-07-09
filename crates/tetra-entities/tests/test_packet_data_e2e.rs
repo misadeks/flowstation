@@ -29,7 +29,7 @@ use tetra_pdus::sndcp::pdus::{
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
-use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataReqBl};
+use tetra_saps::tla::{TlaTlDataIndAl, TlaTlDataReqBl, TlaTlUnitdataReqBl};
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::tmv::TmvUnitdataReqSlots;
 
@@ -256,6 +256,28 @@ fn make_uplink_ind(sdu: BitBuffer, issi: u32) -> SapMsg {
             received_tetra_address: TetraAddress::new(issi, SsiType::Issi),
             chan_change_resp_req: false,
             chan_change_handle: None,
+        }),
+    }
+}
+
+/// PD-5c-H12: Wrap a pre-built SDU (with SNDCP discriminator) in a
+/// `TlaTlDataIndAl` as if LLC just finished reassembling an Advanced-Link
+/// uplink SDU and delivered it up to MLE on the TLA SAP. Exercises the AL
+/// routing arm in `MleBs::rx_tla_prim`.
+fn make_uplink_ind_al(sdu: BitBuffer, issi: u32) -> SapMsg {
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::TlaTlDataIndAl(TlaTlDataIndAl {
+            main_address: TetraAddress::new(issi, SsiType::Issi),
+            link_id: 0,
+            endpoint_id: 0,
+            al_link_number: 1,
+            tl_sdu: sdu,
+            subscriber_class: 0,
+            fcs_ok: true,
+            air_interface_encryption: None,
         }),
     }
 }
@@ -867,4 +889,63 @@ fn standby_paging_lifecycle() {
         .count();
     assert_eq!(tma_unitdata_count, 2,
         "P6: LLC must produce 2 TmaUnitdataReq(packet_data_flag=true) for the drained UNITDATA");
+}
+
+/// PD-5c-H12: Uplink AL-assembled SN-DATA must route through MLE → SNDCP.
+///
+/// Before the fix, `TlaTlDataIndAl` (emitted by LLC after AL reassembly)
+/// hit the catch-all in `MleBs::rx_tla_prim` and produced
+/// `BUG: unexpected message or state -- routing error`, so SNDCP never saw
+/// the SN-DATA and the MS retransmitted indefinitely. This test walks the
+/// full BS-side chain: LLC-emitted `TlaTlDataIndAl` → MLE dispatch →
+/// SNDCP consumption → gateway uplink queue.
+#[test]
+fn al_uplink_sn_data_reaches_sndcp() {
+    debug::setup_logging_verbose();
+
+    let mut stack = TestStack::new();
+
+    // Bring up the PDP context via the existing BL/TLPD injection path.
+    stack.queue.push_back(make_uplink_ind(
+        build_activate_demand_pdu(TEST_NSAPI),
+        TEST_ISSI,
+    ));
+    let setup_msgs = tick_stack(&mut stack);
+    let ltpd_accept = find_ltpd_unitdata_req(&setup_msgs)
+        .expect("setup: ACTIVATE must produce ACCEPT");
+    match decode_dl_from_sdu(&ltpd_accept.sdu) {
+        SnPdu::ActivatePdpContextAccept(_) => {}
+        other => panic!("setup: expected ACCEPT, got {other:?}"),
+    };
+
+    // Now inject SN-DATA over the AL path — simulating LLC delivering an
+    // assembled Advanced-Link SDU up to MLE.
+    let icmp_req: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x02, 0x00, 0x00,
+        0x40, 0x01, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x02,
+        0xc0, 0xa8, 0x64, 0x01,
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
+    ];
+    stack.queue.push_back(make_uplink_ind_al(
+        build_sn_data_pdu(TEST_NSAPI, &icmp_req),
+        TEST_ISSI,
+    ));
+    let al_msgs = tick_stack(&mut stack);
+
+    // MLE must have translated the AL Ind into an LtpdMleUnitdataInd on TlpdSap.
+    let mle_ltpd_ind = al_msgs.iter().find(|m|
+        m.src == TetraEntity::Mle
+            && m.dest == TetraEntity::Sndcp
+            && matches!(m.msg, SapMsgInner::LtpdMleUnitdataInd(_))
+    );
+    assert!(mle_ltpd_ind.is_some(),
+        "H12: MLE must forward AL Ind as LtpdMleUnitdataInd on TlpdSap");
+
+    // SNDCP must have consumed it and pushed the IP payload upstream.
+    let ul = stack.sndcp.uplink_ip_queue.pop_front()
+        .expect("H12: SNDCP must push AL-delivered SN-DATA payload to gateway queue");
+    assert_eq!(ul.main_address.ssi, TEST_ISSI, "H12: uplink SSI");
+    assert_eq!(ul.nsapi, TEST_NSAPI, "H12: uplink NSAPI");
+    assert_eq!(ul.payload, icmp_req, "H12: uplink payload bytes");
 }

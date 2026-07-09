@@ -2,7 +2,7 @@ use crate::mle::components::broadcast::MleBroadcast;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, unimplemented_log};
+use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, Sap, TdmaTime, TetraAddress, unimplemented_log};
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::lmm::LmmMleUnitdataInd;
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
@@ -31,23 +31,8 @@ impl MleBs {
         Self { config, broadcast }
     }
 
-    fn rx_tla_mle_pdu(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_tla_mle_pdu(&mut self, _queue: &mut MessageQueue, sdu: BitBuffer) {
         tracing::trace!("rx_tla_mle_pdu");
-
-        // Extract tm_sdu from whatever primitive we have
-        let tm_sdu = {
-            match message.msg {
-                SapMsgInner::TlaTlDataIndBl(prim) => prim.tl_sdu,
-                _ => {
-                    tracing::error!("BUG: unexpected message or state -- routing error");
-                    return;
-                }
-            }
-        };
-        let Some(sdu) = tm_sdu else {
-            tracing::debug!("rx_tla_mle_pdu: no tm_sdu");
-            return;
-        };
 
         // Determine which type of TL-SDU we have and call handler function
         let Some(bits) = sdu.peek_bits(3) else {
@@ -93,6 +78,9 @@ impl MleBs {
             SapMsgInner::TlaTlDataIndBl(_) => {
                 self.rx_tla_data_ind_bl(queue, message);
             }
+            SapMsgInner::TlaTlDataIndAl(_) => {
+                self.rx_tla_data_ind_al(queue, message);
+            }
             SapMsgInner::TlaTlUnitdataIndBl(_) => {
                 // self.rx_tla_unitdata_ind_bl(queue, message);
                 tracing::warn!("MLE: BS received unexpected TL-UNITDATA, ignoring");
@@ -121,6 +109,47 @@ impl MleBs {
             );
             sdu.seek(0);
         }
+        self.dispatch_tla_data_ind(queue, prim.main_address, prim.link_id, prim.endpoint_id, sdu);
+    }
+
+    /// PD-5c-H12: uplink counterpart to `rx_tla_data_ind_bl` for AL-assembled
+    /// SDUs delivered by LLC over the Advanced Link. Reuses the same
+    /// protocol-discriminator dispatch as the BL path; SNDCP does not
+    /// differentiate provenance for the current MVP.
+    fn rx_tla_data_ind_al(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::TlaTlDataIndAl(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+        if !prim.fcs_ok {
+            // LLC already drops FCS failures before emitting the Ind; be
+            // defensive if that invariant ever changes.
+            tracing::warn!("MLE: rx_tla_data_ind_al received fcs_ok=false, ignoring");
+            return;
+        }
+        // Move the SDU out; leave a small empty buffer behind so we don't need Option.
+        let mut sdu = std::mem::replace(&mut prim.tl_sdu, BitBuffer::new(0));
+        if sdu.get_pos() != 0 {
+            tracing::warn!(
+                "MLE: rx_tla_data_ind_al sdu not at start position (pos={}), seeking to 0",
+                sdu.get_pos()
+            );
+            sdu.seek(0);
+        }
+        self.dispatch_tla_data_ind(queue, prim.main_address, prim.link_id, prim.endpoint_id, sdu);
+    }
+
+    /// Common dispatch for both BL and AL TL-DATA indications. Reads the
+    /// 3-bit MLE protocol discriminator and forwards the remaining SDU to
+    /// MM/CMCE/SNDCP or handles it as an MLE PDU internally.
+    fn dispatch_tla_data_ind(
+        &mut self,
+        queue: &mut MessageQueue,
+        main_address: TetraAddress,
+        link_id: LinkId,
+        endpoint_id: EndpointId,
+        mut sdu: BitBuffer,
+    ) {
         let Some(bits) = sdu.read_bits(3) else {
             tracing::warn!("insufficient bits: {}", sdu.dump_bin());
             return;
@@ -136,7 +165,7 @@ impl MleBs {
                 let m = LmmMleUnitdataInd {
                     sdu,
                     handle: 0,
-                    received_address: prim.main_address,
+                    received_address: main_address,
                 };
                 let msg = SapMsg {
                     sap: Sap::LmmSap,
@@ -150,9 +179,9 @@ impl MleBs {
                 let m = LcmcMleUnitdataInd {
                     sdu,
                     handle: 0,
-                    received_tetra_address: prim.main_address,
-                    endpoint_id: prim.endpoint_id,
-                    link_id: prim.link_id,
+                    received_tetra_address: main_address,
+                    endpoint_id,
+                    link_id,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
                 };
@@ -167,9 +196,9 @@ impl MleBs {
             MleProtocolDiscriminator::Sndcp => {
                 let m = LtpdMleUnitdataInd {
                     sdu,
-                    endpoint_id: prim.endpoint_id,
-                    link_id: prim.link_id,
-                    received_tetra_address: prim.main_address,
+                    endpoint_id,
+                    link_id,
+                    received_tetra_address: main_address,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
                 };
@@ -184,7 +213,7 @@ impl MleBs {
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Mle => {
-                self.rx_tla_mle_pdu(queue, message);
+                self.rx_tla_mle_pdu(queue, sdu);
             }
             MleProtocolDiscriminator::TetraManagementEntity => {
                 unimplemented_log!("MleProtocolDiscriminator::TetraManagementEntity");
