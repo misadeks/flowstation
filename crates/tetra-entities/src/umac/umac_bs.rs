@@ -1782,7 +1782,12 @@ impl UmacBs {
             // NOTE: spec ambiguous — chosen behaviour: Both (11), symmetric UL+DL
             // for V1 PDCH; asymmetric modes deferred to a future PR.
             ul_dl_assigned: UlDlAssignment::Both,
-            clch_permission: false,
+            // clch_permission must be true for Additional/Replace + Ul/Both allocations.
+            // Per ETSI TS 100 392-2 v3.10.1 §23.5.2.1, without CLCH permission the MS is
+            // not permitted to linearise on the assigned timeslot and will therefore never
+            // start transmitting on TS4.  Nexus-BS computes this as
+            // `(Additional||Replace) && (Ul||Both)` which is always true for our V1 case.
+            clch_permission: true,
             cell_change_flag: false,
             carrier_num: carrier,
             ext: None,
