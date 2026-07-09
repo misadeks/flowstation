@@ -212,6 +212,16 @@ pub struct Sndcp {
     ipv4_to_key: HashMap<Ipv4Addr, PdpKey>,
     /// Uplink IP payloads for the pd-gateway (PD-6) or tests to drain.
     pub uplink_ip_queue: VecDeque<GatewayUplink>,
+    /// PD-9: sender end of the pd-gateway bridge for uplink IP payloads.  When
+    /// `Some`, `tick_end` drains `uplink_ip_queue` into it.  `None` in tests
+    /// that inspect `uplink_ip_queue` directly and in configs where
+    /// `packet_data.enabled = false`.
+    gateway_uplink_tx: Option<crossbeam_channel::Sender<GatewayUplink>>,
+    /// PD-9: receiver end of the pd-gateway bridge for downlink IP payloads.
+    /// When `Some`, `tick_start` drains it and injects each item via
+    /// `feed_downlink_ip_acknowledged` (Ready contexts) or `feed_downlink_ip`
+    /// (Standby / WaitForPageResponse).
+    gateway_downlink_rx: Option<crossbeam_channel::Receiver<GatewayDownlink>>,
     /// Current TDMA time, recorded in `tick_start`.
     dltime: TdmaTime,
 }
@@ -225,8 +235,23 @@ impl Sndcp {
             contexts: HashMap::new(),
             ipv4_to_key: HashMap::new(),
             uplink_ip_queue: VecDeque::new(),
+            gateway_uplink_tx: None,
+            gateway_downlink_rx: None,
             dltime: TdmaTime::default(),
         }
+    }
+
+    /// PD-9: install the pd-gateway bridge channels.  `bluestation-bs` calls
+    /// this after `Sndcp::new` and before handing the entity to the router
+    /// when `packet_data.enabled` is true.  Tests that want to inspect
+    /// `uplink_ip_queue` directly leave the channels unset.
+    pub fn set_gateway_channels(
+        &mut self,
+        uplink_tx: crossbeam_channel::Sender<GatewayUplink>,
+        downlink_rx: crossbeam_channel::Receiver<GatewayDownlink>,
+    ) {
+        self.gateway_uplink_tx = Some(uplink_tx);
+        self.gateway_downlink_rx = Some(downlink_rx);
     }
 
     // -- Uplink dispatch -------------------------------------------------------
@@ -1123,12 +1148,57 @@ impl TetraEntityTrait for Sndcp {
         self.on_uplink_pdu(queue, &ind);
     }
 
-    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
+    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
+        // PD-9: pump any downlink IP payloads from the pd-gateway bridge into
+        // the SNDCP downlink path.  Prefer acknowledged SN-DATA (matches the
+        // AL path the MS uses uplink); fall back to SN-UNITDATA / SN-PAGE for
+        // contexts that are not currently in Ready state.
+        if self.gateway_downlink_rx.is_some() {
+            // Drain into a local Vec first — the injection methods take
+            // `&mut self` and would clash with a borrow of the receiver.
+            let mut pending: Vec<GatewayDownlink> = Vec::new();
+            if let Some(rx) = self.gateway_downlink_rx.as_ref() {
+                while let Ok(dl) = rx.try_recv() {
+                    pending.push(dl);
+                }
+            }
+            for dl in pending {
+                let ready = self
+                    .ipv4_to_key
+                    .get(&dl.dest_ipv4)
+                    .and_then(|k| self.contexts.get(k))
+                    .map(|c| c.state == PdpState::Ready)
+                    .unwrap_or(false);
+                if ready {
+                    self.feed_downlink_ip_acknowledged(queue, dl);
+                } else {
+                    self.feed_downlink_ip(queue, dl);
+                }
+            }
+        }
     }
 
     fn tick_end(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         self.run_timers();
+        // PD-9: drain accumulated uplink IP payloads to the pd-gateway bridge.
+        // If the bridge is gone (send error) we null out the sender so we stop
+        // trying and log once — SNDCP itself keeps working.
+        if self.gateway_uplink_tx.is_some() {
+            let mut disconnect = false;
+            while let Some(u) = self.uplink_ip_queue.pop_front() {
+                if let Some(tx) = self.gateway_uplink_tx.as_ref() {
+                    if tx.send(u).is_err() {
+                        disconnect = true;
+                        break;
+                    }
+                }
+            }
+            if disconnect {
+                tracing::warn!("SNDCP: pd-gateway uplink channel disconnected; dropping bridge");
+                self.gateway_uplink_tx = None;
+            }
+        }
         false
     }
 }

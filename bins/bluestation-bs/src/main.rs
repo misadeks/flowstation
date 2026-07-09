@@ -34,7 +34,7 @@ use tetra_entities::{
     mle::mle_bs::MleBs,
     mm::mm_bs::MmBs,
     phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs},
-    sndcp::sndcp_bs::Sndcp,
+    sndcp::sndcp_bs::{GatewayDownlink, GatewayUplink, Sndcp},
     umac::umac_bs::UmacBs,
 };
 
@@ -158,6 +158,101 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
     })
 }
 
+/// PD-9: Wire the pd-gateway crate into a freshly-constructed SNDCP entity.
+///
+/// - Builds a leaked multi-thread tokio runtime (needed by `pd-gateway` for
+///   its async TUN loop) and stores it in a `OnceLock` so it survives for the
+///   process lifetime.
+/// - Calls `spawn_gateway_task` and, on success, installs a pair of
+///   crossbeam channels on the SNDCP entity via `set_gateway_channels`.
+/// - Spawns a `pd-gateway-bridge` std thread that pumps between those
+///   channels and `GatewayHandle`, translating between `GatewayUplink` /
+///   `UplinkFromSndcp` and `DownlinkToSndcp` / `GatewayDownlink`.
+///
+/// Non-Linux (`TunOpen`) and other spawn failures are logged as warnings and
+/// SNDCP is left unwired — the stack still runs, IP queues just accumulate.
+fn wire_pd_gateway(sndcp: &mut Sndcp, pd: &tetra_config::bluestation::CfgPacketData) {
+    use std::sync::OnceLock;
+    use tokio::runtime::Runtime;
+
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    let rt = RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("pd-gateway-rt")
+            .build()
+            .expect("failed to build tokio runtime for pd-gateway")
+    });
+
+    let gw_cfg = pd_gateway::GatewayConfig {
+        tun_name: pd.tun_name.clone(),
+        tun_addr: pd.tun_addr,
+        tun_prefix_len: pd.ipv4_pool_prefix,
+        mtu: pd.mtu,
+    };
+
+    let handle = match rt.block_on(pd_gateway::spawn_gateway_task(gw_cfg.clone())) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                "PD-9: pd-gateway not started ({}); SNDCP IP queues will accumulate. \
+                 This is expected on non-Linux dev machines.",
+                e
+            );
+            return;
+        }
+    };
+    let handle = std::sync::Arc::new(handle);
+
+    let (u_tx, u_rx) = crossbeam_channel::unbounded::<GatewayUplink>();
+    let (d_tx, d_rx) = crossbeam_channel::unbounded::<GatewayDownlink>();
+    sndcp.set_gateway_channels(u_tx, d_rx);
+
+    let bridge_handle = handle.clone();
+    thread::Builder::new()
+        .name("pd-gateway-bridge".into())
+        .spawn(move || {
+            use crossbeam_channel::RecvTimeoutError;
+            use std::time::Duration;
+            loop {
+                // Uplink: block briefly so we don't busy-spin; short timeout
+                // so downlink polling stays responsive.
+                match u_rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(u) => {
+                        let up = pd_gateway::UplinkFromSndcp {
+                            issi: u.main_address.ssi,
+                            nsapi: u.nsapi,
+                            payload: u.payload,
+                        };
+                        if bridge_handle.push_uplink(up).is_err() {
+                            tracing::warn!("PD-9: pd-gateway TUN task gone; bridge exiting");
+                            return;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        tracing::info!("PD-9: SNDCP uplink channel closed; bridge exiting");
+                        return;
+                    }
+                }
+                // Downlink: drain everything currently buffered.
+                while let Some(dl) = bridge_handle.try_pop_downlink() {
+                    let g = GatewayDownlink { dest_ipv4: dl.dest_ipv4, payload: dl.payload };
+                    if d_tx.send(g).is_err() {
+                        tracing::info!("PD-9: SNDCP downlink channel closed; bridge exiting");
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn pd-gateway-bridge thread");
+
+    eprintln!(
+        " -> Packet data gateway enabled (TUN {}, {}/{}, MTU {})",
+        gw_cfg.tun_name, gw_cfg.tun_addr, gw_cfg.tun_prefix_len, gw_cfg.mtu
+    );
+}
+
 /// Start base station stack
 fn build_bs_stack(
     cfg: &mut SharedConfig,
@@ -239,7 +334,14 @@ fn build_bs_stack(
     let llc = Llc::new(cfg.clone());
     let mle = MleBs::new(cfg.clone());
     let mut mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
-    let sndcp = Sndcp::new(cfg.clone());
+    let mut sndcp = Sndcp::new(cfg.clone());
+    // PD-9: bridge SNDCP's uplink/downlink IP queues to the OS TUN interface
+    // via the pd-gateway crate.  Gated on [packet_data].enabled so configs
+    // without packet data (or dev machines without TUN) are unaffected.  On
+    // non-Linux `spawn_gateway_task` returns TunOpen; we warn and continue.
+    if cfg.config().packet_data.enabled {
+        wire_pd_gateway(&mut sndcp, &cfg.config().packet_data);
+    }
     let mut cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
     // Wire the built-in WX/METAR service's reply channel: its background fetch threads
     // re-inject SendSds commands through the CMCE command dispatcher, same as the dashboard.
