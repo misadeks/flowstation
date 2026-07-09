@@ -373,13 +373,35 @@ impl BsChannelScheduler {
     /// Returns (opportunities_to_skip, Vec<timestamps_of_granted_slots>)
     /// Returns None if no suitable opportunity is found in the schedule
     pub fn ul_find_grant_opportunity(&self, t: u8, num_slots: usize, is_halfslot: bool) -> Option<(usize, Vec<TdmaTime>)> {
+        self.ul_find_grant_opportunity_for_owner(t, num_slots, is_halfslot, None)
+    }
+
+    /// Same as `ul_find_grant_opportunity`, but treats a full slot already
+    /// owned by `reusable_owner` as available. This is needed on assigned
+    /// PDCH: when the MS asks for more reserved access (e.g. `Req17Slots`)
+    /// while a prior `Req1Slot` reservation for the same ISSI is still
+    /// stamped in the ring, re-granting that slot to the same owner is
+    /// conflict-free per ETSI EN 300 392-2 §23.5.2.2.7 and lets the run
+    /// span the full multiframe.
+    pub fn ul_find_grant_opportunity_for_owner(
+        &self,
+        t: u8,
+        num_slots: usize,
+        is_halfslot: bool,
+        reusable_owner: Option<u32>,
+    ) -> Option<(usize, Vec<TdmaTime>)> {
         let first_opportunity = self.cur_dltime.forward_to_timeslot(t);
         let mut grant_timeslots = Vec::with_capacity(num_slots);
         let mut opportunities_skipped = 0;
 
         assert!(!is_halfslot || num_slots == 1, "is_halfslot set for num_slots > 1");
 
-        for dist in 0..MACSCHED_NUM_FRAMES - 1 {
+        // Iterate one full multiframe on the target UL timeslot. With
+        // MACSCHED_NUM_FRAMES == 18 this walks 18 candidate frames on TS `t`,
+        // of which exactly one falls on frame 18 (skipped below), leaving
+        // 17 usable candidates — the maximum a single-TS PDCH assignment
+        // can support in one multiframe (Req17Slots).
+        for dist in 0..MACSCHED_NUM_FRAMES {
             // let candidate_t = self.cur_ts.add_timeslots(dist as i32 * 4);
             // Base off of internal perception of time, convert to UL time
             // Below may crash someday, but I'd want to investigate that situation
@@ -411,7 +433,14 @@ impl BsChannelScheduler {
             let index = self.ul_ts_to_sched_index(&candidate_t);
             let elem = &self.ulsched[t as usize - 1][index];
             // tracing::debug!("ul_find_grant_opportunity: sched[{}] ts {}: {:?}", index, candidate_t, elem);
-            if (elem.ul1.is_none() && elem.ul2.is_none()) || (is_halfslot && (elem.ul1.is_none() || elem.ul2.is_none())) {
+            // A full slot already owned end-to-end by the requesting ISSI
+            // is safe to re-grant to the same ISSI (see method doc).
+            let same_owner_full_slot = reusable_owner
+                .is_some_and(|owner| !is_halfslot && elem.ul1 == Some(owner) && elem.ul2 == Some(owner));
+            if (elem.ul1.is_none() && elem.ul2.is_none())
+                || same_owner_full_slot
+                || (is_halfslot && (elem.ul1.is_none() || elem.ul2.is_none()))
+            {
                 // Free UL slot, add this timeslot to result vec
                 grant_timeslots.push(candidate_t);
                 // continue;
@@ -457,8 +486,20 @@ impl BsChannelScheduler {
                     return 2;
                 }
             } else {
-                assert!(elem.ul1.is_none(), "ul_reserve_grant: ul1 already set for ts {:?}, ssi {}", ts, ssi);
-                assert!(elem.ul2.is_none(), "ul_reserve_grant: ul2 already set for ts {:?}, ssi {}", ts, ssi);
+                assert!(
+                    elem.ul1.is_none() || elem.ul1 == Some(ssi),
+                    "ul_reserve_grant: ul1 already set to a different owner for ts {:?}, ssi {}, existing {:?}",
+                    ts,
+                    ssi,
+                    elem.ul1
+                );
+                assert!(
+                    elem.ul2.is_none() || elem.ul2 == Some(ssi),
+                    "ul_reserve_grant: ul2 already set to a different owner for ts {:?}, ssi {}, existing {:?}",
+                    ts,
+                    ssi,
+                    elem.ul2
+                );
                 elem.ul1 = Some(ssi);
                 elem.ul2 = Some(ssi);
             }
@@ -482,8 +523,14 @@ impl BsChannelScheduler {
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
         let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
 
+        // Same-owner reuse is only safe for full-slot multi-slot requests
+        // (see ul_find_grant_opportunity_for_owner). For subslot / single-slot
+        // requests, leave `reusable_owner` as None so we don't accidentally
+        // re-grant a subslot the MS already holds.
+        let reusable_owner = if !is_halfslot && requested_cap >= 2 { Some(addr.ssi) } else { None };
+
         // Find a suitable grant opportunity
-        let grant_op = self.ul_find_grant_opportunity(timeslot, requested_cap, is_halfslot);
+        let grant_op = self.ul_find_grant_opportunity_for_owner(timeslot, requested_cap, is_halfslot, reusable_owner);
 
         tracing::debug!(
             "ul_process_cap_req: addr {}, res_req {:?}, requested_cap {}, is_halfslot {}, grant_op: {:?}",
@@ -496,6 +543,20 @@ impl BsChannelScheduler {
 
         // If found, reserve the slots and return a BasicSlotgrant + optional usage_marker.
         if let Some((skips, grant_timestamps)) = grant_op {
+            // ETSI 21.5.6: DelayNOpportunities is only representable for 1..=13.
+            // If we couldn't find a run within the first 14 opportunities, we
+            // can't tell the MS about the grant on the wire — bail so the MS
+            // re-requests instead of us encoding an invalid delay value.
+            if skips > 13 {
+                tracing::warn!(
+                    "ul_process_cap_req: grant opportunity for addr {} res_req {:?} would need delay={} (>13, not representable), returning None",
+                    addr,
+                    res_req,
+                    skips
+                );
+                return None;
+            }
+
             // For multi-slot full grants, allocate a usage marker. We do this
             // BEFORE reserving so the marker can be embedded in the schedule.
             // Single-slot or half-slot grants don't need a marker — the MS
@@ -2546,5 +2607,138 @@ mod tests {
             1,
             "PDCH data must be queued on TS4"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // PD-5c-H6: Req17Slots on assigned PDCH TS4 must produce a grant.
+    // ------------------------------------------------------------------
+
+    /// Test helper — get a slotter with the DL clock advanced to `ts`, so
+    /// `ul_process_cap_req` sees a realistic starting `first_opportunity`.
+    fn slotter_at(dl_time: TdmaTime) -> BsChannelScheduler {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(dl_time);
+        sched
+    }
+
+    #[test]
+    fn test_req17slots_on_ts4_returns_grant() {
+        // Mid-multiframe start so the 18-frame scan window straddles frame 18.
+        let mut sched = slotter_at(TdmaTime { t: 3, f: 5, m: 1, h: 0 });
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        let grant = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots);
+        assert!(grant.is_some(), "Req17Slots on empty TS4 must produce a grant");
+        let (grant, marker) = grant.unwrap();
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant17Slots);
+        assert!(marker.is_some(), "multi-slot grant must allocate a usage marker");
+    }
+
+    #[test]
+    fn test_req17slots_reserves_17_slots_skipping_frame18() {
+        let start = TdmaTime { t: 3, f: 5, m: 1, h: 0 };
+        let mut sched = slotter_at(start);
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots)
+            .expect("Req17Slots must succeed");
+
+        // Walk the same 18-frame window on TS4 and count owner stamps.
+        let first = start.forward_to_timeslot(4);
+        let mut owned = 0usize;
+        let mut frame18_seen = false;
+        for dist in 0..MACSCHED_NUM_FRAMES {
+            let t = first.add_timeslots(dist as i32 * 4);
+            assert_eq!(t.t, 4);
+            let owner = sched.ul_get_slot_owner(t, PhyBlockNum::Both);
+            if t.f == 18 {
+                frame18_seen = true;
+                assert_eq!(
+                    owner, None,
+                    "frame 18 must not be reserved (got {:?} at {:?})",
+                    owner, t
+                );
+            } else if owner == Some(addr.ssi) {
+                owned += 1;
+            }
+        }
+        assert!(frame18_seen, "18-frame window must include a frame 18 slot");
+        assert_eq!(owned, 17, "exactly 17 slots must be stamped for the ISSI");
+    }
+
+    #[test]
+    fn test_req17slots_reuses_prior_same_owner_slot() {
+        // First grant a single full slot to the same ISSI, then request 17
+        // more. The scheduler must reuse the already-stamped slot instead
+        // of aborting the run at it.
+        let start = TdmaTime { t: 3, f: 5, m: 1, h: 0 };
+        let mut sched = slotter_at(start);
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        let first = sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req1Slot)
+            .expect("initial Req1Slot must succeed");
+        assert_eq!(first.0.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+
+        // Same ISSI now asks for 17 slots on the same TS.
+        let grant = sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots)
+            .expect("Req17Slots must succeed even with prior same-owner reservation");
+        assert_eq!(grant.0.capacity_allocation, BasicSlotgrantCapAlloc::Grant17Slots);
+    }
+
+    #[test]
+    fn test_req17slots_grant_enqueues_dl_grant_pdu() {
+        // Emulate the umac_bs path: process the cap req, then enqueue the
+        // grant on the same TS. Assert the queued DlSchedElem::Grant carries
+        // Grant17Slots and a usage marker.
+        let mut sched = slotter_at(TdmaTime { t: 3, f: 5, m: 1, h: 0 });
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        let (grant, marker) = sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots)
+            .expect("Req17Slots must succeed");
+        sched.dl_enqueue_grant(4, addr, grant, marker);
+
+        // The grant lands on TS4 (index 3).
+        assert!(!sched.dltx_queues[3].is_empty(), "grant must be enqueued on TS4");
+        let found = sched.dltx_queues[3].iter().any(|elem| {
+            matches!(
+                elem,
+                DlSchedElem::Grant(a, g, m)
+                    if a.ssi == addr.ssi
+                        && g.capacity_allocation == BasicSlotgrantCapAlloc::Grant17Slots
+                        && m.is_some()
+            )
+        });
+        assert!(found, "queued grant must be Grant17Slots with usage marker");
+    }
+
+    #[test]
+    fn test_req17slots_delay_out_of_range_returns_none() {
+        // Pre-fill 14 consecutive TS4 candidates with a *different* ISSI so
+        // the run for the requester can only start after > 13 opportunities.
+        let start = TdmaTime { t: 3, f: 5, m: 1, h: 0 };
+        let mut sched = slotter_at(start);
+        let intruder: u32 = 4242;
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        let first = start.forward_to_timeslot(4);
+        let mut blocked = 0;
+        let mut dist = 0i32;
+        while blocked < 14 && (dist as usize) < MACSCHED_NUM_FRAMES {
+            let t = first.add_timeslots(dist * 4);
+            if t.f != 18 {
+                let idx = sched.ul_ts_to_sched_index(&t);
+                sched.ulsched[3][idx].ul1 = Some(intruder);
+                sched.ulsched[3][idx].ul2 = Some(intruder);
+                blocked += 1;
+            }
+            dist += 1;
+        }
+
+        let res = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots);
+        assert!(res.is_none(), "grant with skips>13 must return None, got {:?}", res);
     }
 }
