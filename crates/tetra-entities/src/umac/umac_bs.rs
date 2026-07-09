@@ -719,7 +719,11 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num)
                     .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
             } else {
-                tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
+                // Expected when the MS piggybacks reservation_req on an
+                // active multi-slot reservation (PD-5c-H7). The scheduler
+                // suppresses the re-grant; log at debug so this normal
+                // in-call chatter doesn't spam the console.
+                tracing::debug!("rx_mac_data: No grant for reservation request {:?}", res_req);
             }
         };
 
@@ -917,7 +921,10 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num)
                     .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
             } else {
-                tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
+                // See rx_mac_data note (PD-5c-H7): suppressed re-grants on
+                // piggybacked reservation_req are expected during active
+                // multi-slot reservations.
+                tracing::debug!("rx_mac_access: No grant for reservation request {:?}", res_req);
             }
         };
 
@@ -1115,7 +1122,8 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num)
                     .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
             } else {
-                tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
+                // See rx_mac_data note (PD-5c-H7).
+                tracing::debug!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
             }
         };
 
@@ -1242,7 +1250,8 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num)
                     .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
             } else {
-                tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
+                // See rx_mac_data note (PD-5c-H7).
+                tracing::debug!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
             }
         };
 

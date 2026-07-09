@@ -509,6 +509,37 @@ impl BsChannelScheduler {
         0
     }
 
+    /// Counts how many full UL slots in the forward multiframe window on
+    /// timeslot `t` are already owned end-to-end by `ssi`. Walks the same
+    /// 18-frame candidate window as `ul_find_grant_opportunity_for_owner`
+    /// (starting at `cur_dltime.forward_to_timeslot(t)`), and skips the
+    /// mandatory CLCH candidates and frame 18 exactly like the finder does,
+    /// so the count reflects only slots that are actual UL grant
+    /// opportunities.
+    ///
+    /// Used by `ul_process_cap_req` to suppress re-granting when an MS
+    /// piggybacks the same `reservation_req` on every uplink frame after
+    /// its multi-slot reservation is already in place (PD-5c-H7).
+    pub fn ul_owned_slot_count_in_window(&self, t: u8, ssi: u32) -> usize {
+        let first_opportunity = self.cur_dltime.forward_to_timeslot(t);
+        let mut owned = 0usize;
+        for dist in 0..MACSCHED_NUM_FRAMES {
+            let candidate_t = first_opportunity.add_timeslots(dist as i32 * 4);
+            if candidate_t.is_mandatory_clch() {
+                continue;
+            }
+            if candidate_t.f == 18 {
+                continue;
+            }
+            let index = self.ul_ts_to_sched_index(&candidate_t);
+            let elem = &self.ulsched[t as usize - 1][index];
+            if elem.ul1 == Some(ssi) && elem.ul2 == Some(ssi) {
+                owned += 1;
+            }
+        }
+        owned
+    }
+
     /// Tries to find a way to satisfy a granting request, and reserves the slots in the schedule.
     /// On success returns a `BasicSlotgrant` plus an optional `usage_marker`. The marker is
     /// `Some(m)` only when the grant covers more than one slot — single-slot grants don't need
@@ -522,6 +553,26 @@ impl BsChannelScheduler {
     ) -> Option<(BasicSlotgrant, Option<u8>)> {
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
         let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+
+        // PD-5c-H7: MS keeps piggybacking `reservation_req` on every uplink
+        // frame while its multi-slot reservation is active. Per ETSI
+        // §21.5.2 that is the MS's ongoing capacity statement, not a fresh
+        // request for more slots. If we already own enough forward UL slots
+        // for this ISSI, suppress the grant instead of re-reserving a
+        // shifted run with a fresh usage_marker each frame.
+        if !is_halfslot && requested_cap >= 2 {
+            let owned = self.ul_owned_slot_count_in_window(timeslot, addr.ssi);
+            if owned >= requested_cap {
+                tracing::debug!(
+                    "ul_process_cap_req: suppressing repeat grant for addr {} res_req {:?} — {} slots already reserved in forward window (need {})",
+                    addr,
+                    res_req,
+                    owned,
+                    requested_cap
+                );
+                return None;
+            }
+        }
 
         // Same-owner reuse is only safe for full-slot multi-slot requests
         // (see ul_find_grant_opportunity_for_owner). For subslot / single-slot
@@ -2740,5 +2791,86 @@ mod tests {
 
         let res = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots);
         assert!(res.is_none(), "grant with skips>13 must return None, got {:?}", res);
+    }
+
+    // ------------------------------------------------------------------
+    // PD-5c-H7: piggybacked Req17Slots must not spam re-grants.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_req17slots_repeated_piggyback_grants_once() {
+        // MS's initial MacAccess with Req17Slots grants and reserves 17
+        // slots. A second call in the same DL tick (as would happen if
+        // the same reservation_req were re-processed) must be suppressed.
+        let mut sched = slotter_at(TdmaTime { t: 3, f: 5, m: 1, h: 0 });
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        let first = sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots)
+            .expect("initial Req17Slots must grant");
+        sched.dl_enqueue_grant(4, addr, first.0, first.1);
+        assert_eq!(sched.dltx_queues[3].len(), 1, "first grant must be enqueued");
+
+        let second = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots);
+        assert!(
+            second.is_none(),
+            "repeat Req17Slots with active reservation must be suppressed, got {:?}",
+            second
+        );
+        assert_eq!(
+            sched.dltx_queues[3].len(),
+            1,
+            "no additional grant PDU must be enqueued"
+        );
+    }
+
+    #[test]
+    fn test_req17slots_repeated_piggyback_across_frames_no_new_grants() {
+        // Simulate the log's failure mode: MS piggybacks Req17Slots on
+        // consecutive uplink frames after its reservation is active. DL
+        // clock advances by one full frame (4 timeslots) each iteration.
+        // The BS must grant exactly once.
+        let start = TdmaTime { t: 3, f: 5, m: 1, h: 0 };
+        let mut sched = slotter_at(start);
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        let first = sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots)
+            .expect("initial Req17Slots must grant");
+        sched.dl_enqueue_grant(4, addr, first.0, first.1);
+
+        // Repeat over the next 4 frames without a fresh MacAccess. We
+        // advance `cur_dltime` directly (mimicking `tick_start`) instead
+        // of `set_dl_time`, which purges the schedule.
+        for i in 1..=4 {
+            sched.cur_dltime = start.add_timeslots(i * 4);
+            let res = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots);
+            assert!(
+                res.is_none(),
+                "piggybacked Req17Slots at frame+{} must be suppressed, got {:?}",
+                i,
+                res
+            );
+        }
+        assert_eq!(
+            sched.dltx_queues[3].len(),
+            1,
+            "exactly one Grant17Slots PDU must be enqueued across the burst"
+        );
+    }
+
+    #[test]
+    fn test_req1slot_not_affected_by_h7_guard() {
+        // Half-slot / single-slot requests must never trip the PD-5c-H7
+        // guard — voice call setup uses these. Two back-to-back Req1Slot
+        // calls for the same ISSI both succeed (the second reuses the
+        // same-owner slot via reusable_owner=None → picks a fresh slot).
+        let mut sched = slotter_at(TdmaTime { t: 3, f: 5, m: 1, h: 0 });
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200699 };
+
+        let g1 = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req1Slot);
+        assert!(g1.is_some(), "first Req1Slot must grant");
+        let g2 = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req1Slot);
+        assert!(g2.is_some(), "second Req1Slot must also grant (guard is gated on requested_cap >= 2)");
     }
 }
