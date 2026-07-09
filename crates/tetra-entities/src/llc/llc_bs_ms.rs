@@ -1570,18 +1570,19 @@ impl Llc {
                         ack_bitmap: None,
                     })
                 }
-                Ok(ReassemblerFeed::NeedMore { received_count, missing_indices }) => {
+                Ok(ReassemblerFeed::NeedMore { received_count: _, missing_indices: _ }) => {
                     if ar_flag {
-                        // Immediate partial ACK.
-                        let sr = if missing_indices.is_empty() {
-                            SR::RestOfSduReceived
-                        } else {
-                            SR::OldestNotReceived(missing_indices[0])
-                        };
-                        // NOTE: spec ambiguous — we use Segments(1) with S(R) only
-                        // (no bitmap) for simplicity in V1; this encodes the oldest
-                        // missing segment with all prior segments implicitly received.
-                        let _ = received_count; // would normally go into Segments(N)
+                        // Immediate cumulative ACK: S(R) = oldest missing S(S),
+                        // or the next expected S(S) when the received prefix is
+                        // contiguous. Never `SR::RestOfSduReceived` here — that
+                        // sentinel means the whole SDU is received, which is
+                        // handled by the `Complete` arm above.
+                        //
+                        // `AckLength::Segments(1)` with S(R) only (no bitmap)
+                        // is a valid cumulative ACK shape per ETSI TS 100 392-2
+                        // clause 21.2.3.1: "I confirm every S(S) below S(R);
+                        // please send S(R) next."
+                        let sr = SR::OldestNotReceived(reassembler.next_expected_ss());
                         Some(AcknowledgementBlock {
                             n_r: n_s,
                             ack_length: AckLength::Segments(1),
@@ -2024,26 +2025,20 @@ impl Llc {
             if link.needs_deferred_ack {
                 link.needs_deferred_ack = false;
                 // Build one AL-ACK covering all in-progress reassemblers.
+                // For each in-flight N(S), emit a cumulative ACK block whose
+                // S(R) is the next expected S(S) (smallest missing index, or
+                // `segments.len()` when the received prefix is contiguous).
+                // Never `SR::RestOfSduReceived` here — that sentinel is reserved
+                // for full-SDU confirmation, which is handled by the immediate
+                // ACK in `on_al_data`'s `Complete` arm.
                 let blocks: Vec<AcknowledgementBlock> = link
                     .reassemblers
                     .iter()
-                    .map(|(&n_s, reassembler)| {
-                        let missing = reassembler.missing_segments();
-                        if missing.is_empty() {
-                            AcknowledgementBlock {
-                                n_r: n_s,
-                                ack_length: AckLength::Segments(1),
-                                s_r: Some(SR::RestOfSduReceived),
-                                ack_bitmap: None,
-                            }
-                        } else {
-                            AcknowledgementBlock {
-                                n_r: n_s,
-                                ack_length: AckLength::Segments(1),
-                                s_r: Some(SR::OldestNotReceived(missing[0])),
-                                ack_bitmap: None,
-                            }
-                        }
+                    .map(|(&n_s, reassembler)| AcknowledgementBlock {
+                        n_r: n_s,
+                        ack_length: AckLength::Segments(1),
+                        s_r: Some(SR::OldestNotReceived(reassembler.next_expected_ss())),
+                        ack_bitmap: None,
                     })
                     .collect();
 

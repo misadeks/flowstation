@@ -188,6 +188,25 @@ impl Reassembler {
         self.missing_indices_internal().into_iter().next()
     }
 
+    /// Next S(S) we expect to receive: the smallest missing index in the
+    /// current window, or `segments.len()` when the received prefix is
+    /// contiguous (no gaps).
+    ///
+    /// This is the correct value for the S(R) field of a cumulative AL-ACK
+    /// while the SDU is still being reassembled (`ReassemblerFeed::NeedMore`).
+    /// It says "I have received every S(S) below this value; please send this
+    /// one next."  It is **never** the sentinel `SR::RestOfSduReceived`
+    /// (0b1111_1010 = 250) — that value is reserved for full-SDU confirmation
+    /// and would falsely tell the peer the SDU is complete.
+    ///
+    /// ETSI TS 100 392-2 v3.10.1 clause 21.2.3.1.
+    pub fn next_expected_ss(&self) -> u8 {
+        self.missing_indices_internal()
+            .into_iter()
+            .next()
+            .unwrap_or(self.segments.len() as u8)
+    }
+
     fn missing_indices_internal(&self) -> Vec<u8> {
         let end = match self.final_segment_index {
             Some(fi) => fi as usize + 1,
@@ -639,5 +658,44 @@ mod tests {
             other => panic!("expected Discarded, got {:?}", other),
         }
         assert!(r.done);
+    }
+
+    // ── next_expected_ss helper (for cumulative AL-ACK S(R)) ──────────────
+
+    fn ns_pdu(n_s: u8, s_s: u8) -> AlDataAlFinal {
+        AlDataAlFinal {
+            variant: AlDataVariant::Data,
+            n_s,
+            s_s,
+            tl_sdu_segment: BitBuffer::from_bitstr("10101010"),
+            fcs: None,
+        }
+    }
+
+    #[test]
+    fn next_expected_ss_empty() {
+        let r = Reassembler::new(0);
+        assert_eq!(r.next_expected_ss(), 0);
+    }
+
+    #[test]
+    fn next_expected_ss_no_gap() {
+        let mut r = Reassembler::new(0);
+        r.feed(&ns_pdu(0, 0)).unwrap();
+        r.feed(&ns_pdu(0, 1)).unwrap();
+        r.feed(&ns_pdu(0, 2)).unwrap();
+        // Contiguous 0..3 received, no FINAL → next expected is 3.
+        assert_eq!(r.next_expected_ss(), 3);
+        // And crucially it is NOT the RestOfSduReceived sentinel value (250).
+        assert_ne!(r.next_expected_ss(), 250);
+    }
+
+    #[test]
+    fn next_expected_ss_with_gap() {
+        let mut r = Reassembler::new(0);
+        r.feed(&ns_pdu(0, 0)).unwrap();
+        r.feed(&ns_pdu(0, 2)).unwrap();
+        // Segments 0 and 2 received, gap at 1 → next expected is 1.
+        assert_eq!(r.next_expected_ss(), 1);
     }
 }
