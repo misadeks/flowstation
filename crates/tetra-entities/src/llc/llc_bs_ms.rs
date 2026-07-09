@@ -1593,8 +1593,8 @@ impl Llc {
             let ack_block_opt: Option<AcknowledgementBlock> = match feed_result {
                 Ok(ReassemblerFeed::Complete { sdu }) => {
                     tracing::info!(
-                        "AL link {:?} N(S)={} reassembly complete ({} bytes)",
-                        key, n_s, sdu.len()
+                        "AL link {:?} N(S)={} reassembly complete ({} bits)",
+                        key, n_s, sdu.get_len()
                     );
                     completed_sdu = Some(sdu);
                     link.reassemblers.remove(&n_s);
@@ -1605,8 +1605,14 @@ impl Llc {
                         ack_bitmap: None,
                     })
                 }
-                Ok(ReassemblerFeed::FcsFailure { .. }) => {
-                    tracing::warn!("AL link {:?} N(S)={} FCS failure", key, n_s);
+                Ok(ReassemblerFeed::FcsFailure { info, .. }) => {
+                    tracing::warn!(
+                        assembled_len = info.assembled_len,
+                        extracted_fcs = format!("0x{:08X}", info.extracted_fcs),
+                        computed_fcs = format!("0x{:08X}", info.computed_fcs),
+                        "AL link {:?} N(S)={} FCS failure",
+                        key, n_s
+                    );
                     link.reassemblers.remove(&n_s);
                     Some(AcknowledgementBlock {
                         n_r: n_s,
@@ -1658,7 +1664,6 @@ impl Llc {
         };
 
         if let Some(sdu) = completed_sdu {
-            let bits = BitBuffer::from_vec(sdu);
             queue.push_back(SapMsg {
                 sap: Sap::TlaSap,
                 src: TetraEntity::Llc,
@@ -1668,7 +1673,7 @@ impl Llc {
                     link_id,
                     endpoint_id,
                     al_link_number: key.n261,
-                    tl_sdu: bits,
+                    tl_sdu: sdu,
                     subscriber_class: 0,
                     fcs_ok: true,
                     air_interface_encryption: None,
@@ -1720,15 +1725,21 @@ impl Llc {
             let completed = match result {
                 Ok(UnackReassemblerFeed::Complete { sdu }) => {
                     tracing::info!(
-                        "AL link {:?} N(S)={} unack reassembly complete ({} bytes)",
-                        key, n_s, sdu.len()
+                        "AL link {:?} N(S)={} unack reassembly complete ({} bits)",
+                        key, n_s, sdu.get_len()
                     );
                     link.unack_reassemblers.remove(&n_s);
                     link.unack_started_at.remove(&n_s);
                     Some(sdu)
                 }
-                Ok(UnackReassemblerFeed::FcsFailure { .. }) => {
-                    tracing::warn!("AL link {:?} N(S)={} unack FCS failure, discarding", key, n_s);
+                Ok(UnackReassemblerFeed::FcsFailure { info, .. }) => {
+                    tracing::warn!(
+                        assembled_len = info.assembled_len,
+                        extracted_fcs = format!("0x{:08X}", info.extracted_fcs),
+                        computed_fcs = format!("0x{:08X}", info.computed_fcs),
+                        "AL link {:?} N(S)={} unack FCS failure, discarding",
+                        key, n_s
+                    );
                     link.unack_reassemblers.remove(&n_s);
                     link.unack_started_at.remove(&n_s);
                     None
@@ -1751,7 +1762,6 @@ impl Llc {
         };
 
         if let Some(sdu) = completed_sdu {
-            let bits = BitBuffer::from_vec(sdu);
             queue.push_back(SapMsg {
                 sap: Sap::TlaSap,
                 src: TetraEntity::Llc,
@@ -1761,7 +1771,7 @@ impl Llc {
                     link_id: key.link_id,
                     endpoint_id: key.endpoint_id,
                     al_link_number: key.n261,
-                    tl_sdu: bits,
+                    tl_sdu: sdu,
                     subscriber_class: 0,
                     fcs_ok: true,
                     air_interface_encryption: None,

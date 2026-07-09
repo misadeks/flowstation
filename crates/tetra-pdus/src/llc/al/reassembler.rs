@@ -22,7 +22,7 @@ use tetra_core::BitBuffer;
 use crate::llc::pdus::al_data::{AlDataAlFinal, AlDataVariant};
 use crate::llc::pdus::al_udata::AlAlUdataAlUfinal;
 use super::error::ReassemblyError;
-use super::fcs::crc32;
+use super::fcs::crc32_bits;
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -41,49 +41,104 @@ fn bitbuffer_to_bitvec(bb: &BitBuffer) -> Vec<u8> {
     bits
 }
 
+/// Details returned when the concatenated bit stream fails FCS verification.
+///
+/// All three values are surfaced to the caller (the LLC entity) so hardware
+/// bring-up logs can pinpoint whether the mismatch is a CRC variant issue,
+/// a bit-range issue, or a genuine wire error.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct FcsFailureInfo {
+    /// Total length of the concatenated `tl_sdu_segment` bit stream.
+    pub assembled_len: usize,
+    /// The 32-bit value read from the tail of the assembled stream.
+    pub extracted_fcs: u32,
+    /// The 32-bit value computed by `crc32_bits` over `assembled[..len - 32]`.
+    pub computed_fcs: u32,
+}
+
 /// Attempt to reconstruct the SDU + validate FCS from a complete, contiguous
 /// bitvec (`0..=fi` segments concatenated).
 ///
-/// Returns `Ok(sdu)` on FCS match, `Err(())` on FCS failure or malformed input.
-fn reconstruct_sdu(all_bits: &[u8]) -> Result<Vec<u8>, ()> {
-    if all_bits.len() < 32 {
-        return Err(());
+/// TETRA's AL is bit-transparent (see `fcs::crc32_bits` and ETSI
+/// TS 100 392-2 v3.10.1 clause 21.4.4): the TL-SDU may be any bit-length,
+/// the 32-bit FCS is bit-serially computed over the exact TL-SDU bit-length,
+/// and the concatenated on-wire stream is `TL-SDU-bits ++ FCS-bits`.
+///
+/// Returns `Ok(BitBuffer)` on FCS match (holding the recovered TL-SDU bits),
+/// or `Err(FcsFailureInfo)` on FCS failure / malformed input.
+fn reconstruct_sdu(all_bits: &[u8]) -> Result<BitBuffer, FcsFailureInfo> {
+    let assembled_len = all_bits.len();
+    if assembled_len < 32 {
+        return Err(FcsFailureInfo {
+            assembled_len,
+            extracted_fcs: 0,
+            computed_fcs: 0,
+        });
     }
-    let split = all_bits.len() - 32;
+    let split = assembled_len - 32;
 
-    // NOTE: spec ambiguous — FCS extracted from tail of concatenated bit stream.
-    let fcs_wire =
-        all_bits[split..].iter().fold(0u32, |acc, &b| (acc << 1) | b as u32);
+    let extracted_fcs =
+        all_bits[split..].iter().fold(0u32, |acc, &b| (acc << 1) | (b as u32));
 
     let sdu_bits = &all_bits[..split];
+    let computed_fcs = crc32_bits(sdu_bits);
 
-    // SDU must be byte-aligned (SDU is user bytes; only FCS is 32 bits).
-    // NOTE: spec ambiguous — if the concatenated stream is not byte-aligned after
-    // removing 32 FCS bits, we cannot safely extract the SDU; treat as failure.
-    if sdu_bits.len() % 8 != 0 {
-        return Err(());
+    if extracted_fcs != computed_fcs {
+        tracing::debug!(
+            assembled_len,
+            extracted_fcs = format!("0x{:08X}", extracted_fcs),
+            computed_fcs = format!("0x{:08X}", computed_fcs),
+            "AL FCS mismatch"
+        );
+        return Err(FcsFailureInfo { assembled_len, extracted_fcs, computed_fcs });
     }
 
-    let sdu: Vec<u8> = sdu_bits
-        .chunks(8)
-        .map(|ch| ch.iter().fold(0u8, |acc, &b| (acc << 1) | b))
-        .collect();
-
-    let expected = crc32(&sdu);
-    if expected == fcs_wire { Ok(sdu) } else { Err(()) }
+    // Rebuild the SDU as a BitBuffer, preserving its exact bit-length
+    // (may be non-byte-aligned; TETRA AL is bit-transparent). Size the
+    // backing storage to exactly the SDU bit length so `into_bytes()` on
+    // a byte-aligned SDU returns the original byte count with no trailing
+    // padding byte.
+    let mut sdu = BitBuffer::new_autoexpand(sdu_bits.len());
+    for &b in sdu_bits {
+        sdu.write_bits(b as u64, 1);
+    }
+    sdu.seek(0);
+    Ok(sdu)
 }
 
 // ─── Acknowledged reassembler ────────────────────────────────────────────────
 
 /// Result returned from [`Reassembler::feed`].
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum ReassemblerFeed {
     /// PDU accepted; more segments are still needed before the SDU is complete.
     NeedMore { received_count: u8, missing_indices: Vec<u8> },
-    /// SDU reassembled and FCS validated.  The original payload bytes are returned.
-    Complete { sdu: Vec<u8> },
+    /// SDU reassembled and FCS validated.  The recovered TL-SDU bits (may be
+    /// non-byte-aligned; TETRA's AL is bit-transparent) are returned as a
+    /// [`BitBuffer`] with the read cursor at 0.
+    Complete { sdu: BitBuffer },
     /// SDU reassembly completed but FCS validation failed; the SDU is discarded.
-    FcsFailure { received_count: u8 },
+    /// The failure details are surfaced for diagnostic logging.
+    FcsFailure { received_count: u8, info: FcsFailureInfo },
+}
+
+impl PartialEq for ReassemblerFeed {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::NeedMore { received_count: a, missing_indices: b },
+                Self::NeedMore { received_count: c, missing_indices: d },
+            ) => a == c && b == d,
+            (Self::Complete { sdu: a }, Self::Complete { sdu: b }) => {
+                a.to_bitstr() == b.to_bitstr()
+            }
+            (
+                Self::FcsFailure { received_count: a, info: b },
+                Self::FcsFailure { received_count: c, info: d },
+            ) => a == c && b == d,
+            _ => false,
+        }
+    }
 }
 
 /// Per-(link, N(S)) reassembly context for the acknowledged AL service.
@@ -256,7 +311,7 @@ impl Reassembler {
         self.done = true;
         match reconstruct_sdu(&all_bits) {
             Ok(sdu) => Ok(ReassemblerFeed::Complete { sdu }),
-            Err(()) => Ok(ReassemblerFeed::FcsFailure { received_count: received }),
+            Err(info) => Ok(ReassemblerFeed::FcsFailure { received_count: received, info }),
         }
     }
 }
@@ -264,16 +319,39 @@ impl Reassembler {
 // ─── Unacknowledged reassembler ──────────────────────────────────────────────
 
 /// Result returned from [`UnackReassembler::feed`].
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum UnackReassemblerFeed {
     /// PDU accepted; more segments are still needed.
     NeedMore { received_count: u8 },
     /// SDU reassembled and FCS validated.
-    Complete { sdu: Vec<u8> },
+    Complete { sdu: BitBuffer },
     /// SDU reassembly completed but FCS validation failed.
-    FcsFailure { received_count: u8 },
+    FcsFailure { received_count: u8, info: FcsFailureInfo },
     /// SDU discarded by a state-machine timeout before all segments arrived.
     Discarded { received_count: u8, missing_count: u8 },
+}
+
+impl PartialEq for UnackReassemblerFeed {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::NeedMore { received_count: a },
+                Self::NeedMore { received_count: b },
+            ) => a == b,
+            (Self::Complete { sdu: a }, Self::Complete { sdu: b }) => {
+                a.to_bitstr() == b.to_bitstr()
+            }
+            (
+                Self::FcsFailure { received_count: a, info: b },
+                Self::FcsFailure { received_count: c, info: d },
+            ) => a == c && b == d,
+            (
+                Self::Discarded { received_count: a, missing_count: b },
+                Self::Discarded { received_count: c, missing_count: d },
+            ) => a == c && b == d,
+            _ => false,
+        }
+    }
 }
 
 /// Per-(link, N(S)) reassembly context for the unacknowledged AL service.
@@ -394,7 +472,7 @@ impl UnackReassembler {
         self.done = true;
         match reconstruct_sdu(&all_bits) {
             Ok(sdu) => Ok(UnackReassemblerFeed::Complete { sdu }),
-            Err(()) => Ok(UnackReassemblerFeed::FcsFailure { received_count: received }),
+            Err(info) => Ok(UnackReassemblerFeed::FcsFailure { received_count: received, info }),
         }
     }
 }
@@ -409,6 +487,17 @@ mod tests {
     };
 
     // ── Acknowledged reassembler ──────────────────────────────────────────
+
+    /// Expand `bytes` into an MSB-first bit string (each byte → 8 chars).
+    fn bytes_to_bitstr(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 8);
+        for &b in bytes {
+            for i in (0..8).rev() {
+                s.push(if (b >> i) & 1 == 1 { '1' } else { '0' });
+            }
+        }
+        s
+    }
 
     #[test]
     fn ack_reassemble_in_order() {
@@ -428,7 +517,7 @@ mod tests {
             if i == last {
                 match result {
                     ReassemblerFeed::Complete { sdu: recovered } => {
-                        assert_eq!(recovered, sdu);
+                        assert_eq!(recovered.to_bitstr(), bytes_to_bitstr(&sdu));
                     }
                     other => panic!("expected Complete, got {:?}", other),
                 }
@@ -462,7 +551,7 @@ mod tests {
             if pdu.s_s == 0 {
                 match result {
                     ReassemblerFeed::Complete { sdu: recovered } => {
-                        assert_eq!(recovered, sdu);
+                        assert_eq!(recovered.to_bitstr(), bytes_to_bitstr(&sdu));
                     }
                     other => panic!("expected Complete after last segment, got {:?}", other),
                 }
@@ -586,6 +675,90 @@ mod tests {
         );
     }
 
+    // ── Bit-aligned reassembly (mirrors hardware bring-up trace PD-5c-H11) ─
+
+    /// Regression test for the hardware bring-up failure where a live MS sent
+    /// 18 × 214-bit AL-DATA + 1 × 31-bit AL-FINAL-AR = 3883 bits total. The
+    /// concatenated TL-SDU is 3851 bits — not byte-aligned. The reassembler
+    /// must bit-serially CRC the 3851-bit body against the trailing 32-bit
+    /// FCS and return the recovered bits without requiring byte alignment.
+    #[test]
+    fn ack_reassemble_non_byte_aligned_sdu() {
+        use crate::llc::al::fcs::crc32_bits;
+
+        // Build a deterministic 3851-bit body (arbitrary bit content).
+        let body_bits: Vec<u8> = (0..3851u32).map(|i| ((i * 5 + 3) & 1) as u8).collect();
+        let fcs = crc32_bits(&body_bits);
+
+        // Concatenate body + 32-bit FCS MSB-first.
+        let mut stream = body_bits.clone();
+        for i in (0..32).rev() {
+            stream.push(((fcs >> i) & 1) as u8);
+        }
+        assert_eq!(stream.len(), 3883);
+
+        // Slice into 18 × 214 + 1 × 31 fragments, matching the trace shape.
+        let mut pdus: Vec<AlDataAlFinal> = Vec::with_capacity(19);
+        let mut cursor = 0usize;
+        for s_s in 0..18u8 {
+            let seg = &stream[cursor..cursor + 214];
+            let mut buf = BitBuffer::new_autoexpand(214);
+            for &b in seg {
+                buf.write_bits(b as u64, 1);
+            }
+            buf.seek(0);
+            pdus.push(AlDataAlFinal {
+                variant: AlDataVariant::Data,
+                n_s: 0,
+                s_s,
+                tl_sdu_segment: buf,
+                fcs: None,
+            });
+            cursor += 214;
+        }
+        // FINAL-AR: 31 bits.
+        let final_seg = &stream[cursor..];
+        assert_eq!(final_seg.len(), 31);
+        let mut fbuf = BitBuffer::new_autoexpand(31);
+        for &b in final_seg {
+            fbuf.write_bits(b as u64, 1);
+        }
+        fbuf.seek(0);
+        pdus.push(AlDataAlFinal {
+            variant: AlDataVariant::FinalAr,
+            n_s: 0,
+            s_s: 18,
+            tl_sdu_segment: fbuf,
+            fcs: Some(fcs),
+        });
+
+        // Feed every fragment in order.
+        let mut r = Reassembler::new(0);
+        let last = pdus.len() - 1;
+        for (i, pdu) in pdus.iter().enumerate() {
+            let result = r.feed(pdu).unwrap();
+            if i == last {
+                match result {
+                    ReassemblerFeed::Complete { sdu: recovered } => {
+                        assert_eq!(recovered.get_len(), 3851);
+                        let recovered_bits: String = recovered.to_bitstr();
+                        let expected_bits: String = body_bits
+                            .iter()
+                            .map(|&b| if b == 1 { '1' } else { '0' })
+                            .collect();
+                        assert_eq!(recovered_bits, expected_bits);
+                    }
+                    other => panic!(
+                        "expected Complete on non-byte-aligned SDU, got {:?}",
+                        other
+                    ),
+                }
+            } else {
+                assert!(matches!(result, ReassemblerFeed::NeedMore { .. }));
+            }
+        }
+    }
+
     // ── Unacknowledged reassembler ────────────────────────────────────────
 
     #[test]
@@ -604,7 +777,7 @@ mod tests {
             if i == last {
                 match result {
                     UnackReassemblerFeed::Complete { sdu: recovered } => {
-                        assert_eq!(recovered, sdu);
+                        assert_eq!(recovered.to_bitstr(), bytes_to_bitstr(&sdu));
                     }
                     other => panic!("expected Complete, got {:?}", other),
                 }
