@@ -4,11 +4,14 @@
 /// (or AL-UDATA / AL-UFINAL) PDUs ready for delivery to the MAC layer.
 ///
 /// The FCS is appended to the SDU byte stream before fragmentation, so the FCS
-/// value may span segment boundaries exactly as the spec permits.
+/// value may span segment boundaries — including sitting entirely inside the
+/// FINAL fragment or spilling across the last two segments. This matches the
+/// ETSI wire layout: there is no dedicated FCS field on the PDU (see
+/// `crate::llc::pdus::al_data::AlDataAlFinal` for the codec).
 ///
-/// NOTE: spec ambiguous — the FCS is also placed in the FINAL PDU's `fcs` field
-/// for semantic clarity at the codec level; the wire layout (FCS spanning segments)
-/// is the authoritative form and AL-3 must handle that.
+/// The `fcs: Option<u32>` field the segmenter fills on the FINAL PDU is a
+/// **semantic hint only** — it is used by tests and diagnostics but never
+/// written to the wire.
 ///
 /// ETSI TS 100 392-2 v3.10.1 clauses 21.2.3.2, 21.2.3.3, 21.2.3.6, 21.2.3.7.
 

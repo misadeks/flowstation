@@ -43,7 +43,12 @@ impl AlDataVariant {
         }
     }
 
-    fn has_fcs(self) -> bool {
+    /// Whether this variant marks the terminating fragment of an SDU.
+    ///
+    /// This does **not** imply a dedicated FCS wire field — the FCS is always
+    /// carried inside `tl_sdu_segment` (possibly spanning segments). See the
+    /// module-level docs for `AlDataAlFinal` and the reassembler.
+    pub fn is_final(self) -> bool {
         matches!(self, AlDataVariant::Final | AlDataVariant::FinalAr)
     }
 }
@@ -64,16 +69,18 @@ impl fmt::Display for AlDataVariant {
 /// AL-FINAL is the last fragment of an SDU; AL-DATA is a non-final fragment.
 /// The -AR variants request an immediate AL-ACK.
 ///
-/// FCS (32 bits) is **implicitly** present iff the variant is `Final` or `FinalAr`.
-/// There is **no length field** in the PDU; segment length is determined by the MAC
-/// block size. The caller must supply `pdu_len_bits` (total PDU bits including the
-/// 4-bit LLC type) so the decoder can locate the FCS boundary.
+/// **Wire layout has no dedicated FCS field.** Per ETSI TS 100 392-2 v3.10.1
+/// (clauses 21.2.3.2 / 21.2.3.3 and tables 21.15 / 21.17), the 32-bit FCS is
+/// appended to the SDU byte stream *before* segmentation and can therefore
+/// spill into any fragment — including the FINAL. The codec treats everything
+/// after the 17-bit header as `tl_sdu_segment`; extracting the FCS is the
+/// reassembler's job (it recovers the last 32 bits of the concatenated
+/// bit stream — see `al::reassembler::reconstruct_sdu`).
 ///
-/// NOTE: per the decompile, FCS may spill from a preceding AL-DATA when the last
-/// user segment does not align to a MAC block boundary. AL-1 codec does not model
-/// that spillover; the FCS is treated as belonging entirely to the FINAL PDU.
-///
-/// ETSI TS 100 392-2 v3.10.1 clauses 21.2.3.2 and 21.2.3.3.
+/// The `fcs: Option<u32>` field is a purely semantic hint: the segmenter fills
+/// it on the FINAL PDU it emits for diagnostics/tests, and the reassembler
+/// does not consult it. Encoders do not write it to the wire and decoders
+/// always leave it `None`.
 ///
 /// Wire layout after the 4-bit `LlcPduType` (= 9):
 /// ```text
@@ -81,8 +88,7 @@ impl fmt::Display for AlDataVariant {
 /// ar_flag         1   0 = no ACK request, 1 = ACK requested (-AR)
 /// n_s             3   send sequence number, modulo (N272 + 1)
 /// s_s             8   segment sequence number within the current SDU
-/// tl_sdu_segment  *   remaining bits (minus 32 iff Final/FinalAr)
-/// fcs            32   conditional: present iff Final or FinalAr
+/// tl_sdu_segment  *   remaining bits (may include FCS spillover)
 /// ```
 #[derive(Debug, Clone)]
 pub struct AlDataAlFinal {
@@ -92,9 +98,13 @@ pub struct AlDataAlFinal {
     pub n_s: u8,
     /// Segment sequence number within the current SDU, 8 bits (0..255).
     pub s_s: u8,
-    /// The TL-SDU segment payload (bit-precise).
+    /// The TL-SDU segment payload (bit-precise). For FINAL/FinalAr this may
+    /// carry the trailing bits of the 32-bit FCS that was appended to the SDU
+    /// before segmentation.
     pub tl_sdu_segment: BitBuffer,
-    /// Optional Frame Check Sequence (32 bits), present iff variant is Final or FinalAr.
+    /// Semantic hint: the full 32-bit FCS the segmenter appended to this SDU.
+    /// **Not** a wire field — the codec never reads or writes it. The
+    /// reassembler recovers the FCS from the concatenated bit stream tail.
     pub fcs: Option<u32>,
 }
 
@@ -116,9 +126,21 @@ impl AlDataAlFinal {
     /// `pdu_len_bits`: total PDU length in bits **including** the 4-bit LLC type, as
     /// provided by the MAC layer. The buffer must contain exactly `pdu_len_bits - 4` bits;
     /// the decoder returns `PduParseErr::InconsistentLength` if the sizes do not match.
+    ///
+    /// All post-header bits are captured as `tl_sdu_segment`; FCS extraction is
+    /// deferred to the reassembler (`al::reassembler`). See the type-level docs.
     pub fn from_bitbuf(buf: &mut BitBuffer, pdu_len_bits: usize) -> Result<Self, PduParseErr> {
+        // Fixed bits: 4 (type) + 1 + 1 + 3 + 8 = 17.
+        const HEADER_BITS: usize = 17;
+        if pdu_len_bits < HEADER_BITS {
+            return Err(PduParseErr::InconsistentLength {
+                expected: HEADER_BITS,
+                found: pdu_len_bits,
+            });
+        }
+
         // Validate buffer length against declared PDU size.
-        let expected_body = pdu_len_bits.saturating_sub(4);
+        let expected_body = pdu_len_bits - 4;
         if buf.get_len_remaining() != expected_body {
             return Err(PduParseErr::InconsistentLength {
                 expected: expected_body,
@@ -133,53 +155,26 @@ impl AlDataAlFinal {
 
         let variant = AlDataVariant::from_flags(final_flag, ar_flag);
 
-        // Fixed bits: 4 (type) + 1 + 1 + 3 + 8 = 17.
-        const HEADER_BITS: usize = 17;
-        if pdu_len_bits < HEADER_BITS {
-            return Err(PduParseErr::InconsistentLength {
-                expected: HEADER_BITS,
-                found: pdu_len_bits,
-            });
+        // Everything after the 17-bit header is tl_sdu_segment. FCS spillover
+        // (if any) rides inside these bits and is recovered downstream by the
+        // reassembler from the tail of the concatenated stream.
+        let sdu_len = pdu_len_bits - HEADER_BITS;
+        let mut sdu = BitBuffer::new_autoexpand(sdu_len + 8);
+        for _ in 0..sdu_len {
+            let b = buf
+                .read_bits(1)
+                .ok_or(PduParseErr::BufferEnded { field: Some("tl_sdu_segment") })?;
+            sdu.write_bits(b, 1);
         }
-        let payload_and_fcs = pdu_len_bits - HEADER_BITS;
+        sdu.seek(0);
 
-        let (sdu, fcs) = if variant.has_fcs() {
-            if payload_and_fcs < 32 {
-                return Err(PduParseErr::InconsistentLength {
-                    expected: 32,
-                    found: payload_and_fcs,
-                });
-            }
-            let sdu_len = payload_and_fcs - 32;
-            let mut sdu = BitBuffer::new_autoexpand(sdu_len + 8);
-            for _ in 0..sdu_len {
-                let b = buf
-                    .read_bits(1)
-                    .ok_or(PduParseErr::BufferEnded { field: Some("tl_sdu_segment") })?;
-                sdu.write_bits(b, 1);
-            }
-            sdu.seek(0);
-            let fcs_raw = buf
-                .read_bits(32)
-                .ok_or(PduParseErr::BufferEnded { field: Some("fcs") })?;
-            (sdu, Some(fcs_raw as u32))
-        } else {
-            let sdu_len = payload_and_fcs;
-            let mut sdu = BitBuffer::new_autoexpand(sdu_len + 8);
-            for _ in 0..sdu_len {
-                let b = buf
-                    .read_bits(1)
-                    .ok_or(PduParseErr::BufferEnded { field: Some("tl_sdu_segment") })?;
-                sdu.write_bits(b, 1);
-            }
-            sdu.seek(0);
-            (sdu, None)
-        };
-
-        Ok(AlDataAlFinal { variant, n_s: n_s as u8, s_s: s_s as u8, tl_sdu_segment: sdu, fcs })
+        Ok(AlDataAlFinal { variant, n_s: n_s as u8, s_s: s_s as u8, tl_sdu_segment: sdu, fcs: None })
     }
 
     /// Encode into a `BitBuffer`, writing the 4-bit `LlcPduType` (9) first.
+    ///
+    /// The semantic `fcs` field is **not** written to the wire; any FCS bits
+    /// live inside `tl_sdu_segment` (placed there by the segmenter).
     pub fn to_bitbuf(&self, buf: &mut BitBuffer) {
         // 4-bit LlcPduType = 9 (AlDataAlFinal)
         buf.write_bits(9, 4);
@@ -191,10 +186,6 @@ impl AlDataAlFinal {
         let sdu_len = self.tl_sdu_segment.get_len();
         let mut sdu_copy = BitBuffer::from_bitbuffer(&self.tl_sdu_segment);
         buf.copy_bits(&mut sdu_copy, sdu_len);
-
-        if let Some(fcs) = self.fcs {
-            buf.write_bits(fcs as u64, 32);
-        }
     }
 }
 
@@ -248,6 +239,8 @@ mod tests {
 
     #[test]
     fn al_final_ar_populated_round_trip() {
+        // Semantic `fcs` is not a wire field — the segmenter fills it as a hint,
+        // but decoders always leave it None. Round-trip preserves everything else.
         let pdu = AlDataAlFinal {
             variant: AlDataVariant::FinalAr,
             n_s: 7,
@@ -260,7 +253,7 @@ mod tests {
         assert_eq!(d.n_s, pdu.n_s);
         assert_eq!(d.s_s, pdu.s_s);
         assert_eq!(d.tl_sdu_segment.to_bitstr(), pdu.tl_sdu_segment.to_bitstr());
-        assert_eq!(d.fcs, pdu.fcs);
+        assert_eq!(d.fcs, None, "decoder must not synthesise a wire FCS");
     }
 
     #[test]
@@ -276,5 +269,89 @@ mod tests {
         assert_eq!(d.variant, pdu.variant);
         assert_eq!(d.s_s, 42);
         assert_eq!(d.tl_sdu_segment.to_bitstr(), pdu.tl_sdu_segment.to_bitstr());
+    }
+
+    /// Regression for PD-5c-H9: the 48-bit AL-FINAL-AR captured on-air with a
+    /// 31-bit tail (last few SDU bits + spilled FCS bits) previously failed
+    /// with `InconsistentLength { expected: 32, found: 31 }`. It must parse.
+    #[test]
+    fn al_final_ar_short_tail_48bit_from_wire() {
+        let wire = "100111000000100101110111010000011010001110101111";
+        assert_eq!(wire.len(), 48);
+        let mut buf = BitBuffer::from_bitstr(wire);
+        let type_bits = buf.read_bits(4).unwrap();
+        assert_eq!(type_bits, 9, "LlcPduType must be 9 (AlDataAlFinal)");
+
+        let pdu = AlDataAlFinal::from_bitbuf(&mut buf, 48)
+            .expect("short-tail AL-FINAL-AR must parse");
+
+        assert_eq!(pdu.variant, AlDataVariant::FinalAr);
+        assert_eq!(pdu.n_s, 0);
+        assert_eq!(pdu.s_s, 18, "s_s == 18 (fragment 19, terminating 0..17)");
+        assert_eq!(pdu.tl_sdu_segment.get_len(), 31);
+        assert_eq!(
+            pdu.tl_sdu_segment.to_bitstr(),
+            "1110111010000011010001110101111"
+        );
+        assert_eq!(pdu.fcs, None);
+    }
+
+    /// A full-length non-final AL-DATA fragment (214-bit tl_sdu_segment) must
+    /// still parse — the common hot path during SDU streaming.
+    #[test]
+    fn al_data_full_length_214bit_tail_still_parses() {
+        let tail: String = (0..214).map(|i| if i % 3 == 0 { '1' } else { '0' }).collect();
+        let pdu = AlDataAlFinal {
+            variant: AlDataVariant::Data,
+            n_s: 4,
+            s_s: 7,
+            tl_sdu_segment: make_sdu(&tail),
+            fcs: None,
+        };
+        let d = round_trip(&pdu);
+        assert_eq!(d.variant, AlDataVariant::Data);
+        assert_eq!(d.n_s, 4);
+        assert_eq!(d.s_s, 7);
+        assert_eq!(d.tl_sdu_segment.get_len(), 214);
+        assert_eq!(d.tl_sdu_segment.to_bitstr(), tail);
+    }
+
+    /// Round-trip AL-FINAL-AR at tail sizes 8, 100, 214. The encoded PDU length
+    /// must be exactly `17 + tail_bits` — no phantom FCS on the wire.
+    #[test]
+    fn al_final_ar_round_trip_various_tail_sizes() {
+        for &tail_bits in &[8usize, 100, 214] {
+            let tail: String = (0..tail_bits)
+                .map(|i| if (i * 7 + 3) % 5 < 3 { '1' } else { '0' })
+                .collect();
+            let pdu = AlDataAlFinal {
+                variant: AlDataVariant::FinalAr,
+                n_s: 2,
+                s_s: (tail_bits % 256) as u8,
+                tl_sdu_segment: make_sdu(&tail),
+                fcs: Some(0xCAFEBABE),
+            };
+
+            let mut enc = BitBuffer::new_autoexpand(256);
+            pdu.to_bitbuf(&mut enc);
+            let encoded_len = enc.get_len_written();
+            assert_eq!(
+                encoded_len,
+                17 + tail_bits,
+                "encoded PDU must be 17-bit header + tail only (no phantom FCS) for tail={}",
+                tail_bits
+            );
+
+            enc.seek(0);
+            enc.read_bits(4).unwrap();
+            let d = AlDataAlFinal::from_bitbuf(&mut enc, encoded_len)
+                .expect("round-trip decode must succeed");
+            assert_eq!(d.variant, AlDataVariant::FinalAr);
+            assert_eq!(d.n_s, 2);
+            assert_eq!(d.s_s, (tail_bits % 256) as u8);
+            assert_eq!(d.tl_sdu_segment.get_len(), tail_bits);
+            assert_eq!(d.tl_sdu_segment.to_bitstr(), tail);
+            assert_eq!(d.fcs, None);
+        }
     }
 }
