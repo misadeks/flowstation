@@ -273,6 +273,11 @@ impl MleBs {
         pdu.copy_bits(&mut prim.sdu, sdu_len);
         pdu.seek(0);
 
+        // PD-5c-H2: piggyback the SNDCP-attached channel allocation onto the
+        // downstream TLA request so the resulting MacResource carries both the
+        // TRANSMIT-RESPONSE SDU and the PDCH grant in one PDU.
+        let chan_alloc = prim.chan_alloc.take();
+
         let sapmsg = if prim.layer2service == Layer2Service::Unacknowledged {
             SapMsg {
                 sap: Sap::TlaSap,
@@ -291,7 +296,7 @@ impl MleBs {
                     n_tlsdu_repeats: 0,
                     data_class_info: None,
                     req_handle: 0,
-                    chan_alloc: None,
+                    chan_alloc: chan_alloc.clone(),
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }
@@ -313,7 +318,7 @@ impl MleBs {
                     data_class_info: None,
                     req_handle: 0,
                     graceful_degradation: None,
-                    chan_alloc: None,
+                    chan_alloc,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }

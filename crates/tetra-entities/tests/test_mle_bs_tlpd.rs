@@ -51,6 +51,7 @@ fn tlpd_unacknowledged_produces_bl_unitdata_req_with_discriminator() {
         packet_data_flag: true,
         air_interface_encryption: None,
         tx_reporter: None,
+        chan_alloc: None,
     };
     let sapmsg = SapMsg {
         sap: Sap::TlpdSap,
@@ -103,6 +104,7 @@ fn tlpd_acknowledged_produces_bl_data_req_with_discriminator() {
         packet_data_flag: false,
         air_interface_encryption: None,
         tx_reporter: None,
+        chan_alloc: None,
     };
     let sapmsg = SapMsg {
         sap: Sap::TlpdSap,

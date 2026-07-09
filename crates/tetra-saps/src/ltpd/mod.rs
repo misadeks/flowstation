@@ -3,6 +3,8 @@
 #![allow(unused)]
 use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, TetraAddress, Todo, TxReporter};
 
+use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
+
 #[derive(Debug, Clone)]
 pub struct LtpdMleActivityReq {
     pub sleep_mode: bool,
@@ -224,6 +226,12 @@ pub struct LtpdMleUnitdataReq {
     /// Optional AIE session; wire through the existing plumbing (None until AIE lands).
     pub air_interface_encryption: Option<Todo>,
     pub tx_reporter: Option<TxReporter>,
+    /// PD-5c-H2 piggyback: optional channel-allocation request that SNDCP
+    /// attaches to the SN-DATA-TRANSMIT-RESPONSE so the outgoing MacResource
+    /// carries both the response SDU and the PDCH grant in a single PDU.
+    /// MLE forwards this unchanged through the LTPD→TLA path; LLC and UMAC
+    /// already thread it end-to-end on the TLA and TMA SAPs.
+    pub chan_alloc: Option<CmceChanAllocReq>,
 }
 
 #[derive(Debug, Clone)]
