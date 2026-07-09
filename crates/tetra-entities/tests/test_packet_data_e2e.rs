@@ -2,8 +2,8 @@
 ///
 /// Wires SNDCP + MLE + LLC + UMAC together and drives a complete PDP-context
 /// lifecycle: ACTIVATE, uplink SN-UNITDATA and SN-DATA (acknowledged flow),
-/// downlink SN-UNITDATA and SN-DATA, Ready-timer expiry → Standby,
-/// SN-PAGE-REQUEST / RESPONSE round-trip, and DEACTIVATE – all verified through
+/// downlink SN-UNITDATA and SN-DATA, Ready-timer expiry â†’ Standby,
+/// SN-PAGE-REQUEST / RESPONSE round-trip, and DEACTIVATE â€“ all verified through
 /// the full SapMsg chain.
 mod common;
 
@@ -33,15 +33,15 @@ use tetra_saps::tla::{TlaTlDataIndAl, TlaTlDataReqBl, TlaTlUnitdataReqBl};
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::tmv::TmvUnitdataReqSlots;
 
-// ── Constants ──────────────────────────────────────────────────────────────────
+// â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const TEST_ISSI: u32 = 1234;
 const TEST_NSAPI: u8 = 3;
-/// Slightly more than READY_TIMER_SLOTS (4237 slots ≈ 60 s); enough to expire it.
+/// Slightly more than READY_TIMER_SLOTS (4237 slots â‰ˆ 60 s); enough to expire it.
 /// PD-4i widened the Ready timer from ~10 s to ~60 s so END-OF-DATA doesn't race it.
 const PAST_READY_TIMER: i32 = 4300;
 
-// ── TestStack ─────────────────────────────────────────────────────────────────
+// â”€â”€ TestStack â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Manually-wired entity stack with a shared MessageQueue.
 ///
@@ -109,7 +109,7 @@ fn drain_collecting(stack: &mut TestStack) -> Vec<SapMsg> {
     all
 }
 
-/// Execute one full tick cycle (tick_start → drain → tick_end{LLC,UMAC,others} → drain each),
+/// Execute one full tick cycle (tick_start â†’ drain â†’ tick_end{LLC,UMAC,others} â†’ drain each),
 /// advance `stack.now` by one timeslot, and return all messages that flew through the queue.
 ///
 /// Mirrors the exact ordering in `MessageRouter::tick_start` / `tick_end`.
@@ -126,15 +126,15 @@ fn tick_stack(stack: &mut TestStack) -> Vec<SapMsg> {
     // 2. Deliver all messages queued during tick_start (or injected before this call).
     all.extend(drain_collecting(stack));
 
-    // 3. LLC tick_end (flushes deferred BL-ACKs) → deliver.
+    // 3. LLC tick_end (flushes deferred BL-ACKs) â†’ deliver.
     stack.llc.tick_end(&mut stack.queue, now);
     all.extend(drain_collecting(stack));
 
-    // 4. UMAC tick_end (finalises scheduling, may emit MAC-RESOURCE to LMAC) → deliver.
+    // 4. UMAC tick_end (finalises scheduling, may emit MAC-RESOURCE to LMAC) â†’ deliver.
     stack.umac.tick_end(&mut stack.queue, now);
     all.extend(drain_collecting(stack));
 
-    // 5. Remaining entities' tick_end (SNDCP runs ready/standby timers here) → deliver.
+    // 5. Remaining entities' tick_end (SNDCP runs ready/standby timers here) â†’ deliver.
     stack.sndcp.tick_end(&mut stack.queue, now);
     stack.mle.tick_end(&mut stack.queue, now);
     all.extend(drain_collecting(stack));
@@ -145,7 +145,7 @@ fn tick_stack(stack: &mut TestStack) -> Vec<SapMsg> {
     all
 }
 
-// ── PDU-builder helpers ───────────────────────────────────────────────────────
+// â”€â”€ PDU-builder helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Prepend the 3-bit SNDCP protocol discriminator (0b100) to `sn_pdu_bits`.
 /// The resulting buffer is positioned at 0 and is suitable for `LtpdMleUnitdataInd.sdu`.
@@ -191,7 +191,7 @@ fn build_unitdata_pdu(nsapi: u8, payload: &[u8]) -> BitBuffer {
 }
 
 /// Build a minimal SN-DATA-TRANSMIT-REQUEST (type 6) with the SNDCP discriminator prepended.
-/// No enhanced_pi4_dqpsk, no o_bit, no additional NSAPIs — matches Motorola MTM800E minimum form.
+/// No enhanced_pi4_dqpsk, no o_bit, no additional NSAPIs â€” matches Motorola MTM800E minimum form.
 fn build_data_transmit_request_pdu(nsapi: u8) -> BitBuffer {
     let req = SnDataTransmitRequest {
         nsapi: Nsapi(nsapi),
@@ -240,7 +240,7 @@ fn build_page_response_pdu(nsapi: u8) -> BitBuffer {
     with_discriminator(&buf)
 }
 
-// ── Uplink injection helper ───────────────────────────────────────────────────
+// â”€â”€ Uplink injection helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Wrap a pre-built SDU (with discriminator) in a `LtpdMleUnitdataInd` as if
 /// MLE forwarded it upward from the air interface to SNDCP.
@@ -282,9 +282,9 @@ fn make_uplink_ind_al(sdu: BitBuffer, issi: u32) -> SapMsg {
     }
 }
 
-// ── Message-chain finder helpers ──────────────────────────────────────────────
+// â”€â”€ Message-chain finder helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Find the first `LtpdMleUnitdataReq` (SNDCP → MLE) in a message list.
+/// Find the first `LtpdMleUnitdataReq` (SNDCP â†’ MLE) in a message list.
 fn find_ltpd_unitdata_req(msgs: &[SapMsg]) -> Option<LtpdMleUnitdataReq> {
     msgs.iter().find_map(|m| {
         if m.src == TetraEntity::Sndcp {
@@ -296,7 +296,7 @@ fn find_ltpd_unitdata_req(msgs: &[SapMsg]) -> Option<LtpdMleUnitdataReq> {
     })
 }
 
-/// Find the first `TlaTlDataReqBl` (MLE → LLC, Acknowledged path) in a message list.
+/// Find the first `TlaTlDataReqBl` (MLE â†’ LLC, Acknowledged path) in a message list.
 fn find_tla_data_req_bl(msgs: &[SapMsg]) -> Option<TlaTlDataReqBl> {
     msgs.iter().find_map(|m| {
         if let SapMsgInner::TlaTlDataReqBl(req) = &m.msg {
@@ -307,7 +307,7 @@ fn find_tla_data_req_bl(msgs: &[SapMsg]) -> Option<TlaTlDataReqBl> {
     })
 }
 
-/// Find the first `TlaTlUnitdataReqBl` (MLE → LLC, Unacknowledged path) in a message list.
+/// Find the first `TlaTlUnitdataReqBl` (MLE â†’ LLC, Unacknowledged path) in a message list.
 fn find_tla_unitdata_req_bl(msgs: &[SapMsg]) -> Option<TlaTlUnitdataReqBl> {
     msgs.iter().find_map(|m| {
         if let SapMsgInner::TlaTlUnitdataReqBl(req) = &m.msg {
@@ -318,7 +318,7 @@ fn find_tla_unitdata_req_bl(msgs: &[SapMsg]) -> Option<TlaTlUnitdataReqBl> {
     })
 }
 
-/// Find the first `TmaUnitdataReq` (LLC → UMAC) in a message list.
+/// Find the first `TmaUnitdataReq` (LLC â†’ UMAC) in a message list.
 fn find_tma_unitdata_req(msgs: &[SapMsg]) -> Option<TmaUnitdataReq> {
     msgs.iter().find_map(|m| {
         if m.src == TetraEntity::Llc {
@@ -389,24 +389,24 @@ fn find_pdch_mac_resource(sink_msgs: &[SapMsg], issi: u32) -> Option<MacResource
     None
 }
 
-// ── Phase 1–3 + 7 test ────────────────────────────────────────────────────────
+// â”€â”€ Phase 1â€“3 + 7 test â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// ACTIVATE → UPLINK → DOWNLINK → DEACTIVATE: the core packet-data lifecycle.
+/// ACTIVATE â†’ UPLINK â†’ DOWNLINK â†’ DEACTIVATE: the core packet-data lifecycle.
 ///
 /// Proves that PD-1..PD-7 compose correctly end-to-end:
-/// • SNDCP allocates an IPv4, emits ACCEPT via LtpdMleUnitdataReq
-/// • MLE wraps it in TlaTlDataReqBl (Acknowledged)
-/// • LLC wraps it in TmaUnitdataReq for UMAC
-/// • Uplink UNITDATA surfaces to the gateway queue
-/// • Downlink IP triggers PDCH reservation + MAC-RESOURCE grant
-/// • DEACTIVATE frees the IP back to the pool
+/// â€¢ SNDCP allocates an IPv4, emits ACCEPT via LtpdMleUnitdataReq
+/// â€¢ MLE wraps it in TlaTlDataReqBl (Acknowledged)
+/// â€¢ LLC wraps it in TmaUnitdataReq for UMAC
+/// â€¢ Uplink UNITDATA surfaces to the gateway queue
+/// â€¢ Downlink IP triggers PDCH reservation + MAC-RESOURCE grant
+/// â€¢ DEACTIVATE frees the IP back to the pool
 #[test]
 fn activate_uplink_downlink_deactivate() {
     debug::setup_logging_verbose();
 
     let mut stack = TestStack::new();
 
-    // ── Phase 1: MS sends SN-ACTIVATE PDP CONTEXT DEMAND ─────────────────────
+    // â”€â”€ Phase 1: MS sends SN-ACTIVATE PDP CONTEXT DEMAND â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
     // Inject DEMAND as if MLE forwarded it upward to SNDCP.
     stack.queue.push_back(make_uplink_ind(
@@ -434,7 +434,7 @@ fn activate_uplink_downlink_deactivate() {
     assert!(
         allocated_ip >= Ipv4Addr::new(192, 168, 100, 2)
             && allocated_ip <= Ipv4Addr::new(192, 168, 100, 254),
-        "P1: allocated IP {allocated_ip} must be within default pool 192.168.100.2–.254"
+        "P1: allocated IP {allocated_ip} must be within default pool 192.168.100.2â€“.254"
     );
 
     // [P1-C] MLE forwarded the ACCEPT as TlaTlDataReqBl to LLC.
@@ -456,7 +456,7 @@ fn activate_uplink_downlink_deactivate() {
     assert_eq!(tma_accept.main_address.ssi, TEST_ISSI, "P1: TmaUnitdataReq SSI");
     assert!(!tma_accept.packet_data_flag, "P1: ACCEPT is signalling, not packet data");
 
-    // ── Phase 2: MS sends uplink SN-UNITDATA ─────────────────────────────────
+    // â”€â”€ Phase 2: MS sends uplink SN-UNITDATA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
     // A plausible ICMP echo request payload (28 bytes of mock IP/ICMP).
     let icmp_echo_request = {
@@ -494,7 +494,7 @@ fn activate_uplink_downlink_deactivate() {
     assert_eq!(ul.payload, icmp_echo_request, "P2: gateway uplink payload");
     assert!(stack.sndcp.uplink_ip_queue.is_empty(), "P2: no leftover uplink items");
 
-    // ── Phase 3: Gateway sends ICMP echo reply downlink ───────────────────────
+    // â”€â”€ Phase 3: Gateway sends ICMP echo reply downlink â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
     // Simulate pd-gateway echoing the reply back via feed_downlink_ip.
     let icmp_echo_reply = {
@@ -563,7 +563,7 @@ fn activate_uplink_downlink_deactivate() {
         tick_stack(&mut stack);
     }
 
-    // ── Phase 3.5: SN-DATA-TRANSMIT-REQUEST / SN-DATA (acknowledged flow) ────
+    // â”€â”€ Phase 3.5: SN-DATA-TRANSMIT-REQUEST / SN-DATA (acknowledged flow) â”€â”€â”€â”€
     //
     // A Motorola MTM800E, after receiving ACTIVATE ACCEPT, sends
     // SN-DATA-TRANSMIT-REQUEST (type 6) to negotiate acknowledged packet-data
@@ -607,7 +607,7 @@ fn activate_uplink_downlink_deactivate() {
 
     // [P3.5-B2] PD-5c-H2: the SN-DATA-TRANSMIT-RESPONSE LtpdMleUnitdataReq must
     // carry the piggybacked CmceChanAllocReq so UMAC emits a SINGLE MacResource
-    // with both the response SDU and the ChanAllocElement — the pattern
+    // with both the response SDU and the ChanAllocElement â€” the pattern
     // MTP3550 firmware requires. The TlaTlDataReqBl and downstream
     // TmaUnitdataReq must thread the same chan_alloc through unchanged.
     assert!(
@@ -635,7 +635,7 @@ fn activate_uplink_downlink_deactivate() {
     ));
     let phase35b_msgs = tick_stack(&mut stack);
 
-    // [P3.5-C] SN-DATA uplink → gateway queue; no downlink produced.
+    // [P3.5-C] SN-DATA uplink â†’ gateway queue; no downlink produced.
     assert!(
         find_ltpd_unitdata_req(&phase35b_msgs).is_none(),
         "P3.5: uplink SN-DATA must NOT produce any LtpdMleUnitdataReq"
@@ -682,7 +682,7 @@ fn activate_uplink_downlink_deactivate() {
         "P3.5: MLE must produce TlaTlDataReqBl for acknowledged SN-DATA downlink"
     );
 
-    // ── Phase 7: MS sends SN-DEACTIVATE PDP CONTEXT DEMAND ───────────────────
+    // â”€â”€ Phase 7: MS sends SN-DEACTIVATE PDP CONTEXT DEMAND â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
     // Run deactivate here (before standby phases) to confirm the basic lifecycle.
     // The standby / paging lifecycle is tested in `standby_paging_lifecycle`.
@@ -705,11 +705,11 @@ fn activate_uplink_downlink_deactivate() {
     }
 
     // [P7-B] MLE forwarded the DEACTIVATE ACCEPT to LLC.
-    // NOTE: LLC uses strict per-SSI ordered acknowledged-mode (ETSI §22.3.2.3). Since
+    // NOTE: LLC uses strict per-SSI ordered acknowledged-mode (ETSI Â§22.3.2.3). Since
     // the ACTIVATE ACCEPT BL-DATA has not yet been ACKed by ISSI 1234 (no BL-ACK
     // injected in this test), LLC correctly holds the DEACTIVATE ACCEPT in its
     // outbound queue until the first frame is ACKed. This is correct protocol behavior,
-    // NOT a bug. We assert only up to the MLE level here; LLC→UMAC is covered by
+    // NOT a bug. We assert only up to the MLE level here; LLCâ†’UMAC is covered by
     // phase 1's P1-D assertion (which does receive its TmaUnitdataReq immediately,
     // as no prior ISSI-1234 frame was in-flight then).
     assert!(
@@ -719,7 +719,7 @@ fn activate_uplink_downlink_deactivate() {
     // LLC DEACTIVATE ACCEPT delivery to UMAC is deferred (blocked by pending ACTIVATE
     // ACCEPT ACK); not asserted here.
 
-    // [P7-C] IPv4 returned to pool: request the same IP statically → must succeed.
+    // [P7-C] IPv4 returned to pool: request the same IP statically â†’ must succeed.
     let static_demand = ActivatePdpContextDemand {
         sndcp_version: 0,
         nsapi: Nsapi(TEST_NSAPI),
@@ -737,7 +737,7 @@ fn activate_uplink_downlink_deactivate() {
     encode_buf.seek(0);
     let sdu2 = with_discriminator(&encode_buf);
 
-    // NOTE: spec ambiguous — chosen behaviour: use a different SSI (9999) so no
+    // NOTE: spec ambiguous â€” chosen behaviour: use a different SSI (9999) so no
     // "context already active" collision with the freshly-deactivated SSI 1234.
     stack.queue.push_back(make_uplink_ind(sdu2, 9999));
     let phase7b_msgs = tick_stack(&mut stack);
@@ -752,7 +752,7 @@ fn activate_uplink_downlink_deactivate() {
     }
 }
 
-// ── Phase 4–6 test ─────────────────────────────────────────────────────────────
+// â”€â”€ Phase 4â€“6 test â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Standby / paging lifecycle (phases 4, 5, 6 from the PD-8 spec).
 ///
@@ -777,9 +777,9 @@ fn standby_paging_lifecycle() {
         other => panic!("setup: expected ACCEPT, got {other:?}"),
     };
 
-    // ── Phase 4: Advance past the ready timer → context → Standby ────────────
+    // â”€â”€ Phase 4: Advance past the ready timer â†’ context â†’ Standby â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
-    // READY_TIMER_SLOTS ≈ 4237 timeslots (60 s). Run PAST_READY_TIMER (4300) real
+    // READY_TIMER_SLOTS â‰ˆ 4237 timeslots (60 s). Run PAST_READY_TIMER (4300) real
     // ticks so the UMAC scheduler's sequential-timeslot invariant is satisfied.
     // SNDCP's tick_end calls run_timers() on every tick; the transition fires
     // once the elapsed time since last activity exceeds READY_TIMER_SLOTS.
@@ -808,7 +808,7 @@ fn standby_paging_lifecycle() {
         other => panic!("P4: expected PAGE REQUEST, got {other:?}"),
     }
 
-    // [P4-chain] PAGE REQUEST also travelled through MLE → LLC → UMAC.
+    // [P4-chain] PAGE REQUEST also travelled through MLE â†’ LLC â†’ UMAC.
     assert!(
         find_tla_data_req_bl(&phase4_msgs).is_some(),
         "P4: MLE must produce TlaTlDataReqBl for PAGE REQUEST"
@@ -818,7 +818,7 @@ fn standby_paging_lifecycle() {
         "P4: LLC must produce TmaUnitdataReq for PAGE REQUEST"
     );
 
-    // ── Phase 5: No UNITDATA while waiting for page response ─────────────────
+    // â”€â”€ Phase 5: No UNITDATA while waiting for page response â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
     // The page_payload is queued internally. A second downlink while in
     // WaitForPageResponse must be queued too and produce no new PAGE REQUEST.
@@ -838,7 +838,7 @@ fn standby_paging_lifecycle() {
         "P5: second downlink while WaitForPageResponse must be queued, not sent (got {p5_sndcp_out:?})"
     );
 
-    // ── Phase 6: MS PAGE RESPONSE → context back to Ready; queued payload drained
+    // â”€â”€ Phase 6: MS PAGE RESPONSE â†’ context back to Ready; queued payload drained
     stack.queue.push_back(make_uplink_ind(
         build_page_response_pdu(TEST_NSAPI),
         TEST_ISSI,
@@ -891,14 +891,14 @@ fn standby_paging_lifecycle() {
         "P6: LLC must produce 2 TmaUnitdataReq(packet_data_flag=true) for the drained UNITDATA");
 }
 
-/// PD-5c-H12: Uplink AL-assembled SN-DATA must route through MLE → SNDCP.
+/// PD-5c-H12: Uplink AL-assembled SN-DATA must route through MLE â†’ SNDCP.
 ///
 /// Before the fix, `TlaTlDataIndAl` (emitted by LLC after AL reassembly)
 /// hit the catch-all in `MleBs::rx_tla_prim` and produced
 /// `BUG: unexpected message or state -- routing error`, so SNDCP never saw
 /// the SN-DATA and the MS retransmitted indefinitely. This test walks the
-/// full BS-side chain: LLC-emitted `TlaTlDataIndAl` → MLE dispatch →
-/// SNDCP consumption → gateway uplink queue.
+/// full BS-side chain: LLC-emitted `TlaTlDataIndAl` â†’ MLE dispatch â†’
+/// SNDCP consumption â†’ gateway uplink queue.
 #[test]
 fn al_uplink_sn_data_reaches_sndcp() {
     debug::setup_logging_verbose();
@@ -918,7 +918,7 @@ fn al_uplink_sn_data_reaches_sndcp() {
         other => panic!("setup: expected ACCEPT, got {other:?}"),
     };
 
-    // Now inject SN-DATA over the AL path — simulating LLC delivering an
+    // Now inject SN-DATA over the AL path â€” simulating LLC delivering an
     // assembled Advanced-Link SDU up to MLE.
     let icmp_req: Vec<u8> = vec![
         0x45, 0x00, 0x00, 0x1c, 0x00, 0x02, 0x00, 0x00,
@@ -948,4 +948,133 @@ fn al_uplink_sn_data_reaches_sndcp() {
     assert_eq!(ul.main_address.ssi, TEST_ISSI, "H12: uplink SSI");
     assert_eq!(ul.nsapi, TEST_NSAPI, "H12: uplink NSAPI");
     assert_eq!(ul.payload, icmp_req, "H12: uplink payload bytes");
+}
+
+// -- PD-9: pd-gateway bridge integration ---------------------------------------
+
+/// PD-9: When set_gateway_channels is installed, SNDCP must drain
+/// uplink_ip_queue into the sender end during 	ick_end, so the
+/// pd-gateway bridge (running on a separate std thread) can read from it.
+#[test]
+fn pd9_sndcp_drains_uplink_ip_queue_to_gateway_channel() {
+    debug::setup_logging_verbose();
+
+    let mut stack = TestStack::new();
+    // Install the bridge channels BEFORE any ticks so tick_end sees the sender.
+    let (u_tx, u_rx) = crossbeam_channel::unbounded::<
+        tetra_entities::sndcp::sndcp_bs::GatewayUplink,
+    >();
+    let (_d_tx, d_rx) = crossbeam_channel::unbounded::<GatewayDownlink>();
+    stack.sndcp.set_gateway_channels(u_tx, d_rx);
+
+    // Phase 1: activate a PDP context so on_uplink_data has state to route through.
+    stack.queue.push_back(make_uplink_ind(
+        build_activate_demand_pdu(TEST_NSAPI),
+        TEST_ISSI,
+    ));
+    let phase1 = tick_stack(&mut stack);
+    let accept = match decode_dl_from_sdu(
+        &find_ltpd_unitdata_req(&phase1).expect("PD-9: ACCEPT missing").sdu,
+    ) {
+        SnPdu::ActivatePdpContextAccept(a) => a,
+        other => panic!("PD-9: expected ACCEPT, got {other:?}"),
+    };
+    let _allocated_ip = accept.ip4_address.expect("PD-9: ACCEPT must carry IPv4");
+
+    // With the channel installed, tick_end should have already drained the
+    // (empty) uplink queue with no items surfacing yet.
+    assert!(u_rx.try_recv().is_err(), "PD-9: no uplink items expected pre-injection");
+
+    // Phase 2: inject an uplink SN-DATA (AL-DATA path — matches PD-5c-H12).
+    let ip_payload = vec![0x45u8, 0x00, 0x00, 0x1c,  0, 1, 0, 0,  0x40, 0x01, 0, 0,
+                          0xc0, 0xa8, 0x64, 0x02,  0xc0, 0xa8, 0x64, 0x01,
+                          0x08, 0x00, 0, 0,  0, 1, 0, 1];
+    stack.queue.push_back(make_uplink_ind_al(
+        build_sn_data_pdu(TEST_NSAPI, &ip_payload),
+        TEST_ISSI,
+    ));
+    let _phase2 = tick_stack(&mut stack);
+
+    // The queue must have been drained into the sender; assert the receiver
+    // sees exactly one matching uplink item and the internal queue is empty.
+    let ul = u_rx.try_recv()
+        .expect("PD-9: SNDCP must forward uplink IP payload via the gateway channel");
+    assert_eq!(ul.main_address.ssi, TEST_ISSI, "PD-9: gateway uplink SSI");
+    assert_eq!(ul.nsapi, TEST_NSAPI, "PD-9: gateway uplink NSAPI");
+    assert_eq!(ul.payload, ip_payload, "PD-9: gateway uplink payload bytes");
+    assert!(u_rx.try_recv().is_err(), "PD-9: no additional uplink items expected");
+    assert!(
+        stack.sndcp.uplink_ip_queue.is_empty(),
+        "PD-9: uplink_ip_queue must be drained by tick_end"
+    );
+}
+
+/// PD-9: When the bridge sends a GatewayDownlink into the receiver end,
+/// SNDCP's 	ick_start must pick it up and emit an acknowledged SN-DATA
+/// LtpdMleUnitdataReq on TlpdSap (Ready contexts) — matching the AL path
+/// used by the uplink direction on live hardware.
+#[test]
+fn pd9_sndcp_feeds_downlink_ip_from_gateway_channel_as_sn_data() {
+    debug::setup_logging_verbose();
+
+    let mut stack = TestStack::new();
+    let (u_tx, _u_rx) = crossbeam_channel::unbounded::<
+        tetra_entities::sndcp::sndcp_bs::GatewayUplink,
+    >();
+    let (d_tx, d_rx) = crossbeam_channel::unbounded::<GatewayDownlink>();
+    stack.sndcp.set_gateway_channels(u_tx, d_rx);
+
+    // Activate to Ready so feed_downlink_ip_acknowledged is chosen.
+    stack.queue.push_back(make_uplink_ind(
+        build_activate_demand_pdu(TEST_NSAPI),
+        TEST_ISSI,
+    ));
+    let phase1 = tick_stack(&mut stack);
+    let accept = match decode_dl_from_sdu(
+        &find_ltpd_unitdata_req(&phase1).expect("PD-9: ACCEPT missing").sdu,
+    ) {
+        SnPdu::ActivatePdpContextAccept(a) => a,
+        other => panic!("PD-9: expected ACCEPT, got {other:?}"),
+    };
+    let allocated_ip = accept.ip4_address.expect("PD-9: ACCEPT must carry IPv4");
+
+    // Bridge injects a downlink IP payload for this leased address.
+    let dl_payload = vec![0x45u8, 0x00, 0x00, 0x1c,  0, 2, 0, 0,  0x40, 0x01, 0, 0,
+                          0xc0, 0xa8, 0x64, 0x01,  0xc0, 0xa8, 0x64, 0x02,
+                          0x00, 0x00, 0, 0,  0, 1, 0, 1];
+    d_tx.send(GatewayDownlink { dest_ipv4: allocated_ip, payload: dl_payload.clone() })
+        .expect("PD-9: downlink channel send must succeed");
+
+    // Tick — tick_start must drain the receiver and enqueue an SN-DATA
+    // LtpdMleUnitdataReq (Acknowledged, packet_data_flag=true).
+    let msgs = tick_stack(&mut stack);
+
+    let sn_data_reqs: Vec<LtpdMleUnitdataReq> = msgs.iter()
+        .filter_map(|m| {
+            if m.src == TetraEntity::Sndcp {
+                if let SapMsgInner::LtpdMleUnitdataReq(req) = &m.msg {
+                    if req.packet_data_flag
+                        && req.layer2service == Layer2Service::Acknowledged
+                        && matches!(decode_dl_from_sdu(&req.sdu), SnPdu::Data(_))
+                    {
+                        return Some(req.clone());
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+    assert_eq!(sn_data_reqs.len(), 1,
+        "PD-9: expected exactly one acknowledged SN-DATA LtpdMleUnitdataReq, got {}: {msgs:?}",
+        sn_data_reqs.len());
+
+    let req = &sn_data_reqs[0];
+    assert_eq!(req.main_address.ssi, TEST_ISSI, "PD-9: downlink addressed to MS");
+    match decode_dl_from_sdu(&req.sdu) {
+        SnPdu::Data(d) => {
+            assert_eq!(d.nsapi.0, TEST_NSAPI, "PD-9: SN-DATA NSAPI matches context");
+            assert_eq!(d.n_pdu, dl_payload, "PD-9: SN-DATA N-PDU payload round-trip");
+        }
+        other => panic!("PD-9: expected SnPdu::Data, got {other:?}"),
+    }
 }

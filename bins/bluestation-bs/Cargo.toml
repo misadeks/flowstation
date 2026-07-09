@@ -19,6 +19,12 @@ tetra-core = { workspace = true }
 tetra-config = { workspace = true }
 tetra-saps = { workspace = true }
 tetra-entities = { workspace = true }
+# PD-9: pd-gateway bridges SNDCP's IP queues to the OS TUN interface.  Its
+# `spawn_gateway_task` is async and internally uses `tokio::spawn`, so
+# bluestation-bs needs a small multi-thread tokio runtime to host it.  All
+# SNDCP-facing calls (`push_uplink`, `try_pop_downlink`) are sync.
+pd-gateway = { path = "../pd-gateway" }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 clap = { workspace = true }
 crossbeam-channel = { workspace = true }
