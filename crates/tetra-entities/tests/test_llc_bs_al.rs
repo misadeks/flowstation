@@ -883,4 +883,196 @@ fn al_data_gap_acks_oldest_missing() {
     );
 }
 
+// ─── PD-5c-H10: reassembler reset on AL-SETUP / AL-RECONNECT ─────────────────
+//
+// After the peer re-establishes the AL link (via AL-SETUP with any non-Success
+// report, or via AL-RECONNECT Propose), it starts sending fresh AL-DATA
+// fragments from s_s=0. Any stale reassembler slot from the prior session
+// would otherwise reject the fresh fragment as `ConflictingRetransmission`.
+// These tests exercise both code paths in `llc_bs_ms.rs::{on_al_setup,
+// on_al_reconnect}` and lock in the regression path where natural
+// reassembler advancement (without a reset event) still works.
+
+/// Feed one AL-DATA fragment at (n_s=0, s_s=0) to prime the reassembler with
+/// a stale slot that would collide with any fresh session's first segment.
+fn prime_stale_reassembler(llc: &mut Llc, queue: &mut MessageQueue, ts: TdmaTime) {
+    llc.tick_start(queue, ts);
+    llc.rx_prim(
+        queue,
+        make_tma_ind(make_al_data_fragment(AlDataVariant::Data, 0, 0)),
+    );
+    llc.tick_end(queue, ts);
+    drain_queue(queue);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .expect("link must exist")
+            .reassemblers
+            .contains_key(&0),
+        "prime step should have created a reassembler at N(S)=0",
+    );
+}
+
+/// Feed a complete single-PDU SDU segmented from `starting_n_s=0` and return
+/// the resulting TLA-DATA-Ind and drained messages. Panics if reassembly
+/// dropped the fragment (i.e. `ConflictingRetransmission` fired).
+fn feed_fresh_single_pdu_sdu(
+    llc: &mut Llc,
+    queue: &mut MessageQueue,
+    ts: TdmaTime,
+    sdu: &[u8],
+) -> (TlaTlDataIndAl, Vec<SapMsg>) {
+    let cfg = SegmenterConfig {
+        segment_payload_bits: 400,
+        starting_n_s: 0,
+        request_ack_on_final: true,
+        request_ack_on_data: false,
+    };
+    let out = segment_sdu(sdu, &cfg).expect("segmentation should succeed");
+    assert_eq!(out.pdus.len(), 1, "test SDU should fit in one segment");
+
+    let mut buf = BitBuffer::new_autoexpand(128);
+    out.pdus[0].to_bitbuf(&mut buf);
+    buf.seek(0);
+    llc.tick_start(queue, ts);
+    llc.rx_prim(queue, make_tma_ind(buf));
+    llc.tick_end(queue, ts);
+
+    let ind = take_data_ind_al(queue).unwrap_or_else(|| {
+        panic!(
+            "TlaTlDataIndAl must be delivered after fresh s_s=0; \
+             stale reassembler was not cleared"
+        )
+    });
+    let msgs = drain_queue(queue);
+    (ind, msgs)
+}
+
+/// After the peer re-sends AL-SETUP with a non-Success report (Reset,
+/// ServiceDefinition, ServiceChange), our reassembler slots from the previous
+/// session must be discarded so the peer's fresh s_s=0 does not collide.
+#[test]
+fn al_setup_reset_clears_stale_reassembler() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    let ts = TdmaTime::default();
+    prime_stale_reassembler(&mut llc, &mut queue, ts);
+
+    // Peer re-establishes with AL-SETUP report=Reset.
+    let reset_msgs = send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::Reset));
+    assert_eq!(
+        llc.al_links.get(&test_key()).unwrap().phase,
+        AlPhase::Established,
+        "link must remain Established after peer re-setup",
+    );
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .is_empty(),
+        "reassemblers must be cleared on AL-SETUP re-establishment",
+    );
+    // The AL-SETUP echo (Success) is expected on the wire.
+    assert!(
+        reset_msgs
+            .iter()
+            .any(|m| matches!(m.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "AL-SETUP echo must be emitted",
+    );
+
+    // Fresh single-PDU SDU from s_s=0 must now reassemble cleanly.
+    let sdu = b"post-reset".to_vec();
+    let (ind, _) = feed_fresh_single_pdu_sdu(&mut llc, &mut queue, ts, &sdu);
+    assert_eq!(ind.tl_sdu.into_bytes(), sdu);
+    assert!(ind.fcs_ok);
+}
+
+/// After the peer sends AL-RECONNECT with report=Propose, our reassembler
+/// slots must be cleared so the peer's proposed fresh N(S) window starts
+/// from a clean slate.
+#[test]
+fn al_reconnect_propose_clears_stale_reassembler() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    let ts = TdmaTime::default();
+    prime_stale_reassembler(&mut llc, &mut queue, ts);
+
+    // Peer proposes reconnect.
+    let reconnect = AlReconnect {
+        advanced_link_service: AdvancedLinkService::Ack,
+        advanced_link_number_n261: N261,
+        reconnect_report: ReconnectReport::Propose,
+    };
+    let mut buf = BitBuffer::new_autoexpand(16);
+    reconnect.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, ts, make_tma_ind(buf));
+    let msgs = drain_queue(&mut queue);
+
+    assert_eq!(
+        llc.al_links.get(&test_key()).unwrap().phase,
+        AlPhase::Established,
+        "link must remain Established after AL-RECONNECT accept",
+    );
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .is_empty(),
+        "reassemblers must be cleared on AL-RECONNECT(Propose) accept",
+    );
+    // Accept reply on the wire.
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "AL-RECONNECT Accept must be emitted",
+    );
+
+    // Fresh single-PDU SDU from s_s=0 must now reassemble cleanly.
+    let sdu = b"post-reconnect".to_vec();
+    let (ind, _) = feed_fresh_single_pdu_sdu(&mut llc, &mut queue, ts, &sdu);
+    assert_eq!(ind.tl_sdu.into_bytes(), sdu);
+    assert!(ind.fcs_ok);
+}
+
+/// Regression: after a normal SDU completes on N(S)=0, a subsequent AL-DATA
+/// at N(S)=0, s_s=0 must reassemble via natural reassembler advancement
+/// (map entry removed on completion), without needing a reset event. This
+/// guards against an over-eager reset from breaking the happy path.
+#[test]
+fn al_data_after_completed_sdu_still_works_via_natural_advancement() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    let ts = TdmaTime::default();
+    let sdu1 = b"first".to_vec();
+    let (ind1, _) = feed_fresh_single_pdu_sdu(&mut llc, &mut queue, ts, &sdu1);
+    assert_eq!(ind1.tl_sdu.into_bytes(), sdu1);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .is_empty(),
+        "completed SDU must remove its reassembler slot",
+    );
+
+    // Second SDU, again from s_s=0 (peer's next N(S) after ack, which in
+    // practice would advance mod tx_window+1 but the test focuses on the
+    // simplest same-slot repeat; a real MS would send different N(S)).
+    let sdu2 = b"second".to_vec();
+    let (ind2, _) = feed_fresh_single_pdu_sdu(&mut llc, &mut queue, ts, &sdu2);
+    assert_eq!(ind2.tl_sdu.into_bytes(), sdu2);
+}
+
 
