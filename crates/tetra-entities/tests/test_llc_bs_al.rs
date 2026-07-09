@@ -27,7 +27,8 @@ use tetra_pdus::llc::enums::al_disc_cause::AlDiscCause;
 use tetra_pdus::llc::enums::data_transfer_throughput::DataTransferThroughput;
 use tetra_pdus::llc::enums::max_tl_sdu_length_n271::MaxTlSduLengthN271;
 use tetra_pdus::llc::enums::setup_report::SetupReport;
-use tetra_pdus::llc::pdus::al_ack::{AckLength, AcknowledgementBlock, AlAckAlRnr, AlAckAlRnrKind};
+use tetra_pdus::llc::pdus::al_ack::{AckLength, AcknowledgementBlock, AlAckAlRnr, AlAckAlRnrKind, SR};
+use tetra_pdus::llc::pdus::al_data::{AlDataAlFinal, AlDataVariant};
 use tetra_pdus::llc::pdus::al_disc::AlDisc;
 use tetra_pdus::llc::pdus::al_reconnect::AlReconnect;
 use tetra_pdus::llc::enums::reconnect_report::ReconnectReport;
@@ -727,3 +728,159 @@ fn al_tx_window_config_respected() {
         assert_eq!(link.pending_sdus.len(), 0,     "w3: nothing buffered");
     }
 }
+
+// ─── AL-ACK S(R) correctness (PD-5c-H8) ──────────────────────────────────────
+//
+// Regression tests for the bug where the BS was sending
+// `SR::RestOfSduReceived` (wire value 250) in cumulative AL-ACKs while an SDU
+// was only partially reassembled.  That sentinel means "peer has the whole
+// SDU" and desynchronised the MS's AL peer.  The correct value in the
+// `NeedMore` state is `SR::OldestNotReceived(next_expected_ss)` — the next
+// segment S(S) the receiver needs.
+
+/// Build a single AL-DATA / AL-DATA-AR fragment (non-FINAL) with a fixed
+/// 8-bit payload — enough to satisfy the wire encoder without being part
+/// of a real SDU.
+fn make_al_data_fragment(variant: AlDataVariant, n_s: u8, s_s: u8) -> BitBuffer {
+    let pdu = AlDataAlFinal {
+        variant,
+        n_s,
+        s_s,
+        tl_sdu_segment: BitBuffer::from_bitstr("10101010"),
+        fcs: None,
+    };
+    let mut buf = BitBuffer::new_autoexpand(64);
+    pdu.to_bitbuf(&mut buf);
+    buf.seek(0);
+    buf
+}
+
+/// Decode the AL-ACK PDU carried by the first `TmaUnitdataReq` in `msgs`.
+fn extract_al_ack(msgs: &[SapMsg]) -> AlAckAlRnr {
+    let req = msgs
+        .iter()
+        .find_map(|m| match &m.msg {
+            SapMsgInner::TmaUnitdataReq(r) => Some(r),
+            _ => None,
+        })
+        .expect("at least one TmaUnitdataReq must be present");
+    let pdu_len = req.pdu.get_len();
+    let mut pdu = req.pdu.clone();
+    let ty = pdu.read_bits(4).expect("LLC type bits");
+    assert_eq!(ty, 11, "expected AlAckAlRnr (type 11), got {}", ty);
+    AlAckAlRnr::from_bitbuf(&mut pdu, pdu_len).expect("AL-ACK must parse")
+}
+
+/// Three non-AR AL-DATA fragments (no FINAL) arriving contiguously must
+/// produce a deferred AL-ACK at `tick_end` whose S(R) is
+/// `OldestNotReceived(3)` — **not** `RestOfSduReceived`.
+///
+/// Regression test for PD-5c-H8.  Prior to the fix, the BS emitted
+/// `SR::RestOfSduReceived` (wire value 250), telling the MS's AL peer that
+/// the whole SDU had been received while it was still being reassembled;
+/// the MS then re-SETUPed the link.
+#[test]
+fn al_data_non_ar_contiguous_window_acks_next_expected() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    let ts = TdmaTime::default();
+    // Feed three non-AR AL-DATA fragments (variant = Data → no FINAL, no AR).
+    for s_s in 0..3u8 {
+        let buf = make_al_data_fragment(AlDataVariant::Data, /* n_s */ 0, s_s);
+        llc.tick_start(&mut queue, ts);
+        llc.rx_prim(&mut queue, make_tma_ind(buf));
+        // Do NOT tick_end between segments — we want the deferred flush to
+        // observe all three at once.
+    }
+    // Between-rx no ACK yet: this is the deferred-ACK path.
+    let ts_flush = TdmaTime::default();
+    llc.tick_end(&mut queue, ts_flush);
+    let msgs = drain_queue(&mut queue);
+
+    let ack = extract_al_ack(&msgs);
+    assert_eq!(ack.kind, AlAckAlRnrKind::Ack);
+    assert_eq!(ack.first_block.n_r, 0, "ACK must reference N(S)=0");
+    assert_eq!(
+        ack.first_block.ack_length,
+        AckLength::Segments(1),
+        "cumulative ACK uses Segments(1) shape"
+    );
+    assert_eq!(
+        ack.first_block.s_r,
+        Some(SR::OldestNotReceived(3)),
+        "S(R) must be the next expected S(S) (=3), not RestOfSduReceived"
+    );
+    assert_ne!(
+        ack.first_block.s_r,
+        Some(SR::RestOfSduReceived),
+        "S(R) must never be RestOfSduReceived while reassembly is incomplete"
+    );
+}
+
+/// An AL-DATA-**AR** fragment (ACK requested) must produce an *immediate*
+/// AL-ACK in the same tick with the correct cumulative S(R) — the next
+/// expected S(S), not `RestOfSduReceived`.
+#[test]
+fn al_data_ar_immediate_ack_uses_next_expected_sr() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    let ts = TdmaTime::default();
+    // Single AL-DATA-AR fragment, s_s=0, no FINAL.
+    let buf = make_al_data_fragment(AlDataVariant::DataAr, /* n_s */ 0, 0);
+    llc.tick_start(&mut queue, ts);
+    llc.rx_prim(&mut queue, make_tma_ind(buf));
+    // rx_prim's on_al_data must have already enqueued the immediate ACK; no
+    // tick_end needed to observe it.
+    let msgs = drain_queue(&mut queue);
+
+    let ack = extract_al_ack(&msgs);
+    assert_eq!(ack.kind, AlAckAlRnrKind::Ack);
+    assert_eq!(ack.first_block.n_r, 0);
+    assert_eq!(ack.first_block.ack_length, AckLength::Segments(1));
+    assert_eq!(
+        ack.first_block.s_r,
+        Some(SR::OldestNotReceived(1)),
+        "after receiving s_s=0 only, next expected is 1"
+    );
+}
+
+/// A gap in the received segment sequence must be reflected in the ACK's
+/// S(R) field.  Feeding s_s=0 and s_s=2 (skipping 1) must yield an ACK
+/// whose S(R) is `OldestNotReceived(1)`.
+#[test]
+fn al_data_gap_acks_oldest_missing() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    let ts = TdmaTime::default();
+    llc.tick_start(&mut queue, ts);
+    llc.rx_prim(
+        &mut queue,
+        make_tma_ind(make_al_data_fragment(AlDataVariant::Data, 0, 0)),
+    );
+    llc.rx_prim(
+        &mut queue,
+        make_tma_ind(make_al_data_fragment(AlDataVariant::Data, 0, 2)),
+    );
+    llc.tick_end(&mut queue, ts);
+    let msgs = drain_queue(&mut queue);
+
+    let ack = extract_al_ack(&msgs);
+    assert_eq!(ack.first_block.n_r, 0);
+    assert_eq!(ack.first_block.ack_length, AckLength::Segments(1));
+    assert_eq!(
+        ack.first_block.s_r,
+        Some(SR::OldestNotReceived(1)),
+        "with gap at s_s=1, ACK must ask for s_s=1"
+    );
+}
+
+
