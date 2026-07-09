@@ -8,11 +8,12 @@
 /// (link-id, N(S)) tuple.  The AL state machine (AL-3) owns a
 /// `HashMap<(LinkId, u8), Reassembler>`.
 ///
-/// NOTE: spec ambiguous — the FCS is consumed from the **tail of the
-/// concatenated bit stream** (i.e. the last 32 bits of all assembled segments),
-/// NOT from the `fcs` field on the FINAL PDU.  This matches the wire layout
-/// where the FCS value may span segment boundaries (ETSI TS 100 392-2 v3.10.1
-/// table 21.17, note 2).  If a bench trace disagrees, this needs revisiting.
+/// The FCS is recovered from the **tail of the concatenated bit stream**
+/// (last 32 bits of all assembled `tl_sdu_segment`s), *not* from the codec's
+/// semantic `fcs: Option<u32>` field. This matches the ETSI wire layout, where
+/// the FCS is appended to the SDU before segmentation and can therefore span
+/// segment boundaries or sit entirely inside the FINAL fragment
+/// (ETSI TS 100 392-2 v3.10.1 table 21.17, note 2).
 ///
 /// ETSI TS 100 392-2 v3.10.1 clauses 21.2.3.2, 21.2.3.3, 21.2.3.6, 21.2.3.7.
 
