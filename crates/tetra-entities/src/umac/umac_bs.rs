@@ -1620,12 +1620,50 @@ impl UmacBs {
                 }
                 return;
             };
+            // PD-5c-H2: piggybacked PDCH grant on the same PDU as an SDU
+            // (typically the SN-DATA-TRANSMIT-RESPONSE). Do the PDCH bookkeeping
+            // here so the AACH flips to AssignedControl/AssignedOnly on the
+            // granted timeslot and the allocator tracks the reservation. This
+            // mirrors what `emit_pdch_mac_resource` used to do for the deleted
+            // standalone-grant path.
+            if self.packet_data_enabled
+                && prim.main_address.ssi_type == SsiType::Issi
+                && matches!(
+                    chan_alloc.alloc_type,
+                    ChanAllocType::Additional | ChanAllocType::Replace
+                )
+            {
+                if let Some(ts) = chan_alloc
+                    .timeslots
+                    .iter()
+                    .position(|&assigned| assigned)
+                    .map(|i| (i + 1) as u8)
+                {
+                    // nsapi is unknown at this layer; allocator only keys on ISSI.
+                    self.pdch_allocator.reserve(prim.main_address.ssi, 0, self.dltime);
+                    self.channel_scheduler.set_pdch_timeslot(Some(ts));
+                    self.pdch_allocator.current_timeslot = Some(ts);
+                    tracing::info!(
+                        "UMAC: piggyback PDCH grant issi={} ts={} carrier={} — armed AACH",
+                        prim.main_address.ssi, ts, carrier_num
+                    );
+                }
+            }
             (chan_alloc.usage, Some(mac_chan_alloc))
         } else {
             (None, None)
         };
 
-        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && prim.link_id != 0;
+        // PD-5c-H5: ISSI-addressed responses that carry a piggybacked chan_alloc
+        // (e.g. SN-DATA-TRANSMIT-RESPONSE) are the answer to an MS random-access
+        // burst. MTP3550 firmware treats grants without random_access_flag=true
+        // as stale and refuses to linearise on the assigned timeslot, so force
+        // the flag on for piggybacked-grant PDUs even though LLC forwards
+        // TlaTlDataReqBl with link_id=0. For non-piggybacked signalling the
+        // existing "link_id != 0" rule is preserved.
+        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi
+            && (prim.link_id != 0
+                || (mac_chan_alloc.is_some() && prim.main_address.ssi_type == SsiType::Issi));
         let mut pdu = MacResource {
             fill_bits: false,
             pos_of_grant: 0,
@@ -1678,53 +1716,21 @@ impl UmacBs {
         }
     }
 
-    /// Handle `PdchReserveReq` from SNDCP (PD-4g).
-    ///
-    /// Called right after SNDCP sends TRANSMIT-RESPONSE(accept) so a PDCH slot
-    /// is granted before the MS sends SN-UNITDATA.  Uses the same TS4 > TS3 > TS2
-    /// dynamic-allocation policy as the hyperframe PDCH tick and
-    /// `handle_pdch_unitdata_req`.
-    ///
-    /// On the first call for an ISSI: reserve + emit MAC-RESOURCE with
-    /// chan_alloc_element.  On idempotent retry (ISSI already reserved): refresh
-    /// `last_used_at` and re-emit MAC-RESOURCE so a stale PDCH assignment is
-    /// refreshed on the MS side.  If no eligible timeslot is available (voice
-    /// occupies TS2/3/4), the message is logged and dropped; the PDCH-unitdata
-    /// path will retry when SN-UNITDATA arrives.
-    fn handle_pdch_reserve_req(&mut self, issi: u32, nsapi: u8) {
-        if !self.packet_data_enabled {
-            return;
-        }
-
-        // Pick the highest-numbered free timeslot (TS4 > TS3 > TS2, yield to voice).
-        // Same policy as the hyperframe PDCH tick.
-        let chosen_ts = [4u8, 3, 2]
-            .iter()
-            .find(|&&ts| !self.channel_scheduler.circuit_is_active(Direction::Dl, ts))
-            .copied();
-
-        let Some(ts) = chosen_ts else {
-            tracing::info!(
-                "UMAC: PdchReserveReq deferred: no free timeslot for issi={} nsapi={}",
-                issi, nsapi
-            );
-            return;
-        };
-
-        // reserve() is idempotent: true = newly created, false = refreshed.
-        self.pdch_allocator.reserve(issi, nsapi, self.dltime);
-
-        tracing::info!(
-            "UMAC: PdchReserveReq issi={} nsapi={} ts={} → emitting MAC-RESOURCE grant",
-            issi, nsapi, ts
-        );
-        self.emit_pdch_mac_resource(issi, ts);
-    }
-
     /// Handle a `TmaUnitdataReq` with `packet_data_flag = true` (PDCH path).
-    /// Reserves the PDCH slot for the ISSI. On the first PDU for a new ISSI,
-    /// emits a `MAC-RESOURCE` with a `ChanAllocElement` granting the PDCH so
-    /// the MS learns which (carrier, timeslot) to use.
+    ///
+    /// PD-5c-H2 (this crate): the primary PDCH grant is piggybacked on the
+    /// SNDCP SN-DATA-TRANSMIT-RESPONSE. That path arrives here via the normal
+    /// MCCH-signalling branch of `rx_ul_tma_unitdata_req_carrier`, which
+    /// carries `prim.chan_alloc.is_some()`. This function only handles the
+    /// SN-UNITDATA-first fallback (an MS pushing packet data before we've
+    /// completed the TRANSMIT-REQUEST/RESPONSE handshake). We reserve the
+    /// PDCH slot in the allocator and arm the AACH signalling so
+    /// `AssignedControl`/`AssignedOnly` fires on the chosen timeslot.
+    ///
+    /// We DO NOT emit a standalone `MacResource` with an empty SDU here; the
+    /// MTP3550 hardware verifies that pattern is silently ignored. If the MS
+    /// ever needs a fresh grant, it will re-issue SN-DATA-TRANSMIT-REQUEST
+    /// and the piggyback path will re-emit it on the response.
     fn handle_pdch_unitdata_req(&mut self, prim: &tetra_saps::tma::TmaUnitdataReq) {
         let issi = prim.main_address.ssi;
 
@@ -1740,96 +1746,31 @@ impl UmacBs {
         self.pdch_dl_queue.push_back((issi, prim.pdu.clone()));
 
         if is_new {
-            // First packet-data PDU from this ISSI: pick the highest-numbered
-            // free timeslot and grant it via MAC-RESOURCE.
-            // NOTE: spec ambiguous — chosen behaviour: dynamic allocation using the
-            // same policy as the hyperframe PDCH tick (TS4 > TS3 > TS2).
+            // First packet-data PDU from this ISSI without a preceding
+            // TRANSMIT-REQUEST/RESPONSE handshake: pick the highest-numbered
+            // free timeslot and arm the AACH so the MS can transmit on it.
+            // No standalone MacResource is emitted (see doc-comment above).
             let chosen_ts = [4u8, 3, 2]
                 .iter()
                 .find(|&&ts| !self.channel_scheduler.circuit_is_active(Direction::Dl, ts))
                 .copied();
 
             if let Some(ts) = chosen_ts {
-                self.emit_pdch_mac_resource(issi, ts);
+                tracing::info!(
+                    "UMAC: PDCH SN-UNITDATA-first fallback for issi={} → arming ts={}",
+                    issi, ts
+                );
+                // Bookkeeping mirrors the piggyback path in
+                // rx_ul_tma_unitdata_req_carrier (see PD-5c-H2 block).
+                self.channel_scheduler.set_pdch_timeslot(Some(ts));
+                self.pdch_allocator.current_timeslot = Some(ts);
             } else {
                 tracing::info!(
-                    "UMAC: PDCH MAC-RESOURCE for issi={} deferred — all TS2/3/4 occupied by voice/SDS",
+                    "UMAC: PDCH SN-UNITDATA-first fallback for issi={} deferred — all TS2/3/4 occupied by voice/SDS",
                     issi
                 );
             }
         }
-    }
-
-    /// Build and enqueue a `MAC-RESOURCE` PDU with a `ChanAllocElement` granting
-    /// `issi` the PDCH on timeslot `ts`.
-    ///
-    /// NOTE: spec ambiguous — chosen behaviour:
-    ///   alloc_type = Additional (01) so MS keeps MCCH presence.
-    ///   ul_dl_assigned = Both (11) for symmetric UL+DL PDCH.
-    ///   mon_pattern = 0 with frame18_mon_pattern = Some(0).
-    fn emit_pdch_mac_resource(&mut self, issi: u32, ts: u8) {
-        let carrier = self.main_carrier();
-
-        // ts_assigned bitmap: TS1 = index 0 (MSB), TS4 = index 3 (LSB).
-        let ts_assigned = [ts == 1, ts == 2, ts == 3, ts == 4];
-
-        let umt = self.pdch_allocator.alloc_umt();
-
-        let chan_alloc = ChanAllocElement {
-            // NOTE: spec ambiguous — chosen behaviour: Additional (01) so the MS
-            // can retain its MCCH presence and the PDCH is an additional resource.
-            alloc_type: ChanAllocType::Additional,
-            ts_assigned,
-            // NOTE: spec ambiguous — chosen behaviour: Both (11), symmetric UL+DL
-            // for V1 PDCH; asymmetric modes deferred to a future PR.
-            ul_dl_assigned: UlDlAssignment::Both,
-            // clch_permission must be true for Additional/Replace + Ul/Both allocations.
-            // Per ETSI TS 100 392-2 v3.10.1 §23.5.2.1, without CLCH permission the MS is
-            // not permitted to linearise on the assigned timeslot and will therefore never
-            // start transmitting on TS4.  Nexus-BS computes this as
-            // `(Additional||Replace) && (Ul||Both)` which is always true for our V1 case.
-            clch_permission: true,
-            cell_change_flag: false,
-            carrier_num: carrier,
-            ext: None,
-            // NOTE: spec ambiguous — chosen behaviour: monitoring pattern 0
-            // (standard pattern) with frame18_mon_pattern = 0.
-            mon_pattern: 0,
-            frame18_mon_pattern: Some(0),
-        };
-
-        let mut pdu = MacResource {
-            addr: Some(TetraAddress { ssi: issi, ssi_type: SsiType::Issi }),
-            // Usage marker so the MS can identify this PDCH reservation in AACH.
-            // NOTE: spec ambiguous — chosen behaviour: include UMt in the initial
-            // MAC-RESOURCE so the MS can correlate AACH Traffic(UMt) with the grant.
-            usage_marker: Some(umt),
-            chan_alloc_element: Some(chan_alloc),
-            // The PDCH grant is emitted in response to the MS's SN-DATA-TRANSMIT-REQUEST
-            // which arrived as a random-access uplink burst. Setting this flag tells the
-            // MS "your RA succeeded"; without it, MTP3550 firmware treats the grant as
-            // stale/unrelated and refuses to move to the assigned timeslot. Verified via
-            // Nexus-BS which sets this in the same context.
-            random_access_flag: true,
-            ..Default::default()
-        };
-
-        let sdu = BitBuffer::new(0);
-        pdu.update_len_and_fill_ind(sdu.get_len());
-
-        tracing::info!(
-            "UMAC: PDCH MAC-RESOURCE grant issi={} ts={} umt={} carrier={}",
-            issi, ts, umt, carrier
-        );
-
-        self.channel_scheduler.dl_enqueue_tma(pdu, sdu, None);
-
-        // Arm PDCH AACH signalling: from this frame onward the scheduler will
-        // emit AssignedControl / AssignedOnly on `ts` so the MS knows the slot
-        // is an assigned SCCH and may transmit uplink control-plane bursts.
-        // Cleared when the last reservation expires or PdchReleaseReq arrives.
-        self.channel_scheduler.set_pdch_timeslot(Some(ts));
-        self.pdch_allocator.current_timeslot = Some(ts);
     }
 
     /// Build an ACCESS-DEFINE PDU for a PDCH access-code override and return
@@ -2417,11 +2358,6 @@ impl TetraEntityTrait for UmacBs {
                 // ── PD-5: PdchReleaseReq (gated) ────────────────────────────
                 if let SapMsgInner::PdchReleaseReq { issi, nsapi } = message.msg {
                     self.handle_pdch_release_req(issi, nsapi);
-                    return;
-                }
-                // ── PD-4g: PdchReserveReq (gated) ───────────────────────────
-                if let SapMsgInner::PdchReserveReq { issi, nsapi } = message.msg {
-                    self.handle_pdch_reserve_req(issi, nsapi);
                     return;
                 }
                 self.rx_control(queue, message);

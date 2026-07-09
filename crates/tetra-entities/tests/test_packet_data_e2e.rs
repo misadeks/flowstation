@@ -530,20 +530,16 @@ fn activate_uplink_downlink_deactivate() {
         "P3: UMAC must have a current PDCH timeslot assigned"
     );
 
-    // [P3-E] UMAC eventually emits a MAC-RESOURCE with channel-allocation for ISSI 1234.
-    //        Run additional ticks until the scheduler has had a chance to do so.
+    // [P3-E] PD-5c-H2: with the piggyback pattern, no standalone empty-SDU
+    //        MAC-RESOURCE-with-ChanAllocElement is emitted on the DL IP data
+    //        path. The bookkeeping asserted in [P3-D] (allocator reservation +
+    //        current_timeslot) is the observable signal here. The actual PDCH
+    //        grant to the MS rides on the SN-DATA-TRANSMIT-RESPONSE in Phase
+    //        3.5 below.
+    // Give the scheduler a few ticks so any DL PDU can drain to LMAC.
     for _ in 0..10 {
-        if find_pdch_mac_resource(&stack.lmac_sink, TEST_ISSI).is_some() {
-            break;
-        }
         tick_stack(&mut stack);
     }
-    let mac_res = find_pdch_mac_resource(&stack.lmac_sink, TEST_ISSI)
-        .expect("P3: UMAC must emit MAC-RESOURCE with ChanAllocElement for ISSI {TEST_ISSI}");
-    assert!(
-        mac_res.chan_alloc_element.is_some(),
-        "P3: MAC-RESOURCE must carry chan_alloc_element (channel_allocation_flag=1)"
-    );
 
     // ── Phase 3.5: SN-DATA-TRANSMIT-REQUEST / SN-DATA (acknowledged flow) ────
     //
@@ -585,6 +581,22 @@ fn activate_uplink_downlink_deactivate() {
     assert!(
         find_tla_data_req_bl(&phase35a_msgs).is_some(),
         "P3.5: MLE must produce TlaTlDataReqBl for DATA-TRANSMIT-RESPONSE"
+    );
+
+    // [P3.5-B2] PD-5c-H2: the SN-DATA-TRANSMIT-RESPONSE LtpdMleUnitdataReq must
+    // carry the piggybacked CmceChanAllocReq so UMAC emits a SINGLE MacResource
+    // with both the response SDU and the ChanAllocElement — the pattern
+    // MTP3550 firmware requires. The TlaTlDataReqBl and downstream
+    // TmaUnitdataReq must thread the same chan_alloc through unchanged.
+    assert!(
+        ltpd_txr.chan_alloc.is_some(),
+        "P3.5: TRANSMIT-RESPONSE must piggyback CmceChanAllocReq (PD-5c-H2)"
+    );
+    let tla_dl = find_tla_data_req_bl(&phase35a_msgs)
+        .expect("P3.5: TlaTlDataReqBl must exist for TRANSMIT-RESPONSE");
+    assert!(
+        tla_dl.chan_alloc.is_some(),
+        "P3.5: MLE must thread chan_alloc through onto TlaTlDataReqBl"
     );
 
     // Inject uplink SN-DATA (type 5, acknowledged IP data).

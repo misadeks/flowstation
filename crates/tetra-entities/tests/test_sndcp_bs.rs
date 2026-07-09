@@ -739,13 +739,19 @@ fn downlink_ip_acknowledged_sends_sn_data() {
     }
 }
 
-/// PD-4g. SN-DATA-TRANSMIT-REQUEST(accept) must emit a `PdchReserveReq` directed at UMAC.
+/// PD-5c-H2. SN-DATA-TRANSMIT-REQUEST(accept) must piggyback the PDCH grant
+/// on the outgoing SN-DATA-TRANSMIT-RESPONSE via `LtpdMleUnitdataReq.chan_alloc`.
 ///
-/// After SNDCP sends TRANSMIT-RESPONSE(accept) it must enqueue a
-/// `SapMsgInner::PdchReserveReq { issi, nsapi }` targeting `TetraEntity::Umac`
-/// so that UMAC can grant the PDCH before the MS sends SN-UNITDATA.
+/// After SNDCP sends TRANSMIT-RESPONSE(accept) it must attach a
+/// `CmceChanAllocReq` (Additional / TS4 / UL+DL) to that same
+/// `LtpdMleUnitdataReq` so UMAC produces a single MacResource carrying both
+/// the response SDU and the grant. It must NOT enqueue any standalone
+/// `PdchReserveReq` — that variant no longer exists.
 #[test]
-fn transmit_request_accept_emits_pdch_reserve_req() {
+fn transmit_request_accept_carries_chan_alloc_on_transmit_response() {
+    use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
+    use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
+
     let (mut sndcp, mut queue) = make_sndcp();
     // Activate a PDP context so the context exists in Ready state.
     activate(&mut sndcp, &mut queue, 30001, demand_dynamic(3)).expect("no ACCEPT");
@@ -765,28 +771,39 @@ fn transmit_request_accept_emits_pdch_reserve_req() {
     let sdu = with_discriminator(&encode_data_transmit_request(&req));
     sndcp.rx_prim(&mut queue, make_ind(sdu, 30001));
 
-    // Drain all outbound messages.
     let msgs = drain_queue(&mut queue);
-
-    // First message must be the TRANSMIT-RESPONSE(accept) downlink PDU.
     assert!(!msgs.is_empty(), "expected at least one outbound message");
 
-    // Find the PdchReserveReq among the outbound messages.
-    let reserve_req = msgs.iter().find(|m| {
-        matches!(m.msg, SapMsgInner::PdchReserveReq { .. })
-    });
-    let reserve_req = reserve_req.expect(
-        "TRANSMIT-REQUEST accept must emit PdchReserveReq directed at UMAC"
+    // Locate the TRANSMIT-RESPONSE LtpdMleUnitdataReq and verify the piggybacked
+    // chan_alloc is present with the expected shape.
+    let ltpd_req = msgs
+        .into_iter()
+        .find_map(|m| match m.msg {
+            SapMsgInner::LtpdMleUnitdataReq(r) => Some(r),
+            _ => None,
+        })
+        .expect("TRANSMIT-REQUEST accept must emit an LtpdMleUnitdataReq");
+    let chan_alloc = ltpd_req
+        .chan_alloc
+        .as_ref()
+        .expect("PD-5c-H2: TRANSMIT-RESPONSE must piggyback a CmceChanAllocReq grant");
+    assert_eq!(
+        chan_alloc.alloc_type,
+        ChanAllocType::Additional,
+        "piggybacked grant must be Additional so the MS keeps MCCH presence"
     );
-
-    // Verify destination and payload.
-    assert_eq!(reserve_req.dest, TetraEntity::Umac, "PdchReserveReq must be destined for UMAC");
-    assert_eq!(reserve_req.src, TetraEntity::Sndcp, "PdchReserveReq must come from SNDCP");
-    match reserve_req.msg {
-        SapMsgInner::PdchReserveReq { issi, nsapi } => {
-            assert_eq!(issi, 30001, "PdchReserveReq issi must match the requesting MS");
-            assert_eq!(nsapi, 3, "PdchReserveReq nsapi must match the context NSAPI");
-        }
-        _ => panic!("expected PdchReserveReq"),
-    }
+    assert_eq!(
+        chan_alloc.ul_dl_assigned,
+        UlDlAssignment::Both,
+        "piggybacked grant must be symmetric UL+DL"
+    );
+    assert_eq!(
+        chan_alloc.timeslots,
+        [false, false, false, true],
+        "MVP profile: piggybacked grant targets TS4"
+    );
+    assert!(
+        chan_alloc.carrier.is_some(),
+        "piggybacked grant must carry the main carrier so UMAC's chan_alloc validator accepts it"
+    );
 }

@@ -186,11 +186,17 @@ fn packet_data_flag_threads_through_llc_to_umac() {
 }
 
 // ── test 3 ────────────────────────────────────────────────────────────────────
-/// The first `TmaUnitdataReq { packet_data_flag: true }` for a new ISSI must
-/// cause UMAC to emit a `MAC-RESOURCE` PDU with a `ChanAllocElement` granting
-/// the PDCH timeslot.  Fields checked: SSI, carrier_number, ts_assigned bitmap.
+/// PD-5c-H2: with the piggyback pattern, the SN-UNITDATA-first fallback path
+/// (a packet-data `TmaUnitdataReq` arriving BEFORE any TRANSMIT-REQUEST /
+/// TRANSMIT-RESPONSE handshake) no longer emits a standalone MAC-RESOURCE
+/// with a `ChanAllocElement`. Instead it arms the PDCH allocator
+/// (`current_timeslot`, `reservations`) and flips the AACH via
+/// `pdch_timeslot` so the MS observes AssignedControl on the chosen slot.
+///
+/// The primary PDCH grant now rides on the TRANSMIT-RESPONSE MacResource —
+/// see `piggyback_grant_rides_on_transmit_response_mac_resource`.
 #[test]
-fn first_packet_data_pdu_triggers_mac_resource_with_channel_allocation() {
+fn first_packet_data_pdu_arms_pdch_bookkeeping() {
     debug::setup_logging_verbose();
 
     const TEST_ISSI: u32 = 1234;
@@ -217,34 +223,33 @@ fn first_packet_data_pdu_triggers_mac_resource_with_channel_allocation() {
         dest: TetraEntity::Umac,
         msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(TEST_ISSI)),
     });
-    // Run enough ticks for the message to be processed and finalized into LMAC.
     test.run_stack(Some(4));
 
-    let sink_msgs = test.dump_sinks();
+    let umac = test
+        .router
+        .get_entity(TetraEntity::Umac)
+        .expect("UMAC")
+        .as_any_mut()
+        .downcast_mut::<UmacBs>()
+        .expect("downcast");
 
-    let pdu = find_pdch_mac_resource(&sink_msgs, TEST_ISSI)
-        .expect("MAC-RESOURCE with ChanAllocElement must be emitted for the first PDCH PDU");
-
-    let chan_alloc = pdu.chan_alloc_element.expect("chan_alloc_element must be present");
-
-    // Exactly one timeslot must be assigned (the dynamically-chosen PDCH slot).
-    let assigned_count = chan_alloc.ts_assigned.iter().filter(|&&b| b).count();
-    assert_eq!(assigned_count, 1, "exactly one timeslot must be assigned in the PDCH grant");
-
-    // TS1 must never be the PDCH slot (it's the control channel).
+    // Allocator must reserve the ISSI and mark the highest free TS as current.
     assert!(
-        !chan_alloc.ts_assigned[0],
-        "TS1 must never be assigned as a PDCH timeslot"
+        umac.pdch_allocator().reservations.contains_key(&TEST_ISSI),
+        "first packet-data PDU must reserve PDCH for ISSI={TEST_ISSI}"
     );
-
-    // With no voice circuits active, TS4 is the preferred PDCH slot.
-    assert!(
-        chan_alloc.ts_assigned[3],
+    assert_eq!(
+        umac.pdch_allocator().current_timeslot,
+        Some(4),
         "with no voice circuits, PDCH must prefer TS4 (highest eligible)"
     );
 
-    // The carrier must be the main carrier.
-    assert_eq!(chan_alloc.carrier_num, MAIN_CARRIER, "PDCH carrier must be the main carrier");
+    // AACH must flip to AssignedControl on the chosen TS.
+    assert_eq!(
+        umac.channel_scheduler.pdch_timeslot(),
+        Some(4),
+        "SN-UNITDATA-first fallback must arm pdch_timeslot=Some(4) so AACH signals AssignedControl"
+    );
 }
 
 // ── test 4 ────────────────────────────────────────────────────────────────────
@@ -646,25 +651,26 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
     );
 }
 
-// ── test PD-4g ────────────────────────────────────────────────────────────────
-/// Sending a `SapMsgInner::PdchReserveReq { issi: 1234, nsapi: 1 }` to UMAC
-/// (with `packet_data_enabled = true`) must cause UMAC to emit a `MAC-RESOURCE`
-/// PDU with a `chan_alloc_element` granting the PDCH timeslot.
-///
-/// This reproduces the PD-4g fix: SNDCP emits PdchReserveReq right after
-/// TRANSMIT-RESPONSE(accept) so the MS gets a PDCH grant before it sends
-/// SN-UNITDATA.
+// ── test PD-5c-H2 (piggyback) ─────────────────────────────────────────────────
+/// PD-5c-H2. Feeding UMAC a `TmaUnitdataReq` with a `chan_alloc` and a non-empty
+/// PDU must produce a **single** MAC-RESOURCE that carries BOTH the SDU bits
+/// AND the ChanAllocElement — the piggyback pattern that MTP3550 firmware
+/// requires. It must also flip the AACH on the assigned TS to
+/// `AssignedControl` (`pdch_timeslot = Some(ts)`) and mark the grant as a
+/// random-access response (PD-5c-H5).
 #[test]
-fn pdch_reserve_req_triggers_mac_resource_with_channel_allocation() {
+fn piggyback_grant_rides_on_transmit_response_mac_resource() {
+    use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
+    use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
+    use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
+
     debug::setup_logging_verbose();
 
     const TEST_ISSI: u32 = 1234;
-    const TEST_NSAPI: u8 = 1;
 
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
 
-    // Enable PDCH so the packet-data path is active.
     {
         let umac = test
             .router
@@ -676,57 +682,75 @@ fn pdch_reserve_req_triggers_mac_resource_with_channel_allocation() {
         umac.set_packet_data_enabled_for_test(true);
     }
 
-    // Submit a PdchReserveReq directly — as SNDCP would after TRANSMIT-RESPONSE(accept).
+    // Build a TmaUnitdataReq carrying a non-empty SDU (would be the SN-DATA
+    // TRANSMIT-RESPONSE in production) and a piggybacked TS4 grant.
+    let piggyback_req = TmaUnitdataReq {
+        req_handle: 0,
+        pdu: BitBuffer::from_bitstr("11110000101010101100"),
+        main_address: issi_addr(TEST_ISSI),
+        link_id: 0,
+        endpoint_id: 0,
+        stealing_permission: false,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        carrier_num: Some(MAIN_CARRIER),
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: None,
+            carrier: Some(MAIN_CARRIER),
+            timeslots: [false, false, false, true],
+            alloc_type: ChanAllocType::Additional,
+            ul_dl_assigned: UlDlAssignment::Both,
+        }),
+        tx_reporter: None,
+        packet_data_flag: false, // signalling PDU, not IP data
+    };
     test.submit_message(SapMsg {
-        sap: Sap::Control,
-        src: TetraEntity::Sndcp,
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
         dest: TetraEntity::Umac,
-        msg: SapMsgInner::PdchReserveReq { issi: TEST_ISSI, nsapi: TEST_NSAPI },
+        msg: SapMsgInner::TmaUnitdataReq(piggyback_req),
     });
-    // Run enough ticks for the message to be processed and reach LMAC.
     test.run_stack(Some(4));
 
     let sink_msgs = test.dump_sinks();
 
+    // Locate a MAC-RESOURCE with chan_alloc_element for our ISSI.
     let pdu = find_pdch_mac_resource(&sink_msgs, TEST_ISSI)
-        .expect("PdchReserveReq must trigger a MAC-RESOURCE with ChanAllocElement for the MS");
+        .expect("piggyback path must emit a MAC-RESOURCE with ChanAllocElement");
 
-    let chan_alloc = pdu.chan_alloc_element
-        .expect("chan_alloc_element must be present in the MAC-RESOURCE grant");
+    let chan_alloc = pdu
+        .chan_alloc_element
+        .expect("chan_alloc_element must be present on the piggybacked MAC-RESOURCE");
 
-    // SSI address must match.
-    assert_eq!(
-        pdu.addr.map(|a| a.ssi),
-        Some(TEST_ISSI),
-        "MAC-RESOURCE must be addressed to ISSI={TEST_ISSI}"
-    );
+    // Grant fields.
+    assert_eq!(chan_alloc.ts_assigned, [false, false, false, true],
+        "grant must target TS4");
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both,
+        "grant must be UL+DL");
+    assert_eq!(chan_alloc.alloc_type, ChanAllocType::Additional,
+        "grant must be Additional so the MS keeps MCCH presence");
+    assert!(chan_alloc.clch_permission,
+        "CLCH permission must be granted so MTP3550 linearises on the TS");
+    assert_eq!(chan_alloc.carrier_num, MAIN_CARRIER,
+        "grant must be on the main carrier");
 
-    // Exactly one timeslot assigned.
-    let assigned_count = chan_alloc.ts_assigned.iter().filter(|&&b| b).count();
-    assert_eq!(assigned_count, 1, "exactly one timeslot must be assigned in the PDCH grant");
+    // Random-access flag must be forced on for piggybacked ISSI grants
+    // (PD-5c-H5) even when LLC forwards TlaTlDataReqBl with link_id=0.
+    assert!(pdu.random_access_flag,
+        "piggybacked ISSI grant must have random_access_flag=true (PD-5c-H5)");
 
-    // TS1 must never be the PDCH slot (it's the control channel).
-    assert!(!chan_alloc.ts_assigned[0], "TS1 must never be assigned as a PDCH timeslot");
+    // Length indicator must reflect a non-empty SDU (i.e. the grant is not
+    // riding on an empty-payload MacResource).
+    assert!(pdu.length_ind > 0,
+        "piggyback path must carry a non-empty SDU on the same PDU as the grant");
 
-    // With no voice circuits active, TS4 is the preferred PDCH slot.
-    assert!(
-        chan_alloc.ts_assigned[3],
-        "with no voice circuits, PDCH must prefer TS4 (highest eligible)"
-    );
-
-    // UL+DL must both be assigned.
-    use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
-    assert_eq!(
-        chan_alloc.ul_dl_assigned,
-        UlDlAssignment::Both,
-        "ul_dl_assigned must be Both for symmetric PDCH"
-    );
-
-    // The carrier must be the main carrier.
-    assert_eq!(
-        chan_alloc.carrier_num, MAIN_CARRIER,
-        "PDCH carrier must be the main carrier"
-    );
+    // AACH must be armed on TS4.
+    let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+        .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+    assert_eq!(umac.channel_scheduler.pdch_timeslot(), Some(4),
+        "piggyback path must arm the PDCH AACH on the assigned timeslot");
 }
 
 // ── PD-5b test 1 ──────────────────────────────────────────────────────────────
@@ -752,7 +776,8 @@ fn pdch_mac_resource_activates_assigned_control_aach_on_pdch_slot() {
         umac.set_packet_data_enabled_for_test(true);
     }
 
-    // Submit a packet-data uplink — triggers reserve + emit_pdch_mac_resource.
+    // Submit a packet-data uplink — triggers reserve + AACH bookkeeping
+    // (SN-UNITDATA-first fallback path in handle_pdch_unitdata_req).
     test.submit_message(SapMsg {
         sap: Sap::TmaSap,
         src: TetraEntity::Llc,
@@ -764,11 +789,11 @@ fn pdch_mac_resource_activates_assigned_control_aach_on_pdch_slot() {
     let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
         .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
 
-    // After the grant, the scheduler must have pdch_timeslot = Some(4) (highest free slot).
+    // After the fallback bookkeeping, the scheduler must have pdch_timeslot = Some(4).
     assert_eq!(
         umac.channel_scheduler.pdch_timeslot(),
         Some(4),
-        "emit_pdch_mac_resource must arm pdch_timeslot=Some(4) so AACH signals AssignedControl"
+        "PDCH fallback path must arm pdch_timeslot=Some(4) so AACH signals AssignedControl"
     );
 }
 

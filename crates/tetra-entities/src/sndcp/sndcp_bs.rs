@@ -22,6 +22,9 @@ use std::net::Ipv4Addr;
 use tetra_config::bluestation::{CfgPacketData, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress};
+use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
+use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
+use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -643,27 +646,34 @@ impl Sndcp {
             return;
         }
         sdu.seek(0);
-        send_downlink(
-            queue, main_address, ind.link_id, ind.endpoint_id,
-            sdu, Layer2Service::Acknowledged, false,
-        );
 
-        // PD-4g: trigger PDCH allocation immediately after TRANSMIT-RESPONSE(accept)
-        // so the MS receives a MAC-RESOURCE with chan_alloc_element before it tries
-        // to send SN-UNITDATA.  Without this, the only PDCH grant trigger was a
-        // TmaUnitdataReq with packet_data_flag=true (SN-UNITDATA), creating a
-        // chicken-and-egg: no SN-UNITDATA until PDCH assigned, no PDCH until
-        // SN-UNITDATA arrives.
-        // NOTE: spec ambiguous — chosen behaviour: re-emit PdchReserveReq on retry,
-        // allocator is idempotent per reserve() outcome (existing entry = refresh only,
-        // no duplicate MAC-RESOURCE since emit_pdch_mac_resource is only called on
-        // the NewlyAssigned / first-reserve path in handle_pdch_reserve_req).
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Sndcp,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::PdchReserveReq { issi: main_address.ssi, nsapi },
-        });
+        // PD-5c-H2: piggyback the PDCH grant on the SN-DATA-TRANSMIT-RESPONSE.
+        // MTP3550 firmware requires the ChanAllocElement to ride on the same
+        // MacResource PDU as the response SDU; a standalone empty-SDU grant is
+        // silently ignored. See parent-session bring-up log 2026-07-09 21:51.
+        //
+        // MVP profile: hardcode TS4 (matches the "no active voice" bring-up
+        // scenario handle_pdch_reserve_req previously picked dynamically).
+        // UMAC's validate_chan_alloc rejects the grant if TS4 conflicts.
+        //
+        // usage: None — nexus-bs sets usage_marker=None on the piggybacked
+        //                grant. Marker was previously injected by
+        //                emit_pdch_mac_resource; not needed on the piggyback.
+        // alloc_type Additional — MS retains MCCH presence.
+        // ul_dl_assigned Both   — symmetric UL+DL PDCH.
+        // clch_permission is derived by UMAC (Add||Rep && Ul||Both == true).
+        let main_carrier = self.config.config().cell.main_carrier;
+        let chan_alloc = CmceChanAllocReq {
+            usage: None,
+            carrier: Some(main_carrier),
+            timeslots: [false, false, false, true],
+            alloc_type: ChanAllocType::Additional,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+        send_downlink_with_chan_alloc(
+            queue, main_address, ind.link_id, ind.endpoint_id,
+            sdu, Layer2Service::Acknowledged, false, Some(chan_alloc),
+        );
     }
 
     // -- SN-DATA uplink (type 5, acknowledged data) ----------------------------
@@ -1136,6 +1146,26 @@ fn send_downlink(
     layer2service: Layer2Service,
     packet_data_flag: bool,
 ) {
+    send_downlink_with_chan_alloc(
+        queue, main_address, link_id, endpoint_id,
+        sdu, layer2service, packet_data_flag, None,
+    );
+}
+
+/// Same as `send_downlink` but attaches an optional `CmceChanAllocReq` to the
+/// outgoing `LtpdMleUnitdataReq` (PD-5c-H2 piggyback). MLE forwards it through
+/// LLC → UMAC unchanged; UMAC then builds the resulting `MacResource` with the
+/// `ChanAllocElement` on the SAME PDU that carries this SDU.
+fn send_downlink_with_chan_alloc(
+    queue: &mut MessageQueue,
+    main_address: TetraAddress,
+    link_id: u32,
+    endpoint_id: u32,
+    sdu: BitBuffer,
+    layer2service: Layer2Service,
+    packet_data_flag: bool,
+    chan_alloc: Option<CmceChanAllocReq>,
+) {
     queue.push_back(SapMsg {
         sap: Sap::TlpdSap,
         src: TetraEntity::Sndcp,
@@ -1149,6 +1179,7 @@ fn send_downlink(
             packet_data_flag,
             air_interface_encryption: None,
             tx_reporter: None,
+            chan_alloc,
         }),
     });
 }
