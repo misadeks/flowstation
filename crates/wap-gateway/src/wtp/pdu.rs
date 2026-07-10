@@ -33,13 +33,15 @@
 //!
 //! **Result** (Type = 2) — no extra octet; user data follows the fixed header.
 //!
-//! **Ack** (Type = 3) adds one octet:
+//! **Ack** (Type = 3) — exactly 3 octets total. The TVE bit is packed into
+//! the top bit of byte 1 (TID high 7 bits). No trailing byte:
 //! ```text
-//!  octet 3 | 7 | 6 5 4 3 2 1 0 |
-//!          |TVE|   Reserved    |
+//!  octet 1 | 7  | 6 5 4 3 2 1 0 |
+//!          |TVE|   TID hi (7)   |
+//!  octet 2 |        TID lo       |
 //! ```
-//! TVE = 1 indicates one or more TPIs follow (unsupported in v0.1 — we
-//! decode/encode with TVE=0).
+//! TVE = 1 indicates one or more TPIs follow the fixed header (unsupported
+//! in v0.1 — we encode with TVE=0, i.e. bare 3-byte Ack).
 //!
 //! **Abort** (Type = 4) adds two octets:
 //! ```text
@@ -288,7 +290,16 @@ impl WtpPdu {
                 out.extend_from_slice(payload);
             }
             Self::Ack { tve, .. } => {
-                out.push(u8::from(*tve) << 7);
+                // WAP-201 §8.4.1: Ack PDU is exactly 3 octets total. The TVE bit
+                // is packed into the top bit of byte 1 (TID high). No trailing
+                // byte. UP.Browser silently discards Acks that include an extra
+                // byte, so pushing anything here breaks class 2 responder flow.
+                if *tve {
+                    // Set TVE bit in byte 1 top position (index len-2).
+                    let idx = out.len() - 2;
+                    out[idx] |= 0x80;
+                }
+                // No byte written.
             }
             Self::Abort { abort_type, reason, .. } => {
                 // Abort type occupies bits 7-4; low nibble reserved.
@@ -388,9 +399,11 @@ impl WtpPdu {
                 payload: rest.to_vec(),
             },
             PduType::Ack => {
-                // Ack MAY be 3 octets (no TVE nibble) on some Openwave stacks;
-                // real UP.Browser observed both. Tolerate either length.
-                let tve = rest.first().is_some_and(|b| (*b & 0b1000_0000) != 0);
+                // WAP-201 §8.4.1: Ack is 3 octets total. TVE is the top bit of
+                // byte 1 (packed with TID hi 7 bits). Any extension octets
+                // (TPIs) only appear when TVE=1 — we accept them but do not
+                // interpret in v0.1.
+                let tve = (bytes[1] & 0x80) != 0;
                 Self::Ack { flags, tid, tve }
             }
             PduType::Abort => {
@@ -548,6 +561,30 @@ mod tests {
     #[test]
     fn ack_roundtrip() {
         rt(&WtpPdu::ack(0x5678));
+    }
+
+    /// Regression: MS UP.Browser silently discards Acks that include an extra
+    /// trailing byte. WAP-201 §8.4.1 says Ack PDU is exactly 3 octets total.
+    #[test]
+    fn ack_encodes_to_exactly_three_bytes() {
+        let bytes = WtpPdu::ack(0x14b1).encode();
+        assert_eq!(bytes.len(), 3, "Ack must be 3 bytes on the wire");
+        assert_eq!(bytes[0] & 0x78, 0x18, "PDU Type = Ack (0011 in bits 6-3)");
+        // TID = 0x14b1 with TVE=0 → byte 1 = 0x14, byte 2 = 0xb1.
+        assert_eq!(bytes[1], 0x14);
+        assert_eq!(bytes[2], 0xb1);
+    }
+
+    #[test]
+    fn ack_with_tve_sets_byte1_top_bit() {
+        let pdu = WtpPdu::Ack {
+            flags: HeaderFlags::default(),
+            tid: 0x0042,
+            tve: true,
+        };
+        let bytes = pdu.encode();
+        assert_eq!(bytes.len(), 3, "Ack is still 3 bytes even with TVE=1");
+        assert_eq!(bytes[1] & 0x80, 0x80, "TVE bit set in byte 1 top position");
     }
 
     #[test]
