@@ -929,24 +929,55 @@ impl Sndcp {
         // RECONNECT NSAPI is conditional (clause 28.4.4.8). If present, target that
         // context; if absent, move any Standby context for this MS back to Ready
         // (V1: apply to the first Standby one found; multi-context RECONNECT is rare).
+        //
+        // PD-5c-H23 (2026-07-11): MTP3550 hardware observation. MTP3550's local
+        // SNDCP READY timer is shorter than our READY_TIMER_SLOTS (60 s). Even
+        // after a successful WSP CONNECT + ConnectReply delivery, the MS goes
+        // Standby locally within ~1 s and then sends a RECONNECT to promote
+        // itself back to Ready so it can transmit its outstanding WTP Ack. Our
+        // context is still Ready from BS's perspective, so previously we logged
+        // a WARN and did nothing — the MS then hung "connecting" (red blink)
+        // because it interpreted our silence as no PDCH grant, waited for T252,
+        // and eventually SNDCP-reconnected again on BL.
+        //
+        // Treat any RECONNECT as a liveness ping: refresh the READY timer so
+        // the context stays in Ready long enough for the MS to complete its
+        // outstanding uplink. This is spec-consistent (RECONNECT semantically
+        // asserts "I need Ready" regardless of BS view of state) and turns the
+        // logs from WARN into INFO for the common MTP3550 case.
         let main_address = ind.received_tetra_address;
         match rc.nsapi.map(|n| n.0) {
             Some(nsapi) => {
                 let key = PdpKey::new(main_address, nsapi);
                 if let Some(ctx) = self.contexts.get_mut(&key) {
-                    if ctx.state == PdpState::Standby {
-                        ctx.state = PdpState::Ready;
-                        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
-                        ctx.standby_deadline = None;
-                        tracing::info!(
-                            "SNDCP: {:?} NSAPI={nsapi} Standby->Ready (RECONNECT data_to_send)",
-                            main_address
-                        );
-                    } else {
-                        tracing::warn!(
-                            "SNDCP: RECONNECT from {:?} NSAPI={nsapi} in unexpected state {:?}",
-                            main_address, ctx.state
-                        );
+                    match ctx.state {
+                        PdpState::Standby => {
+                            ctx.state = PdpState::Ready;
+                            ctx.ready_deadline =
+                                Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                            ctx.standby_deadline = None;
+                            tracing::info!(
+                                "SNDCP: {:?} NSAPI={nsapi} Standby->Ready (RECONNECT data_to_send)",
+                                main_address
+                            );
+                        }
+                        PdpState::Ready => {
+                            // H23: refresh READY timer instead of warning. MTP3550 sends
+                            // this after WSP CONNECT when its own READY timer expires
+                            // before ours; treat as liveness ping.
+                            ctx.ready_deadline =
+                                Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                            tracing::info!(
+                                "SNDCP: {:?} NSAPI={nsapi} RECONNECT in Ready — refreshed READY timer",
+                                main_address
+                            );
+                        }
+                        other => {
+                            tracing::warn!(
+                                "SNDCP: RECONNECT from {:?} NSAPI={nsapi} in unexpected state {:?}",
+                                main_address, other
+                            );
+                        }
                     }
                 } else {
                     tracing::warn!(
@@ -956,14 +987,28 @@ impl Sndcp {
                 }
             }
             None => {
-                // No NSAPI carried: apply to any Standby context for the MS.
+                // No NSAPI carried: apply to any Standby context for the MS, and also
+                // refresh any Ready context's READY timer (H23 liveness ping semantics).
                 let mut moved = 0usize;
+                let mut refreshed = 0usize;
                 for (key, ctx) in self.contexts.iter_mut() {
-                    if key.ssi == main_address.ssi && ctx.state == PdpState::Standby {
-                        ctx.state = PdpState::Ready;
-                        ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
-                        ctx.standby_deadline = None;
-                        moved += 1;
+                    if key.ssi != main_address.ssi {
+                        continue;
+                    }
+                    match ctx.state {
+                        PdpState::Standby => {
+                            ctx.state = PdpState::Ready;
+                            ctx.ready_deadline =
+                                Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                            ctx.standby_deadline = None;
+                            moved += 1;
+                        }
+                        PdpState::Ready => {
+                            ctx.ready_deadline =
+                                Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
+                            refreshed += 1;
+                        }
+                        _ => {}
                     }
                 }
                 if moved > 0 {
@@ -971,9 +1016,14 @@ impl Sndcp {
                         "SNDCP: {:?} RECONNECT (no data_to_send): moved {} contexts Standby->Ready",
                         main_address, moved
                     );
+                } else if refreshed > 0 {
+                    tracing::info!(
+                        "SNDCP: {:?} RECONNECT (no data_to_send): refreshed {} Ready contexts (H23 liveness)",
+                        main_address, refreshed
+                    );
                 } else {
                     tracing::debug!(
-                        "SNDCP: RECONNECT from {:?} (no data_to_send): no Standby contexts",
+                        "SNDCP: RECONNECT from {:?} (no data_to_send): no eligible contexts",
                         main_address
                     );
                 }
