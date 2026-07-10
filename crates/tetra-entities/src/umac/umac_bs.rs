@@ -1635,7 +1635,18 @@ impl UmacBs {
             // granted timeslot and the allocator tracks the reservation. This
             // mirrors what `emit_pdch_mac_resource` used to do for the deleted
             // standalone-grant path.
+            //
+            // PD-5c-H20 (2026-07-10 hardware fix): must ALSO gate on
+            // `prim.packet_data_flag == true`. Voice call D-CONNECT/D-SETUP carry
+            // a `chan_alloc` with `alloc_type: Replace` addressed to the caller's
+            // ISSI too — without the packet_data_flag guard we hijacked that voice
+            // grant as a PDCH grant, flipping AACH on the voice timeslot to
+            // AssignedControl and confusing the MS: D-CONNECT said voice, AACH
+            // said PDCH, MS auto-released PTT after ~500 ms. Symptom manifested
+            // only when `[packet_data].enabled = true` in the config (i.e. this
+            // block runs), which correlates with the user's PTT-broken report.
             if self.packet_data_enabled
+                && prim.packet_data_flag
                 && prim.main_address.ssi_type == SsiType::Issi
                 && matches!(
                     chan_alloc.alloc_type,
