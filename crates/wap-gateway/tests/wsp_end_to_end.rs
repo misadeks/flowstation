@@ -76,14 +76,17 @@ async fn end_to_end_mtp3550_connect_gets_openwave_connect_reply() {
         let pdu = WtpPdu::decode(&buf[..n]).expect("valid PDU from gateway");
         match pdu {
             WtpPdu::Ack { tid, .. } => {
-                assert_eq!(tid, 0x14B1);
+                // Gateway XORs TID with 0x8000 per WAP-201 §8.1.2 SendTID.
+                assert_eq!(tid, 0x14B1 ^ 0x8000, "gateway must send SendTID");
                 got_ack = true;
             }
             WtpPdu::Result { tid, payload, .. } => {
-                assert_eq!(tid, 0x14B1);
+                assert_eq!(tid, 0x14B1 ^ 0x8000, "gateway must send SendTID");
                 let reply = WspPdu::decode(&payload).expect("Result carries a valid WSP PDU");
                 connect_reply = Some(reply);
-                // Send back an Ack so the responder's retx state stops.
+                // Send back our own Ack of the Result so responder retx stops.
+                // As the initiator we still use RcvTID unmodified here (our
+                // send direction, MS-side, wouldn't XOR).
                 let ack = WtpPdu::Ack {
                     flags: HeaderFlags {
                         gtr: false,

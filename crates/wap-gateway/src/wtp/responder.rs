@@ -327,7 +327,10 @@ impl Responder {
     // ── Transaction progression ────────────────────────────────────────────
 
     async fn complete_invoke(&self, txn: &mut Transaction) {
-        // 1. Ack the Invoke.
+        // 1. Ack the Invoke. Per WAP-201 §8.1.2 the responder must use
+        //    SendTID = RcvTID ^ 0x8000 on every outbound PDU; the initiator
+        //    matches its transaction against SendTID and silently discards
+        //    any PDU carrying RcvTID unchanged. `WtpPdu::ack()` does the XOR.
         let ack = WtpPdu::ack(txn.tid);
         if let Err(e) = self.wdp.send(txn.peer, &ack.encode()).await {
             warn!(peer = %txn.peer, tid = txn.tid, err = %e, "failed to send Ack");
@@ -444,10 +447,16 @@ async fn sweep_loop(resp: Responder) {
 // ── Result segmentation ──────────────────────────────────────────────────────
 
 /// Chop `payload` into a `Result` PDU followed by zero or more
-/// `SegmentedResult` PDUs, all sharing `tid`. For a group of N>1 segments the
-/// closing Segmented Result carries `GTR=1, TTR=1`; single-segment (unsegmented)
-/// Results carry `GTR=0, TTR=1` only, per WAP-201 §8.4.3.
-pub(crate) fn segment_result(tid: u16, payload: &[u8]) -> Vec<Vec<u8>> {
+/// `SegmentedResult` PDUs. Every outbound PDU uses the WTP **SendTID**
+/// (`rcv_tid ^ 0x8000`) per WAP-201 §8.1.2 — the initiator matches PDUs
+/// against SendTID, so any outbound PDU that echoes the incoming RcvTID
+/// unchanged is silently discarded by the peer.
+///
+/// Both single-segment (unsegmented) and closing-segment (of a segmented
+/// group) Results carry `GTR=1, TTR=1` per WAP-201 §8.7.3. Intermediate
+/// segments in a group carry `GTR=0, TTR=0`.
+pub(crate) fn segment_result(rcv_tid: u16, payload: &[u8]) -> Vec<Vec<u8>> {
+    let send_tid = rcv_tid ^ 0x8000;
     let chunks: Vec<&[u8]> = if payload.is_empty() {
         vec![&[][..]]
     } else {
@@ -458,25 +467,21 @@ pub(crate) fn segment_result(tid: u16, payload: &[u8]) -> Vec<Vec<u8>> {
 
     for (i, chunk) in chunks.iter().enumerate() {
         let is_last = i == n - 1;
-        // WAP-201 §8.4.3 unsegmented Result: GTR=0, TTR=1.
-        // For a group of N>1 segments the closing Segmented Result carries
-        // GTR=1, TTR=1; intermediate segments GTR=0, TTR=0.
-        let is_segmented_group = n > 1;
         let flags = HeaderFlags {
-            gtr: is_last && is_segmented_group,
+            gtr: is_last,
             ttr: is_last,
             rid: false,
         };
         let pdu = if i == 0 {
             WtpPdu::Result {
                 flags,
-                tid,
+                tid: send_tid,
                 payload: chunk.to_vec(),
             }
         } else {
             WtpPdu::SegmentedResult {
                 flags,
-                tid,
+                tid: send_tid,
                 psn: i as u8,
                 payload: chunk.to_vec(),
             }
@@ -496,15 +501,17 @@ mod tests {
 
     #[test]
     fn segment_result_single_segment() {
+        // segment_result takes rcv_tid and internally XORs 0x8000 for SendTID.
         let out = segment_result(0x1234, b"hello");
         assert_eq!(out.len(), 1);
         let pdu = WtpPdu::decode(&out[0]).unwrap();
         match pdu {
             WtpPdu::Result { flags, tid, payload } => {
-                assert_eq!(tid, 0x1234);
-                // WAP-201 §8.4.3: unsegmented Result = TTR=1, GTR=0.
+                // SendTID = 0x1234 ^ 0x8000 = 0x9234.
+                assert_eq!(tid, 0x9234);
+                // WAP-201 §8.7.3: unsegmented Result = GTR=1, TTR=1.
                 assert!(flags.ttr);
-                assert!(!flags.gtr);
+                assert!(flags.gtr);
                 assert!(!flags.rid);
                 assert_eq!(payload, b"hello");
             }
@@ -513,14 +520,18 @@ mod tests {
     }
 
     /// Regression: on hardware, MS UP.Browser silently discarded our single-segment
-    /// Result and re-Invoked repeatedly when we set GTR=1 alongside TTR=1. The fix
-    /// (GTR=0 on unsegmented Results) is validated by the wire byte here: octet 0
-    /// must be exactly 0x12 (Type=Result=0010, GTR=0, TTR=1, RID=0).
+    /// Result because (a) TID wasn't SendTID (XOR 0x8000), and (b) GTR was 0.
+    /// Both fixes must land together to produce a byte-identical WAP-201 §8.7.3
+    /// compliant Result the initiator will accept.
     #[test]
-    fn segment_result_single_segment_octet0_is_0x12() {
+    fn segment_result_single_segment_wire_matches_kannel() {
         let out = segment_result(0x14b1, b"abc");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0][0], 0x12, "unsegmented Result octet 0 must be 0x12 for UP.Browser compat");
+        // Byte 0 = 0x16 (Type=Result, GTR=1, TTR=1, RID=0).
+        assert_eq!(out[0][0], 0x16, "unsegmented Result byte 0 must be 0x16 (GTR=TTR=1)");
+        // Byte 1-2 = SendTID = 0x14b1 ^ 0x8000 = 0x94b1.
+        assert_eq!(out[0][1], 0x94, "byte 1 must be SendTID hi (XOR of RcvTID hi with 0x80)");
+        assert_eq!(out[0][2], 0xb1);
     }
 
     #[test]
@@ -594,7 +605,9 @@ mod tests {
         };
         client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
 
-        // Expect Ack + Result (order Ack first).
+        // Expect Ack + Result (order Ack first). Responder XORs TID with 0x8000
+        // per WAP-201 §8.1.2 (SendTID). Our Invoke used RcvTID=0x0042, so
+        // outbound PDUs carry SendTID=0x8042.
         let mut got_ack = false;
         let mut got_result = None;
         for _ in 0..2 {
@@ -605,11 +618,11 @@ mod tests {
             let pdu = WtpPdu::decode(&bytes).unwrap();
             match pdu {
                 WtpPdu::Ack { tid, .. } => {
-                    assert_eq!(tid, 0x0042);
+                    assert_eq!(tid, 0x8042);
                     got_ack = true;
                 }
                 WtpPdu::Result { tid, payload, .. } => {
-                    assert_eq!(tid, 0x0042);
+                    assert_eq!(tid, 0x8042);
                     got_result = Some(payload);
                 }
                 other => panic!("unexpected PDU from responder: {other:?}"),

@@ -81,11 +81,12 @@ async fn run_serves_wsp_connect_and_shuts_down_on_cancel() {
         let pdu = WtpPdu::decode(&buf[..n]).expect("valid PDU from gateway");
         match pdu {
             WtpPdu::Ack { tid, .. } => {
-                assert_eq!(tid, 0x00CD);
+                // Responder XORs TID with 0x8000 per WAP-201 §8.1.2 SendTID.
+                assert_eq!(tid, 0x00CD ^ 0x8000);
                 got_ack = true;
             }
             WtpPdu::Result { tid, payload, .. } => {
-                assert_eq!(tid, 0x00CD);
+                assert_eq!(tid, 0x00CD ^ 0x8000);
                 // Payload must be a WSP ConnectReply that echoes both
                 // Openwave-critical caps verbatim.
                 let reply = WspPdu::decode(&payload).expect("Result carries a valid WSP PDU");

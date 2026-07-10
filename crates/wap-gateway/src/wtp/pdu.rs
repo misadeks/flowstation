@@ -290,16 +290,15 @@ impl WtpPdu {
                 out.extend_from_slice(payload);
             }
             Self::Ack { tve, .. } => {
-                // WAP-201 §8.4.1: Ack PDU is exactly 3 octets total. The TVE bit
-                // is packed into the top bit of byte 1 (TID high). No trailing
-                // byte. UP.Browser silently discards Acks that include an extra
-                // byte, so pushing anything here breaks class 2 responder flow.
-                if *tve {
-                    // Set TVE bit in byte 1 top position (index len-2).
-                    let idx = out.len() - 2;
-                    out[idx] |= 0x80;
-                }
-                // No byte written.
+                // WAP-201 §8.4.1: Ack is 3 octets when no TPI extension is
+                // present. TVE=1 signals that one or more TPI extension bytes
+                // follow — we do not generate TPIs in v0.1, so if tve is set
+                // we still emit no trailing bytes (the receiver will treat it
+                // as an empty TPI list). The top bit of byte 1 IS part of the
+                // TID (specifically the SendTID direction bit set via XOR
+                // 0x8000 in `WtpPdu::ack()`), NOT a separate TVE field.
+                let _ = tve;
+                // No trailing bytes; Ack ends at byte 2.
             }
             Self::Abort { abort_type, reason, .. } => {
                 // Abort type occupies bits 7-4; low nibble reserved.
@@ -399,11 +398,14 @@ impl WtpPdu {
                 payload: rest.to_vec(),
             },
             PduType::Ack => {
-                // WAP-201 §8.4.1: Ack is 3 octets total. TVE is the top bit of
-                // byte 1 (packed with TID hi 7 bits). Any extension octets
-                // (TPIs) only appear when TVE=1 — we accept them but do not
-                // interpret in v0.1.
-                let tve = (bytes[1] & 0x80) != 0;
+                // WAP-201 §8.4.1: Ack is 3 octets total (no TPI extension).
+                // The top bit of byte 1 is the TID direction bit (SendTID vs
+                // RcvTID); the WAP-201 spec labels it "TVE" for Ack framing
+                // but in practice for a responder-side Ack it's set = 1 by
+                // XOR of `rcv_tid ^ 0x8000` on the sender. We treat the full
+                // 16-bit TID (including that bit) as the tid field and only
+                // set tve=true if an actual TPI extension byte follows.
+                let tve = bytes.len() > 3;
                 Self::Ack { flags, tid, tve }
             }
             PduType::Abort => {
@@ -462,46 +464,49 @@ impl WtpPdu {
 // ── Convenience constructors ─────────────────────────────────────────────────
 
 impl WtpPdu {
-    /// Build a responder Ack.
+    /// Build a responder Ack. Applies WTP §8.1.2 `SendTID = RcvTID ^ 0x8000`
+    /// to the TID before packing — the initiator matches replies against
+    /// SendTID, so an Ack that echoes RcvTID unchanged is silently discarded.
     ///
-    /// WAP-201 §8.4.1: for Ack PDUs, bits 2 and 1 of byte 0 are **reserved
-    /// (must be 0)** — they are NOT GTR/TTR (those flags only exist on
-    /// Invoke/Result/Segmented\* PDUs). RID is 0 for a fresh Ack; set by the
-    /// caller (or higher layer) when retransmitting.
-    pub fn ack(tid: u16) -> Self {
+    /// WAP-201 §8.4.1 Ack byte 0 layout: `CON(1)|Type(4)|TIDverify(1)|Rsv(1)|RID(1)`.
+    /// Bit 2 (TIDverify) = 0 for ACKNOWLEDGEMENT, 1 for TID_VERIFICATION.
+    /// Bit 1 is reserved (must be 0). Bit 0 (RID) is 0 on first send.
+    pub fn ack(rcv_tid: u16) -> Self {
         Self::Ack {
             flags: HeaderFlags {
                 gtr: false,
                 ttr: false,
                 rid: false,
             },
-            tid,
+            tid: rcv_tid ^ 0x8000,
             tve: false,
         }
     }
 
-    /// Build a single-segment Result. Set TTR=true to mark it terminal.
-    pub fn result(tid: u16, payload: Vec<u8>) -> Self {
+    /// Build a single-segment Result. Applies WTP §8.1.2 `SendTID = RcvTID ^ 0x8000`
+    /// and sets GTR=TTR=1 per WAP-201 §8.7.3 (unsegmented Result must set both
+    /// group-trailer and transmission-trailer flags).
+    pub fn result(rcv_tid: u16, payload: Vec<u8>) -> Self {
         Self::Result {
             flags: HeaderFlags {
-                gtr: false,
+                gtr: true,
                 ttr: true,
                 rid: false,
             },
-            tid,
+            tid: rcv_tid ^ 0x8000,
             payload,
         }
     }
 
-    /// Build a Provider-side Abort.
-    pub fn provider_abort(tid: u16, reason: u8) -> Self {
+    /// Build a Provider-side Abort. Applies WTP §8.1.2 `SendTID = RcvTID ^ 0x8000`.
+    pub fn provider_abort(rcv_tid: u16, reason: u8) -> Self {
         Self::Abort {
             flags: HeaderFlags {
                 gtr: false,
                 ttr: true,
                 rid: false,
             },
-            tid,
+            tid: rcv_tid ^ 0x8000,
             abort_type: AbortType::Provider,
             reason,
         }
@@ -570,8 +575,9 @@ mod tests {
 
     /// Regression: MS UP.Browser silently discards Acks that include an extra
     /// trailing byte. WAP-201 §8.4.1 says Ack PDU is exactly 3 octets total.
+    /// Also asserts SendTID = RcvTID ^ 0x8000 (§8.1.2).
     #[test]
-    fn ack_encodes_to_exactly_three_bytes() {
+    fn ack_encodes_to_exactly_three_bytes_and_xors_tid() {
         let bytes = WtpPdu::ack(0x14b1).encode();
         assert_eq!(bytes.len(), 3, "Ack must be 3 bytes on the wire");
         // Byte 0: CON=0, Type=Ack(0011), reserved=00, RID=0 → 0x18.
@@ -579,21 +585,20 @@ mod tests {
             bytes[0], 0x18,
             "Ack byte 0 must be 0x18 (reserved bits 2 and 1 = 0, per WAP-201 §8.4.1)"
         );
-        // TID = 0x14b1 with TVE=0 → byte 1 = 0x14, byte 2 = 0xb1.
-        assert_eq!(bytes[1], 0x14);
+        // SendTID = 0x14b1 ^ 0x8000 = 0x94b1. Byte 1 = 0x94, byte 2 = 0xb1.
+        assert_eq!(bytes[1], 0x94, "byte 1 must be SendTID hi (RcvTID hi ^ 0x80)");
         assert_eq!(bytes[2], 0xb1);
     }
 
+    /// Regression: single-segment Result must set GTR=1, TTR=1 per WAP-201
+    /// §8.7.3, and must XOR TID with 0x8000 for SendTID (§8.1.2).
     #[test]
-    fn ack_with_tve_sets_byte1_top_bit() {
-        let pdu = WtpPdu::Ack {
-            flags: HeaderFlags::default(),
-            tid: 0x0042,
-            tve: true,
-        };
-        let bytes = pdu.encode();
-        assert_eq!(bytes.len(), 3, "Ack is still 3 bytes even with TVE=1");
-        assert_eq!(bytes[1] & 0x80, 0x80, "TVE bit set in byte 1 top position");
+    fn result_encodes_gtr_ttr_and_xors_tid() {
+        let bytes = WtpPdu::result(0x14b1, vec![0xAA]).encode();
+        // Byte 0: CON=0, Type=Result(0010), GTR=1, TTR=1, RID=0 → 0x16.
+        assert_eq!(bytes[0], 0x16, "unsegmented Result byte 0 must be 0x16 (GTR=TTR=1)");
+        assert_eq!(bytes[1], 0x94, "byte 1 = SendTID hi");
+        assert_eq!(bytes[2], 0xb1);
     }
 
     #[test]
