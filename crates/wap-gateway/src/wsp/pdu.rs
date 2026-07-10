@@ -535,19 +535,43 @@ impl ContentType {
 
 /// Build a WSP Reply for a successful (or unsuccessful) HTTP relay.
 ///
-/// The Reply's headers block starts with the Content-Type value in Kannel's
-/// implicit-content-type convention: the first entry of the headers block
-/// IS the Content-Type value (no field-code prefix). See
-/// `wap/wsp_headers.c::wsp_headers_pack` in Kannel 1.4.5 for the reference
-/// encoding UP.Browser 6.3 expects. No other headers are emitted in v0.1.
+/// Headers block layout (matches Kannel `wsp/wsp_headers.c::wsp_headers_pack`
+/// with content-type flag = 1):
+///   1. Content-Type value at position 0 (no field-code prefix — the WAP-230
+///      §8.5.1.1 "implicit content type" convention that UP.Browser 6.3 relies
+///      on for the very first header of a Reply).
+///   2. Content-Length as a well-known header (field 0x0D → short-int 0x8D,
+///      followed by short-integer or long-integer value depending on size).
+///      Some browsers (including UP.Browser 6.3) reject Replies without an
+///      explicit Content-Length despite WSP body length being implicit —
+///      hardware-observed 2026-07-10.
 pub fn build_get_reply(status: u8, content_type: ContentType, body: Vec<u8>) -> WspPdu {
-    let mut headers = Vec::with_capacity(4);
+    let mut headers = Vec::with_capacity(8);
+    // (1) Content-Type at head of block, no field prefix.
     content_type.encode(&mut headers);
+    // (2) Content-Length: <body.len()>. Field code 0x0D → short-int 0x8D.
+    headers.push(0x8D);
+    encode_integer_value(&mut headers, body.len() as u32);
     WspPdu::Reply {
         status,
         headers: HeaderBlock::from_bytes(headers),
         body,
     }
+}
+
+/// Encode a WSP integer-value per WAP-230 §8.4.2.3.
+/// - Short-integer form (value 0..=127) = single byte 0x80|value.
+/// - Long-integer form otherwise = length byte + big-endian value bytes.
+fn encode_integer_value(out: &mut Vec<u8>, value: u32) {
+    if value < 0x80 {
+        out.push(0x80 | (value as u8));
+        return;
+    }
+    let bytes = value.to_be_bytes();
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(3);
+    let num = 4 - start;
+    out.push(num as u8);
+    out.extend_from_slice(&bytes[start..]);
 }
 
 #[cfg(test)]
@@ -752,35 +776,45 @@ mod tests {
     }
 
     #[test]
-    fn build_get_reply_encodes_content_type_wellknown() {
+    fn build_get_reply_encodes_content_type_and_length() {
         let reply = build_get_reply(STATUS_OK, ContentType::WellKnown(ContentType::WMLC), b"hello".to_vec());
         let bytes = reply.encode();
-        // 04 (Reply type) | 20 (status OK) | 01 (headers-len=1) | 94 (wmlc short-int) | body
-        assert_eq!(&bytes[..4], &[0x04, 0x20, 0x01, 0x94]);
-        assert_eq!(&bytes[4..], b"hello");
+        // 04 (Reply) | 20 (200 OK) | 03 (headers-len=3) | 94 (CT wmlc) | 8D (Content-Length field) | 85 (short-int 5) | body
+        assert_eq!(&bytes[..6], &[0x04, 0x20, 0x03, 0x94, 0x8D, 0x85]);
+        assert_eq!(&bytes[6..], b"hello");
     }
 
     #[test]
-    fn build_get_reply_encodes_content_type_literal() {
+    fn build_get_reply_content_length_long_form_for_large_body() {
+        let body = vec![0xAA; 200];
+        let reply = build_get_reply(STATUS_OK, ContentType::WellKnown(ContentType::WMLC), body.clone());
+        let bytes = reply.encode();
+        // 04 20 04 94 8D 01 C8 (headers-len=4: wmlc + Content-Length long-int length=1 value=0xC8=200)
+        assert_eq!(&bytes[..7], &[0x04, 0x20, 0x04, 0x94, 0x8D, 0x01, 0xC8]);
+        assert_eq!(&bytes[7..], &body[..]);
+    }
+
+    #[test]
+    fn build_get_reply_encodes_content_type_literal_with_length() {
         let reply = build_get_reply(STATUS_OK, ContentType::from_http("application/x-flowstation"), b"x".to_vec());
         let bytes = reply.encode();
-        // 04 20 <hdrs-len> "application/x-flowstation" 00 78
         assert_eq!(&bytes[..2], &[0x04, 0x20]);
-        // headers-len = 25 chars + 1 NUL = 26 = 0x1A
-        assert_eq!(bytes[2], 0x1A);
+        // headers-len = 25 chars + NUL + Content-Length(8D 81) = 26 + 2 = 28 = 0x1C
+        assert_eq!(bytes[2], 0x1C);
         assert_eq!(&bytes[3..3 + 25], b"application/x-flowstation");
         assert_eq!(bytes[3 + 25], 0x00);
-        assert_eq!(bytes[3 + 25 + 1], b'x');
+        // Then Content-Length header: 0x8D 0x81 (short-int 1)
+        assert_eq!(bytes[3 + 26], 0x8D);
+        assert_eq!(bytes[3 + 27], 0x81);
+        assert_eq!(bytes[3 + 28], b'x');
     }
 
     #[test]
-    fn build_get_reply_round_trip_matches_observed_wire_format() {
+    fn build_get_reply_round_trip_matches_kannel_wire_format() {
         let reply = build_get_reply(STATUS_OK, ContentType::WellKnown(ContentType::WMLC), vec![0xDE, 0xAD]);
         let bytes = reply.encode();
-        // Byte-for-byte assertion matching the Kannel wire format observed
-        // on the pi from Nokia 6210 / UP.Browser sessions in prior PDs.
-        assert_eq!(bytes, vec![0x04, 0x20, 0x01, 0x94, 0xDE, 0xAD]);
-        // Decoder must reconstruct an equivalent Reply.
+        // 04 20 03 94 8D 82 DE AD -- headers block = wmlc CT + Content-Length: 2
+        assert_eq!(bytes, vec![0x04, 0x20, 0x03, 0x94, 0x8D, 0x82, 0xDE, 0xAD]);
         let back = WspPdu::decode(&bytes).unwrap();
         assert_eq!(back, reply);
     }
