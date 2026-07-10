@@ -80,24 +80,24 @@ pub struct ResponderConfig {
 impl Default for ResponderConfig {
     fn default() -> Self {
         Self {
-            // PD-10c-H28 (2026-07-11): tightened from 4 s → 2 s. Hardware log
-            // showed every WSP transaction takes at least one WTP retx before
-            // MS ACKs (MTP3550 firmware skips the WAP-201 §9.5.7 final Ack in
-            // many cases). Faster retx = faster time-to-render. Still above
-            // TETRA one-way RTT (~1 s single-slot PDCH) so we don't spuriously
-            // retx while a genuine Ack is in flight.
-            t_ack: Duration::from_secs(2),
-            // PD-10c-H30 (2026-07-11): max_retx from 1 → 0. Hardware log
-            // 01:09 proved MS receives our Result cleanly — the LLC layer
-            // reports "AL N(S)=X fully acknowledged" ~1.4s after we send it.
-            // MS just doesn't send the WAP-201 §9.5.7 WTP final Ack.
-            // Retransmitting was retx'ing content that MS already had; each
-            // duplicate AL SDU was confusing MTP3550's session state and
-            // causing the red-blink UI symptom. Zero retries + rely on the
-            // LLC AL-ACK for delivery confirmation. If MS actually loses the
-            // Result (rare, one-off air loss with no LLC ACK), MS re-invokes
-            // with a fresh TID and H25 evicts the stale txn.
-            max_retx: 0,
+            // PD-10c-H35 (2026-07-11): tightened to 500 ms. Hardware evidence
+            // (log 01:56:22 H33 replay + AL-ACK arriving 1s later) shows
+            // MTP3550's WTP client only reliably accepts our Result when the
+            // RID bit is set. First-shot RID=0 sends get silently discarded,
+            // then MS waits ~17s for its own WTP Awt timer to fire a
+            // re-Invoke, which we serve via H33 replay (RID=1) and MS
+            // finally accepts. Sending a proactive RID=1 retry ~500 ms after
+            // the initial RID=0 Result eliminates the 17s wait: the retry
+            // fires well before MS's WTP re-Invoke, hits MS's WTP receive
+            // window with RID=1 set, and MS accepts on first perception of
+            // the response. Still comfortably above single-slot PDCH RTT.
+            t_ack: Duration::from_millis(500),
+            // PD-10c-H35: one automatic retry with RID=1 (retransmit_result
+            // flips the bit). This is the minimum needed to overcome
+            // MTP3550's "reject RID=0 first send" quirk. Second retry is
+            // handled by H33 (MS's own re-Invoke), so max_retx=1 covers all
+            // paths without duplicate air spam.
+            max_retx: 1,
             idle_timeout: Duration::from_secs(90),
             // PD-10c-H28: sweep every 5 s (was 15 s). H25 evicts stale txns
             // when a new Invoke arrives on the same peer, so this only affects
