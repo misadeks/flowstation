@@ -152,6 +152,7 @@ fn tlpd_wrong_variant_drops_with_error_log() {
         received_tetra_address: test_addr(),
         chan_change_resp_req: false,
         chan_change_handle: None,
+        al_link_number: None,
     };
     let sapmsg = SapMsg {
         sap: Sap::TlpdSap,

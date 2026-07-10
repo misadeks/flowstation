@@ -171,6 +171,7 @@ impl MleMs {
                     received_tetra_address: prim.main_address,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
+                    al_link_number: None,
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
@@ -271,6 +272,7 @@ impl MleMs {
                     received_tetra_address: prim.main_address,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
+                    al_link_number: None,
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
