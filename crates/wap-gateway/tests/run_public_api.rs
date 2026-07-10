@@ -87,12 +87,13 @@ async fn run_serves_wsp_connect_and_shuts_down_on_cancel() {
             }
             WtpPdu::Result { tid, payload, .. } => {
                 assert_eq!(tid, 0x00CD ^ 0x8000);
-                // Payload must be a WSP ConnectReply that echoes both
-                // Openwave-critical caps verbatim.
+                // Payload must be a WSP ConnectReply matching Kannel's
+                // sanitize_capabilities() behaviour (see build_connect_reply).
                 let reply = WspPdu::decode(&payload).expect("Result carries a valid WSP PDU");
                 let WspPdu::ConnectReply {
                     server_session_id,
                     capabilities,
+                    headers,
                     ..
                 } = reply
                 else {
@@ -100,12 +101,17 @@ async fn run_serves_wsp_connect_and_shuts_down_on_cancel() {
                 };
                 assert!(server_session_id >= 1);
                 assert!(
-                    capabilities.contains(&Capability::ProtocolOptions(0xF0)),
-                    "ConnectReply must echo Protocol-Options 0xF0 (Openwave quirk)"
+                    capabilities.contains(&Capability::ProtocolOptions(0x00)),
+                    "ConnectReply must SANITIZE Protocol-Options (0xF0 → 0x00) to match Kannel"
                 );
                 assert!(
-                    capabilities.contains(&Capability::ExtendedMethods(vec![(0x10, b"x-up-1".to_vec())])),
-                    "ConnectReply must echo Extended-Methods x-up-1 (Openwave quirk)"
+                    capabilities.contains(&Capability::ExtendedMethods(Vec::new())),
+                    "ConnectReply must REFUSE Extended-Methods / Header-Code-Pages (empty payload = refusal)"
+                );
+                assert_eq!(
+                    headers.raw,
+                    vec![0xC3, 0x93],
+                    "ConnectReply headers block must contain Encoding-Version: 1.3"
                 );
                 got_result = true;
             }

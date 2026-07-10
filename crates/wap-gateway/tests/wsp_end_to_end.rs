@@ -117,12 +117,12 @@ async fn end_to_end_mtp3550_connect_gets_openwave_connect_reply() {
     };
     assert!(server_session_id >= 1);
     assert!(
-        capabilities.contains(&Capability::ProtocolOptions(0xF0)),
-        "ConnectReply must echo Protocol-Options 0xF0"
+        capabilities.contains(&Capability::ProtocolOptions(0x00)),
+        "ConnectReply must SANITIZE Protocol-Options (0xF0 → 0x00) per Kannel"
     );
     assert!(
-        capabilities.contains(&Capability::ExtendedMethods(vec![(0x10, b"x-up-1".to_vec())])),
-        "ConnectReply must echo Extended-Methods x-up-1"
+        capabilities.contains(&Capability::ExtendedMethods(Vec::new())),
+        "ConnectReply must REFUSE Extended-Methods (empty payload)"
     );
     assert!(
         capabilities.contains(&Capability::MethodMor(3)),

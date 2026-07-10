@@ -16,16 +16,25 @@ use wap_gateway::wsp::pdu::{HeaderBlock, WspPdu, build_connect_reply, pdu_type};
 /// Load the fixture as raw bytes. `include_bytes!` keeps it a pure static.
 const FIXTURE: &[u8] = include_bytes!("fixtures/mtp3550_connect.bin");
 
-/// The 29-byte capability block as it appears in the fixture (bytes 5..34).
-/// Kept as a separate const so a failing assertion prints the exact
-/// hardware bytes we're comparing against.
-const HW_CAPS_BLOCK: &[u8] = &[
-    0x04, 0x80, 0x94, 0x80, 0x00, // Client-SDU-Size
-    0x04, 0x81, 0x94, 0x80, 0x00, // Server-SDU-Size
-    0x02, 0x82, 0xF0, // Protocol-Options (Openwave critical)
-    0x02, 0x83, 0x03, // Method-MOR
-    0x02, 0x84, 0x01, // Push-MOR
-    0x09, 0x86, 0x10, 0x78, 0x2D, 0x75, 0x70, 0x2D, 0x31, 0x00, // Extended-Methods x-up-1
+/// The 21-byte SANITIZED capability block we now emit in our ConnectReply,
+/// matching Kannel's `sanitize_capabilities()` behaviour. This is the byte
+/// pattern UP.Browser expects to see back from the gateway. Hardware
+/// testing 2026-07-10 confirmed that echoing MS's original 29-byte block
+/// verbatim got past WTP but was silently discarded at the WSP layer.
+const SANITIZED_CAPS_BLOCK: &[u8] = &[
+    0x04, 0x80, 0x94, 0x80, 0x00, // Client-SDU-Size (echoed)
+    0x04, 0x81, 0x94, 0x80, 0x00, // Server-SDU-Size (echoed)
+    0x02, 0x82, 0x00, // Protocol-Options: top nibble cleared (0xF0 -> 0x00)
+    0x02, 0x83, 0x03, // Method-MOR (echoed)
+    0x02, 0x84, 0x01, // Push-MOR (echoed)
+    0x01, 0x86, // Header-Code-Pages / Extended-Methods: refused (zero-length payload)
+];
+
+/// The raw 29-byte block the MS proposes (kept for the framing check on the
+/// uplink fixture — this is what MS sends, NOT what we reply with).
+const HW_ORIGINAL_CAPS_BLOCK: &[u8] = &[
+    0x04, 0x80, 0x94, 0x80, 0x00, 0x04, 0x81, 0x94, 0x80, 0x00, 0x02, 0x82, 0xF0, 0x02, 0x83, 0x03, 0x02, 0x84, 0x01,
+    0x09, 0x86, 0x10, 0x78, 0x2D, 0x75, 0x70, 0x2D, 0x31, 0x00,
 ];
 
 #[test]
@@ -43,7 +52,7 @@ fn fixture_is_the_expected_size() {
 fn caps_block_bytes_match_hardware_dump() {
     // Confirms our own understanding of the outer framing (5-byte header)
     // before we hand bytes to the decoder.
-    assert_eq!(&FIXTURE[5..34], HW_CAPS_BLOCK);
+    assert_eq!(&FIXTURE[5..34], HW_ORIGINAL_CAPS_BLOCK);
 }
 
 #[test]
@@ -93,9 +102,12 @@ fn decodes_connect_pdu_with_expected_capabilities() {
 }
 
 #[test]
-fn connect_reply_cap_block_is_byte_identical_to_hardware() {
+fn connect_reply_cap_block_matches_kannel_sanitized() {
     // Round-trip: decode fixture → build ConnectReply → re-encode → decode
-    // again → assert cap wire bytes equal HW_CAPS_BLOCK.
+    // again → assert cap wire bytes equal the KANNEL sanitized block.
+    // (We used to assert byte-identical-to-MS but hardware testing showed
+    // MS silently drops replies that dishonestly echo caps we don't
+    // implement — Kannel's sanitizer is correct.)
     let connect = WspPdu::decode(FIXTURE).unwrap();
     let reply = build_connect_reply(&connect, /* server session id */ 1, HeaderBlock::empty()).unwrap();
     let bytes = reply.encode();
@@ -114,12 +126,13 @@ fn connect_reply_cap_block_is_byte_identical_to_hardware() {
         panic!("re-decoded ConnectReply is not a ConnectReply: {decoded:?}");
     };
     assert_eq!(server_session_id, 1);
-    assert!(headers.is_empty());
+    // Headers block MUST carry Encoding-Version: 1.3 → wire bytes `C3 93`.
+    assert_eq!(headers.raw, vec![0xC3, 0x93]);
 
-    // Re-encode just the caps and compare to hardware.
+    // Re-encode just the caps and compare to the Kannel-sanitized block.
     let cap_bytes = wap_gateway::wsp::caps::encode_list(&capabilities);
     assert_eq!(
-        cap_bytes, HW_CAPS_BLOCK,
-        "ConnectReply cap block must be byte-identical to the MS's proposal"
+        cap_bytes, SANITIZED_CAPS_BLOCK,
+        "ConnectReply cap block must match Kannel sanitize_capabilities() output"
     );
 }

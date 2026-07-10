@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_establishes_session_and_echoes_caps() {
+    async fn connect_establishes_session_and_sanitizes_caps() {
         let state = WspGatewayState::new();
         let h = WspHandler::new(state.clone());
         let reply_bytes = h.handle(loopback_peer(), synthetic_connect_bytes()).await;
@@ -261,7 +261,9 @@ mod tests {
             panic!("expected ConnectReply, got {reply:?}");
         };
         assert!(server_session_id >= 1);
-        assert_eq!(capabilities, vec![Capability::ProtocolOptions(0xF0)]);
+        // build_connect_reply clears the top nibble of Protocol-Options
+        // (0xF0 → 0x00) to match Kannel's sanitize_capabilities().
+        assert_eq!(capabilities, vec![Capability::ProtocolOptions(0x00)]);
         assert_eq!(state.session_count(), 1);
     }
 

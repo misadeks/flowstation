@@ -293,18 +293,33 @@ fn decode_reply(rest: &[u8]) -> WapResult<WspPdu> {
 
 // ── Builders ─────────────────────────────────────────────────────────────────
 
-/// Build the ConnectReply that answers a given Connect. The reply echoes
-/// **every** capability the MS proposed, verbatim — this is the whole
-/// point of PD-10b, since Kannel's `sanitize_capabilities()` strips the
-/// Openwave-specific caps and breaks UP.Browser.
+/// Build the ConnectReply that answers a given Connect.
+///
+/// Historically we tried to echo every MS-proposed capability verbatim
+/// (against Kannel's `sanitize_capabilities()`). Hardware testing 2026-07-10
+/// with Motorola MTP3550 / UP.Browser 6.3 showed that pure echoing works
+/// through the WTP layer but MS silently drops the WSP ConnectReply if we
+/// claim capabilities we can't actually service. The three sanitizations
+/// applied here mirror Kannel's WAP-230-compliant behaviour and are the
+/// difference between UP.Browser accepting the session and looping:
+///
+/// 1. **Protocol-Options top 4 bits cleared** — MS proposes `0xF0` (Confirmed
+///    Push + Push + Suspend/Resume + Ack Headers). We don't implement any of
+///    those, so echoing `0xF0` is dishonest and causes MS to abort later.
+///    Per `wsp_session.c::sanitize_capabilities()`, mask with `0x0F`.
+/// 2. **Header-Code-Pages refused** — MS proposes `x-up-1` (Openwave's
+///    proprietary header encoding). We can't decode it, so accepting means
+///    every subsequent request breaks. Kannel replaces the accepted list
+///    with a zero-data refusal entry (`01 86` on the wire).
+/// 3. **Encoding-Version: 1.3 in the headers block** — WAP-230 §8.4.2.70:
+///    absence defaults MS to WSP 1.2 encoding. Kannel always echoes `1.3`.
+///    Wire bytes: `C3 93` (field code 0x43 | 0x80 = 0xC3; version value
+///    (1<<4)|3 = 0x13 | 0x80 = 0x93).
 ///
 /// `server_session_id` is chosen by the gateway (see [`crate::wsp::session`]).
-/// `headers` is what we want to echo back to the MS in the header block;
-/// callers typically pass [`HeaderBlock::empty`] for now — WSP allows an
-/// empty header block on ConnectReply and Kannel does the same in practice.
-pub fn build_connect_reply(connect: &WspPdu, server_session_id: u32, headers: HeaderBlock) -> WapResult<WspPdu> {
-    let capabilities = match connect {
-        WspPdu::Connect { capabilities, .. } => capabilities.clone(),
+pub fn build_connect_reply(connect: &WspPdu, server_session_id: u32, _headers: HeaderBlock) -> WapResult<WspPdu> {
+    let ms_caps = match connect {
+        WspPdu::Connect { capabilities, .. } => capabilities,
         other => {
             return Err(WapError::WspDecode(format!(
                 "build_connect_reply called with non-Connect PDU {:?}",
@@ -312,6 +327,37 @@ pub fn build_connect_reply(connect: &WspPdu, server_session_id: u32, headers: He
             )));
         }
     };
+
+    let mut capabilities: Vec<Capability> = Vec::with_capacity(ms_caps.len());
+    for cap in ms_caps {
+        match cap {
+            // Sanitize (1): clear top 4 bits of Protocol-Options. MS proposes
+            // 0xF0 (Confirmed Push + Push + Suspend/Resume + Ack Headers)
+            // which we don't implement — echoing it dishonestly causes MS
+            // to later Abort the session.
+            Capability::ProtocolOptions(bits) => {
+                capabilities.push(Capability::ProtocolOptions(*bits & 0x0F));
+            }
+            // Sanitize (2): refuse Header-Code-Pages / Extended-Methods (both
+            // land under cap id 0x06 in our codec). Per WAP-230 §8.2.4.1 the
+            // server signals refusal by echoing the capability id with a
+            // zero-length payload → wire bytes `01 86`. Accepting means we
+            // claim to understand Openwave's `x-up-1` header encoding, and
+            // subsequent GETs would arrive with headers we can't decode.
+            Capability::ExtendedMethods(_) | Capability::HeaderCodePages(_) => {
+                capabilities.push(Capability::ExtendedMethods(Vec::new()));
+            }
+            // Everything else is echoed byte-for-byte.
+            other => capabilities.push(other.clone()),
+        }
+    }
+
+    // Sanitize (3): always emit Encoding-Version: 1.3 in the headers block.
+    // WAP-230 §8.4.1 well-known header encoding: field name = short-integer
+    // (bit 7 set + code in bits 6-0); Encoding-Version code = 0x43 → 0xC3.
+    // Value = version-value short-integer form for "1.3": (1<<4)|3 = 0x13 → 0x93.
+    let headers = HeaderBlock::from_bytes(vec![0xC3, 0x93]);
+
     Ok(WspPdu::ConnectReply {
         server_session_id,
         capabilities,
@@ -369,8 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn build_connect_reply_echoes_capabilities_verbatim() {
-        // Hand-craft a minimal Connect with the two Openwave-critical caps.
+    fn build_connect_reply_sanitizes_openwave_caps() {
+        // Hand-craft a Connect matching what MTP3550 sends.
         let connect = WspPdu::Connect {
             version: 0x10,
             capabilities: vec![
@@ -380,12 +426,21 @@ mod tests {
             headers: HeaderBlock::empty(),
         };
         let reply = build_connect_reply(&connect, 1, HeaderBlock::empty()).unwrap();
-        let WspPdu::ConnectReply { capabilities, .. } = &reply else {
+        let WspPdu::ConnectReply {
+            capabilities,
+            headers,
+            ..
+        } = &reply
+        else {
             panic!("build_connect_reply returned non-ConnectReply: {reply:?}");
         };
-        assert_eq!(capabilities.len(), 2);
-        assert_eq!(capabilities[0], Capability::ProtocolOptions(0xF0));
-        assert_eq!(capabilities[1], Capability::ExtendedMethods(vec![(0x10, b"x-up-1".to_vec())]));
+        // (1) Protocol-Options: top 4 bits cleared.
+        assert_eq!(capabilities[0], Capability::ProtocolOptions(0x00));
+        // (2) ExtendedMethods (cap id 0x06 in our codec = Header-Code-Pages
+        //     on the wire) refused with empty list.
+        assert_eq!(capabilities[1], Capability::ExtendedMethods(Vec::new()));
+        // (3) Headers block contains Encoding-Version: 1.3 short-integer form.
+        assert_eq!(headers.raw, vec![0xC3, 0x93]);
     }
 
     #[test]
