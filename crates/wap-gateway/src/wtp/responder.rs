@@ -87,7 +87,15 @@ impl Default for ResponderConfig {
             // TETRA one-way RTT (~1 s single-slot PDCH) so we don't spuriously
             // retx while a genuine Ack is in flight.
             t_ack: Duration::from_secs(2),
-            max_retx: 3,
+            // PD-10c-H29 (2026-07-11): reduced from 3 → 1. MTP3550 never
+            // sends the WAP-201 §9.5.7 final Ack; when it wants a fresh
+            // response it re-invokes with a new TID (H25 evicts the stale
+            // txn). Additional retx attempts were pure air spam — 3
+            // duplicate Results per transaction that MS ignored but couldn't
+            // reconcile with its session state, causing the "red blink"
+            // symptom. One retry covers pure air-loss cases; anything more
+            // is wasted PDCH slots.
+            max_retx: 1,
             idle_timeout: Duration::from_secs(90),
             // PD-10c-H28: sweep every 5 s (was 15 s). H25 evicts stale txns
             // when a new Invoke arrives on the same peer, so this only affects
