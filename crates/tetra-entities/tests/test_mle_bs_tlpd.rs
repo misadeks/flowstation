@@ -52,6 +52,7 @@ fn tlpd_unacknowledged_produces_bl_unitdata_req_with_discriminator() {
         air_interface_encryption: None,
         tx_reporter: None,
         chan_alloc: None,
+        al_link_number: None,
     };
     let sapmsg = SapMsg {
         sap: Sap::TlpdSap,
@@ -105,6 +106,7 @@ fn tlpd_acknowledged_produces_bl_data_req_with_discriminator() {
         air_interface_encryption: None,
         tx_reporter: None,
         chan_alloc: None,
+        al_link_number: None,
     };
     let sapmsg = SapMsg {
         sap: Sap::TlpdSap,
@@ -164,4 +166,123 @@ fn tlpd_wrong_variant_drops_with_error_log() {
     mle.rx_prim(&mut queue, sapmsg);
 
     assert!(queue.pop_front().is_none(), "queue must be empty after wrong variant");
+}
+
+/// PD-5c-H14: Acknowledged + packet_data_flag + `al_link_number: Some(n)`
+/// (populated by SNDCP after learning the MS's AL from an uplink AL frame,
+/// H13) must route the downlink onto `TlaTlDataReqAl` so LLC segments as
+/// AL-DATA on the correct N.261 link. Prior to H14 this dropped to BL-DATA
+/// and the MS's AL peer ignored it.
+#[test]
+fn tlpd_acknowledged_pd_with_al_link_produces_tla_data_req_al() {
+    let (mut mle, mut queue) = make_mle();
+
+    let sdu = BitBuffer::from_bitstr("11110000");
+    let prim = LtpdMleUnitdataReq {
+        main_address: test_addr(),
+        link_id: 4,
+        endpoint_id: 0,
+        sdu,
+        layer2service: Layer2Service::Acknowledged,
+        packet_data_flag: true,
+        air_interface_encryption: None,
+        tx_reporter: None,
+        chan_alloc: None,
+        al_link_number: Some(2),
+    };
+    let sapmsg = SapMsg {
+        sap: Sap::TlpdSap,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::LtpdMleUnitdataReq(prim),
+    };
+
+    mle.rx_prim(&mut queue, sapmsg);
+
+    let msg = queue.pop_front().expect("expected one message in queue");
+    assert!(queue.pop_front().is_none(), "expected exactly one message");
+
+    let SapMsgInner::TlaTlDataReqAl(out) = msg.msg else {
+        panic!("H14: expected TlaTlDataReqAl, got {:?}", msg.msg);
+    };
+
+    assert_eq!(msg.sap, Sap::TlaSap);
+    assert_eq!(msg.dest, TetraEntity::Llc);
+    assert_eq!(msg.src, TetraEntity::Mle);
+    assert_eq!(out.link_id, 4);
+    assert_eq!(out.endpoint_id, 0);
+    assert_eq!(out.al_link_number, 2, "N.261 index must be forwarded to LLC");
+
+    // Discriminator + SDU bits are preserved on the AL path.
+    let mut tl_sdu = out.tl_sdu;
+    tl_sdu.seek(0);
+    let discriminator = tl_sdu.read_bits(3).expect("3 discriminator bits");
+    assert_eq!(discriminator, 0b100, "SNDCP discriminator must be 0b100");
+    let sdu_bits = tl_sdu.read_bits(8).expect("8 SDU bits");
+    assert_eq!(sdu_bits, 0b11110000);
+}
+
+/// PD-5c-H14: Acknowledged + packet_data_flag but `al_link_number: None`
+/// (SNDCP has not yet learned an AL for this MS) must fall back to
+/// `TlaTlDataReqBl`. This keeps the pre-AL-learn flow (SN-ACTIVATE / PAGE
+/// REQUEST replies) intact on BL where the MS is monitoring.
+#[test]
+fn tlpd_acknowledged_pd_without_al_link_stays_bl() {
+    let (mut mle, mut queue) = make_mle();
+
+    let prim = LtpdMleUnitdataReq {
+        main_address: test_addr(),
+        link_id: 4,
+        endpoint_id: 0,
+        sdu: BitBuffer::from_bitstr("10101010"),
+        layer2service: Layer2Service::Acknowledged,
+        packet_data_flag: true,
+        air_interface_encryption: None,
+        tx_reporter: None,
+        chan_alloc: None,
+        al_link_number: None,
+    };
+    let sapmsg = SapMsg {
+        sap: Sap::TlpdSap,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::LtpdMleUnitdataReq(prim),
+    };
+
+    mle.rx_prim(&mut queue, sapmsg);
+    let msg = queue.pop_front().expect("expected one message in queue");
+    assert!(matches!(msg.msg, SapMsgInner::TlaTlDataReqBl(_)),
+        "H14: without al_link_number, must stay on BL-DATA");
+}
+
+/// PD-5c-H14: Acknowledged + `al_link_number: Some(_)` but `packet_data_flag:
+/// false` (e.g. hypothetical CMCE/MM ack traffic) must NOT route onto AL —
+/// only packet-data SN-DATA rides the Advanced Link in the H14 design.
+#[test]
+fn tlpd_acknowledged_non_pd_stays_bl() {
+    let (mut mle, mut queue) = make_mle();
+
+    let prim = LtpdMleUnitdataReq {
+        main_address: test_addr(),
+        link_id: 4,
+        endpoint_id: 0,
+        sdu: BitBuffer::from_bitstr("00001111"),
+        layer2service: Layer2Service::Acknowledged,
+        packet_data_flag: false,
+        air_interface_encryption: None,
+        tx_reporter: None,
+        chan_alloc: None,
+        al_link_number: Some(2),
+    };
+    let sapmsg = SapMsg {
+        sap: Sap::TlpdSap,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::LtpdMleUnitdataReq(prim),
+    };
+
+    mle.rx_prim(&mut queue, sapmsg);
+    let msg = queue.pop_front().expect("expected one message in queue");
+    assert!(matches!(msg.msg, SapMsgInner::TlaTlDataReqBl(_)),
+        "H14: without packet_data_flag, must stay on BL-DATA even if al_link_number is set");
 }

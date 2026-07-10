@@ -1189,6 +1189,33 @@ fn pd_al_uplink_learns_al_link_and_downlink_uses_it() {
         }
         other => panic!("H13: expected SN-DATA, got {other:?}"),
     }
+
+    // PD-5c-H14: SNDCP must also thread the N.261 al_link_number (4) on the
+    // outbound LtpdMleUnitdataReq so MLE can route the downlink onto AL. Prior
+    // to H14 this field did not exist and MLE fell back to TlaTlDataReqBl.
+    assert_eq!(
+        ltpd_dl.al_link_number, Some(4),
+        "H14: SNDCP must forward the cached AL number (4) on downlink SN-DATA"
+    );
+
+    // PD-5c-H14: and MLE must in turn emit TlaTlDataReqAl (not TlaTlDataReqBl)
+    // for LLC's AL segmenter. This is the primary fix — before H14, LLC saw
+    // BL-DATA and the MS's AL peer ignored it because BL-DATA does not advance
+    // the AL RX window.
+    let tla_al = dl_msgs.iter().find_map(|m| match &m.msg {
+        SapMsgInner::TlaTlDataReqAl(req) if req.main_address.ssi == TEST_ISSI => Some(req),
+        _ => None,
+    }).expect("H14: MLE must emit TlaTlDataReqAl for SNDCP AL-routed downlink");
+    assert_eq!(tla_al.link_id, 4, "H14: AL request link_id");
+    assert_eq!(tla_al.endpoint_id, 0, "H14: AL request endpoint_id");
+    assert_eq!(tla_al.al_link_number, 4, "H14: AL request N.261 index");
+
+    // And no TlaTlDataReqBl should have been emitted for this downlink SDU
+    // (the legacy BL path is the exact bug H14 fixes).
+    assert!(
+        find_tla_data_req_bl(&dl_msgs).is_none(),
+        "H14: downlink SN-DATA must NOT fall back to TlaTlDataReqBl once AL is known"
+    );
 }
 
 /// PD-5c-H13: If no AL uplink has been seen yet, downlink must fall back to
