@@ -24,6 +24,7 @@ tetra-entities = { workspace = true }
 # bluestation-bs needs a small multi-thread tokio runtime to host it.  All
 # SNDCP-facing calls (`push_uplink`, `try_pop_downlink`) are sync.
 pd-gateway = { path = "../pd-gateway" }
+wap-gateway = { path = "../../crates/wap-gateway" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 clap = { workspace = true }

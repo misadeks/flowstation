@@ -158,6 +158,21 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
     })
 }
 
+/// Shared tokio runtime used by `pd-gateway` and `wap-gateway`. Lazily
+/// constructed on first access and leaked for the process lifetime.
+fn shared_gateway_runtime() -> &'static tokio::runtime::Runtime {
+    use std::sync::OnceLock;
+    use tokio::runtime::Runtime;
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("pd-gateway-rt")
+            .build()
+            .expect("failed to build tokio runtime for pd-gateway / wap-gateway")
+    })
+}
+
 /// PD-9: Wire the pd-gateway crate into a freshly-constructed SNDCP entity.
 ///
 /// - Builds a leaked multi-thread tokio runtime (needed by `pd-gateway` for
@@ -172,17 +187,7 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
 /// Non-Linux (`TunOpen`) and other spawn failures are logged as warnings and
 /// SNDCP is left unwired — the stack still runs, IP queues just accumulate.
 fn wire_pd_gateway(sndcp: &mut Sndcp, pd: &tetra_config::bluestation::CfgPacketData) {
-    use std::sync::OnceLock;
-    use tokio::runtime::Runtime;
-
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    let rt = RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("pd-gateway-rt")
-            .build()
-            .expect("failed to build tokio runtime for pd-gateway")
-    });
+    let rt = shared_gateway_runtime();
 
     let gw_cfg = pd_gateway::GatewayConfig {
         tun_name: pd.tun_name.clone(),
@@ -250,6 +255,33 @@ fn wire_pd_gateway(sndcp: &mut Sndcp, pd: &tetra_config::bluestation::CfgPacketD
     eprintln!(
         " -> Packet data gateway enabled (TUN {}, {}/{}, MTU {})",
         gw_cfg.tun_name, gw_cfg.tun_addr, gw_cfg.tun_prefix_len, gw_cfg.mtu
+    );
+}
+
+/// PD-10: spawn the in-process WAP 1.x gateway on the shared pd-gateway
+/// tokio runtime. Reads `[wap_gateway]` from the main FlowStation config.
+///
+/// Errors from `wap_gateway::run` (socket bind failure, fatal I/O) are
+/// logged via `tracing::error!` — the surrounding stack continues to run
+/// so operators can diagnose via journalctl without losing the BS.
+fn wire_wap_gateway(wg: &tetra_config::bluestation::CfgWapGateway) {
+    let rt = shared_gateway_runtime();
+
+    let run_cfg = wap_gateway::RunConfig {
+        listen_addr: wg.listen_addr,
+        listen_port: wg.listen_port,
+        upstream_url: wg.upstream_url.clone(),
+    };
+
+    rt.spawn(async move {
+        if let Err(e) = wap_gateway::run(run_cfg).await {
+            tracing::error!("PD-10: wap-gateway task failed: {e}");
+        }
+    });
+
+    eprintln!(
+        " -> WAP gateway enabled ({}:{}, upstream {})",
+        wg.listen_addr, wg.listen_port, wg.upstream_url
     );
 }
 
@@ -341,6 +373,12 @@ fn build_bs_stack(
     // non-Linux `spawn_gateway_task` returns TunOpen; we warn and continue.
     if cfg.config().packet_data.enabled {
         wire_pd_gateway(&mut sndcp, &cfg.config().packet_data);
+    }
+    // PD-10: spawn the WAP 1.x gateway on the same tokio runtime as pd-gateway
+    // when [wap_gateway].enabled = true. Bind failures are logged as warnings
+    // so the stack still comes up (the gateway can be diagnosed via journalctl).
+    if cfg.config().wap_gateway.enabled {
+        wire_wap_gateway(&cfg.config().wap_gateway);
     }
     let mut cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
     // Wire the built-in WX/METAR service's reply channel: its background fetch threads

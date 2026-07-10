@@ -25,6 +25,7 @@ use super::sec_snom_notify::{CfgSnomNotifyDto, apply_snom_notify_patch};
 use super::sec_telegram::{CfgTelegramDto, apply_telegram_patch};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
 use super::sec_tpg2200_action::{CfgTpg2200ActionDto, apply_tpg2200_action_patch};
+use super::sec_wap_gateway::{CfgWapGatewayDto, apply_wap_gateway_patch};
 use super::sec_wx::{CfgWxServiceDto, apply_wx_service_patch};
 use super::{PhyIoDto, phy_dto_to_cfg};
 
@@ -206,6 +207,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     }
 
+    // Optional wap_gateway section — reject unknown keys.
+    if let Some(ref wg) = root.wap_gateway
+        && !wg.extra.is_empty()
+    {
+        return Err(format!("Unrecognized fields in wap_gateway config: {:?}", sorted_keys(&wg.extra)).into());
+    }
+
     // Build cell config, then inject the separately-parsed neighbor cells and sds_command_control
     let mut cell_cfg = cell_dto_to_cfg(root.cell_info);
     cell_cfg.neighbor_cells_ca = neighbor_cells_ca;
@@ -259,7 +267,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         emergency: apply_emergency_patch(root.emergency.unwrap_or_default()),
         llc: apply_llc_patch(root.llc.unwrap_or_default())?,
         packet_data: apply_packet_data_patch(root.packet_data)?,
+        // `wap_gateway` is filled in below (needs packet_data.tun_addr).
+        wap_gateway: crate::bluestation::sec_wap_gateway::CfgWapGateway::disabled(std::net::Ipv4Addr::UNSPECIFIED),
     };
+
+    // Now that packet_data is materialised, resolve wap_gateway (defaults
+    // listen_addr from packet_data.tun_addr).
+    cfg.wap_gateway = apply_wap_gateway_patch(root.wap_gateway.unwrap_or_default(), cfg.packet_data.tun_addr)?;
 
     if let Some(brew) = root.brew {
         cfg.brew = Some(apply_brew_patch(brew));
@@ -339,6 +353,7 @@ struct TomlConfigRoot {
     emergency: Option<CfgEmergencyDto>,
     llc: Option<CfgLlcDto>,
     packet_data: Option<PacketDataDto>,
+    wap_gateway: Option<CfgWapGatewayDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,

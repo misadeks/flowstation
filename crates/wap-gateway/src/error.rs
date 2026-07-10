@@ -11,9 +11,6 @@ pub enum WapError {
     #[error("configuration error: {0}")]
     Config(String),
 
-    #[error("failed to parse TOML: {0}")]
-    Toml(#[from] toml::de::Error),
-
     #[error("WTP PDU decode error: {0}")]
     WtpDecode(String),
 

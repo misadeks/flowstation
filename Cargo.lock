@@ -171,6 +171,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "wap-gateway",
 ]
 
 [[package]]
@@ -2453,16 +2454,11 @@ dependencies = [
 name = "wap-gateway"
 version = "0.3.9"
 dependencies = [
- "anyhow",
  "bytes",
- "clap",
  "dashmap",
- "serde",
  "thiserror 2.0.18",
  "tokio",
- "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
