@@ -80,12 +80,20 @@ pub struct ResponderConfig {
 impl Default for ResponderConfig {
     fn default() -> Self {
         Self {
-            // TETRA RTT can reach 1.5 s; 4 s gives headroom over the WAP-201
-            // default of 3 s without triggering MS-side Abort (~15 s).
-            t_ack: Duration::from_secs(4),
+            // PD-10c-H28 (2026-07-11): tightened from 4 s → 2 s. Hardware log
+            // showed every WSP transaction takes at least one WTP retx before
+            // MS ACKs (MTP3550 firmware skips the WAP-201 §9.5.7 final Ack in
+            // many cases). Faster retx = faster time-to-render. Still above
+            // TETRA one-way RTT (~1 s single-slot PDCH) so we don't spuriously
+            // retx while a genuine Ack is in flight.
+            t_ack: Duration::from_secs(2),
             max_retx: 3,
             idle_timeout: Duration::from_secs(90),
-            sweep_interval: Duration::from_secs(15),
+            // PD-10c-H28: sweep every 5 s (was 15 s). H25 evicts stale txns
+            // when a new Invoke arrives on the same peer, so this only affects
+            // txns that idle out without any follow-up. Faster sweep = tighter
+            // resource use with negligible CPU overhead.
+            sweep_interval: Duration::from_secs(5),
             hold_on_ack_delay: Duration::from_millis(2500),
         }
     }
