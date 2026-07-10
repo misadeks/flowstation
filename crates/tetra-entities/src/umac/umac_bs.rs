@@ -1632,21 +1632,19 @@ impl UmacBs {
             // PD-5c-H2: piggybacked PDCH grant on the same PDU as an SDU
             // (typically the SN-DATA-TRANSMIT-RESPONSE). Do the PDCH bookkeeping
             // here so the AACH flips to AssignedControl/AssignedOnly on the
-            // granted timeslot and the allocator tracks the reservation. This
-            // mirrors what `emit_pdch_mac_resource` used to do for the deleted
-            // standalone-grant path.
+            // granted timeslot and the allocator tracks the reservation.
             //
             // PD-5c-H20 (2026-07-10 hardware fix): must ALSO gate on
-            // `prim.packet_data_flag == true`. Voice call D-CONNECT/D-SETUP carry
-            // a `chan_alloc` with `alloc_type: Replace` addressed to the caller's
-            // ISSI too — without the packet_data_flag guard we hijacked that voice
-            // grant as a PDCH grant, flipping AACH on the voice timeslot to
-            // AssignedControl and confusing the MS: D-CONNECT said voice, AACH
-            // said PDCH, MS auto-released PTT after ~500 ms. Symptom manifested
-            // only when `[packet_data].enabled = true` in the config (i.e. this
-            // block runs), which correlates with the user's PTT-broken report.
+            // `chan_alloc.usage.is_none()`. Voice call D-CONNECT / D-SETUP carry
+            // a `chan_alloc` addressed to the caller's ISSI too, with
+            // `usage = Some(4)` (voice traffic). Without a `usage.is_none()`
+            // guard we hijacked that voice grant as a PDCH grant, flipping
+            // AACH on the voice timeslot to AssignedControl and confusing the
+            // MS: D-CONNECT said voice, AACH said PDCH, MS auto-released PTT
+            // after ~500 ms. Real PDCH grants (from SNDCP
+            // SN-DATA-TRANSMIT-RESPONSE) carry `usage: None`.
             if self.packet_data_enabled
-                && prim.packet_data_flag
+                && chan_alloc.usage.is_none()
                 && prim.main_address.ssi_type == SsiType::Issi
                 && matches!(
                     chan_alloc.alloc_type,
