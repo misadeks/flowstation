@@ -37,9 +37,11 @@ use tetra_pdus::sndcp::fields::mtu::Mtu;
 use tetra_pdus::sndcp::fields::nsapi::Nsapi;
 use tetra_pdus::sndcp::fields::pco::{Pco, PcoEntry};
 use tetra_pdus::sndcp::fields::timer_value::{ReadyTimer, ResponseWaitTimer, StandbyTimer};
+use tetra_pdus::sndcp::enums::deactivation_type::DeactivationType;
 use tetra_pdus::sndcp::pdus::{
-    ActivatePdpContextAccept, ActivatePdpContextReject, DeactivatePdpContextAccept, PageRequest,
-    SnData, SnDataTransmitRequest, SnDataTransmitResponse, SnPdu, Unitdata,
+    ActivatePdpContextAccept, ActivatePdpContextReject, DeactivatePdpContextAccept,
+    DeactivatePdpContextDemand, PageRequest, SnData, SnDataTransmitRequest, SnDataTransmitResponse,
+    SnPdu, Unitdata,
 };
 
 use crate::{MessageQueue, TetraEntityTrait};
@@ -666,6 +668,37 @@ impl Sndcp {
                 queue, main_address, ind.link_id, ind.endpoint_id,
                 sdu, Layer2Service::Acknowledged, false,
             );
+
+            // PD-5c-H31 (2026-07-11): when we reject with UnknownNsapi (context
+            // is genuinely gone — usually because the BS was restarted while
+            // MS kept its cached PDP context), ALSO emit an SN-DEACTIVATE PDP
+            // CONTEXT DEMAND (network-initiated) so the MS drops its stale
+            // context and goes back through the full ACTIVATE handshake. Per
+            // ETSI EN 300 392-5 §5.6, this is the correct network-side way to
+            // recover from a lost context. Without it, MTP3550 firmware just
+            // keeps re-sending the same SN-DATA-TRANSMIT-REQUEST forever, and
+            // the user sees "browser opens but nothing happens".
+            if matches!(cause, TransmitResponseRejectCause::UnknownNsapi) {
+                let deact = DeactivatePdpContextDemand {
+                    deactivation_type: DeactivationType::NetworkInitiated,
+                    nsapi: req.nsapi,
+                    snei: None,
+                };
+                let mut sdu = BitBuffer::new_autoexpand(32);
+                if let Err(e) = deact.to_bitbuf(&mut sdu) {
+                    tracing::warn!("SNDCP: H31 failed to encode DEACTIVATE-DEMAND: {e:?}");
+                    return;
+                }
+                sdu.seek(0);
+                send_downlink(
+                    queue, main_address, ind.link_id, ind.endpoint_id,
+                    sdu, Layer2Service::Acknowledged, false,
+                );
+                tracing::info!(
+                    "SNDCP: H31 -> SN-DEACTIVATE PDP CONTEXT DEMAND (NetworkInitiated) to {:?} NSAPI={nsapi}",
+                    main_address
+                );
+            }
             return;
         }
 
