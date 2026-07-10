@@ -87,15 +87,17 @@ impl Default for ResponderConfig {
             // TETRA one-way RTT (~1 s single-slot PDCH) so we don't spuriously
             // retx while a genuine Ack is in flight.
             t_ack: Duration::from_secs(2),
-            // PD-10c-H29 (2026-07-11): reduced from 3 → 1. MTP3550 never
-            // sends the WAP-201 §9.5.7 final Ack; when it wants a fresh
-            // response it re-invokes with a new TID (H25 evicts the stale
-            // txn). Additional retx attempts were pure air spam — 3
-            // duplicate Results per transaction that MS ignored but couldn't
-            // reconcile with its session state, causing the "red blink"
-            // symptom. One retry covers pure air-loss cases; anything more
-            // is wasted PDCH slots.
-            max_retx: 1,
+            // PD-10c-H30 (2026-07-11): max_retx from 1 → 0. Hardware log
+            // 01:09 proved MS receives our Result cleanly — the LLC layer
+            // reports "AL N(S)=X fully acknowledged" ~1.4s after we send it.
+            // MS just doesn't send the WAP-201 §9.5.7 WTP final Ack.
+            // Retransmitting was retx'ing content that MS already had; each
+            // duplicate AL SDU was confusing MTP3550's session state and
+            // causing the red-blink UI symptom. Zero retries + rely on the
+            // LLC AL-ACK for delivery confirmation. If MS actually loses the
+            // Result (rare, one-off air loss with no LLC ACK), MS re-invokes
+            // with a fresh TID and H25 evicts the stale txn.
+            max_retx: 0,
             idle_timeout: Duration::from_secs(90),
             // PD-10c-H28: sweep every 5 s (was 15 s). H25 evicts stale txns
             // when a new Invoke arrives on the same peer, so this only affects
