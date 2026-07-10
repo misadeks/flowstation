@@ -30,8 +30,191 @@ use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tla::{TlaTlDataIndAl, TlaTlDataReqBl, TlaTlUnitdataReqBl};
-use tetra_saps::tma::TmaUnitdataReq;
+use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::tmv::TmvUnitdataReqSlots;
+
+use tetra_entities::llc::llc_bs_ms::AlLinkKey;
+use tetra_pdus::llc::enums::advanced_link_service::AdvancedLinkService;
+use tetra_pdus::llc::enums::advanced_link_symmetry::AdvancedLinkSymmetry;
+use tetra_pdus::llc::enums::data_transfer_throughput::DataTransferThroughput;
+use tetra_pdus::llc::enums::max_tl_sdu_length_n271::MaxTlSduLengthN271;
+use tetra_pdus::llc::enums::setup_report::SetupReport;
+use tetra_pdus::llc::pdus::al_ack::{AckLength, AcknowledgementBlock, AlAckAlRnr, AlAckAlRnrKind};
+use tetra_pdus::llc::pdus::al_setup::AlSetup;
+
+/// PD-5c-H15: Feed an AL PDU (already encoded as `BitBuffer`) into LLC as a
+/// `TmaUnitdataInd` on the given (link_id, endpoint_id).  Used by PD-5c-H15
+/// burst tests that need to prime LLC's `al_links` state (AL-SETUP) or drive
+/// the AL-ACK path.
+fn make_al_tma_ind(pdu: BitBuffer, issi: u32, link_id: u32, endpoint_id: u32) -> SapMsg {
+    SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+            carrier_num: 1521,
+            pdu: Some(pdu),
+            main_address: TetraAddress::new(issi, SsiType::Issi),
+            scrambling_code: 0,
+            link_id,
+            endpoint_id,
+            new_endpoint_id: None,
+            css_endpoint_id: None,
+            air_interface_encryption: 0,
+            chan_change_response_req: false,
+            chan_change_handle: None,
+            chan_info: None,
+        }),
+    }
+}
+
+/// PD-5c-H15: On a downlink burst of two IP packets in the same tick, the LLC
+/// AL layer must gate at one outstanding SDU (per Original-AL peer
+/// serialization) and hold the second SDU in `pending_sdus` until N(S)=0 is
+/// AL-ACKed.  This is the exact scenario that broke on the Motorola MTP3550
+/// when Kannel sent WSP-ConnectReply back-to-back with WSP-Reply.
+#[test]
+fn pd_al_downlink_burst_of_two_serializes_under_conn_w_zero() {
+    debug::setup_logging_verbose();
+
+    let mut stack = TestStack::new();
+
+    // 1. Activate PDP context (BL flow, standard).
+    stack.queue.push_back(make_uplink_ind(
+        build_activate_demand_pdu(TEST_NSAPI),
+        TEST_ISSI,
+    ));
+    let setup = tick_stack(&mut stack);
+    let accept = match decode_dl_from_sdu(
+        &find_ltpd_unitdata_req(&setup).expect("ACCEPT missing").sdu,
+    ) {
+        SnPdu::ActivatePdpContextAccept(a) => a,
+        other => panic!("expected ACCEPT, got {other:?}"),
+    };
+    let allocated_ip = accept.ip4_address.expect("ACCEPT must carry IPv4");
+
+    // 2. MS opens an Advanced Link.  Feed AL-SETUP into LLC so `al_links`
+    //    contains an Established entry with `connection_width=0`.
+    const AL_LINK_ID: u32 = 4;
+    const AL_ENDPOINT_ID: u32 = 0;
+    const AL_N261: u8 = 1;
+    let setup_pdu = AlSetup {
+        advanced_link_service: AdvancedLinkService::Ack,
+        advanced_link_number_n261: AL_N261,
+        max_tl_sdu_length_n271: MaxTlSduLengthN271::Bytes256,
+        connection_width: 0, // Original AL — triggers serialization override.
+        advanced_link_symmetry: AdvancedLinkSymmetry::Symmetric,
+        n264_dqpsk_ts_uplink: None,
+        n264_dqpsk_ts_downlink: None,
+        data_transfer_throughput: DataTransferThroughput::NetworkDependentMin,
+        tl_sdu_window_size_n272_n281: 3, // Peer advertises 3, we still clamp to 1.
+        max_retx_n273_or_repetition_n282: 3,
+        max_segment_retx_n274: 3,
+        setup_report: SetupReport::ServiceDefinition,
+        n_s: None,
+        advanced_link_type: None,
+        n272_n281_augmented: None,
+        reserved: None,
+    };
+    let mut setup_buf = BitBuffer::new_autoexpand(64);
+    setup_pdu.to_bitbuf(&mut setup_buf);
+    setup_buf.seek(0);
+    stack.queue.push_back(make_al_tma_ind(
+        setup_buf, TEST_ISSI, AL_LINK_ID, AL_ENDPOINT_ID,
+    ));
+    let _ = tick_stack(&mut stack);
+
+    let al_key = AlLinkKey::from_prim(
+        TetraAddress::new(TEST_ISSI, SsiType::Issi),
+        AL_LINK_ID, AL_ENDPOINT_ID, AL_N261,
+    );
+    {
+        let link = stack.llc.al_links.get(&al_key).expect("AL link must be Established");
+        assert_eq!(link.tx_window, 3, "negotiated window is 3");
+        assert_eq!(link.effective_tx_sdu_window, 1,
+            "PD-5c-H15: connection_width=0 clamps effective window to 1");
+    }
+
+    // 3. Prime MLE's AL-mapping cache with an uplink AL-DATA-Ind so downlink
+    //    SN-DATA is routed through TLA-DATA-Req-Al (not BL).
+    stack.queue.push_back(make_uplink_ind_al_at(
+        build_sn_data_pdu(TEST_NSAPI, &[0x45, 0x00, 0x00, 0x1c][..]),
+        TEST_ISSI, AL_LINK_ID, AL_ENDPOINT_ID, AL_N261,
+    ));
+    let _ = tick_stack(&mut stack);
+    let _ = stack.sndcp.uplink_ip_queue.pop_front();
+
+    // 4. Feed two downlink IP packets back-to-back (the WSP-ConnectReply +
+    //    WSP-Reply scenario).
+    let ip1: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x0a, 0x00, 0x00,
+        0x40, 0x06, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x01,
+        0xc0, 0xa8, 0x64, 0x02,
+        // TCP-ish payload padding for two distinct SDUs.
+        0x00, 0x50, 0xdd, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x20, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+    let ip2: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x0b, 0x00, 0x00,
+        0x40, 0x06, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x01,
+        0xc0, 0xa8, 0x64, 0x02,
+        0x00, 0x50, 0xdd, 0x01, 0x00, 0x00, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x20, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xaa, 0xbb, 0xcc, 0xdd,
+    ];
+    stack.sndcp.feed_downlink_ip_acknowledged(
+        &mut stack.queue,
+        GatewayDownlink { dest_ipv4: allocated_ip, payload: ip1 },
+    );
+    stack.sndcp.feed_downlink_ip_acknowledged(
+        &mut stack.queue,
+        GatewayDownlink { dest_ipv4: allocated_ip, payload: ip2 },
+    );
+    let _ = tick_stack(&mut stack);
+
+    // 5. Assert LLC held the second SDU in pending_sdus.
+    {
+        let link = stack.llc.al_links.get(&al_key).expect("AL link");
+        assert_eq!(link.outstanding_sdus.len(), 1,
+            "burst of 2 downlink IPs must produce exactly 1 outstanding SDU under conn_w=0");
+        assert_eq!(link.pending_sdus.len(), 1,
+            "the second SDU must be held in pending_sdus until N(S)=0 is ACKed");
+        assert_eq!(link.outstanding_sdus[0].n_s, 0,
+            "first SDU wears N(S)=0");
+    }
+
+    // 6. Simulate MS AL-ACK for N(S)=0.  LLC must retire N(S)=0 from
+    //    outstanding_sdus and promote the pending SDU (which then wears N(S)=1).
+    let ack_pdu = AlAckAlRnr {
+        kind: AlAckAlRnrKind::Ack,
+        first_block: AcknowledgementBlock {
+            n_r: 0,
+            ack_length: AckLength::EntireSduReceived,
+            s_r: None,
+            ack_bitmap: None,
+        },
+        other_blocks: vec![],
+    };
+    let mut ack_buf = BitBuffer::new_autoexpand(64);
+    ack_pdu.to_bitbuf(&mut ack_buf);
+    ack_buf.seek(0);
+    stack.queue.push_back(make_al_tma_ind(
+        ack_buf, TEST_ISSI, AL_LINK_ID, AL_ENDPOINT_ID,
+    ));
+    let _ = tick_stack(&mut stack);
+
+    let link = stack.llc.al_links.get(&al_key).expect("AL link");
+    assert_eq!(link.pending_sdus.len(), 0,
+        "pending SDU must drain after AL-ACK for N(S)=0");
+    assert_eq!(link.outstanding_sdus.len(), 1,
+        "the promoted second SDU now occupies the window");
+    assert_eq!(link.outstanding_sdus[0].n_s, 1,
+        "the second SDU wears N(S)=1 (only started segmenting after N(S)=0 was ACKed)");
+}
 
 // â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

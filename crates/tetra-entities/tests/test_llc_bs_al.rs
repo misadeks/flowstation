@@ -75,6 +75,21 @@ fn make_setup_pdu(report: SetupReport) -> AlSetup {
     }
 }
 
+/// Build an Extended-AL AL-SETUP PDU (connection_width=1, window=3).
+///
+/// Used in tests that need the negotiated window to be honored (i.e. multiple
+/// outstanding SDUs allowed).  In the default `make_setup_pdu`, `connection_width=0`
+/// (Original AL) triggers the PD-5c-H15 serialization override that caps
+/// `effective_tx_sdu_window` at 1 regardless of the negotiated window.
+fn make_setup_pdu_extended(report: SetupReport) -> AlSetup {
+    AlSetup {
+        connection_width: 1,
+        n264_dqpsk_ts_uplink: Some(1),
+        n264_dqpsk_ts_downlink: None,
+        ..make_setup_pdu(report)
+    }
+}
+
 /// Wrap a serialised PDU `BitBuffer` in a `TmaUnitdataInd` and then a `SapMsg`
 /// addressed LLC ← Umac on `TmaSap`.
 fn make_tma_ind(pdu: BitBuffer) -> SapMsg {
@@ -572,7 +587,8 @@ fn al_reconnect_propose_from_peer_accepted() {
 fn al_sdu_window_full_buffers_in_pending() {
     debug::setup_logging_verbose();
     let (mut llc, mut queue) = make_llc();
-    establish_link(&mut llc, &mut queue);
+    // Extended-AL peer so `effective_tx_sdu_window == tx_window == 3` (see PD-5c-H15).
+    send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu_extended(SetupReport::ServiceDefinition));
     drain_queue(&mut queue);
 
     // Flood the window (tx_window = 3).
@@ -588,6 +604,143 @@ fn al_sdu_window_full_buffers_in_pending() {
     let link = llc.al_links.get(&test_key()).unwrap();
     assert_eq!(link.pending_sdus.len(), 1, "fourth SDU must be buffered in pending_sdus");
     assert_eq!(link.outstanding_sdus.len(), 3, "window must still have 3 SDUs");
+}
+
+// ─── PD-5c-H15: Original-AL peer forces max-1 outstanding SDU ────────────────
+//
+// The default `make_setup_pdu` uses `connection_width == 0` (Original AL,
+// single-slot, non-DQPSK) which matches the observed Motorola MTP3550 peer
+// that cannot handle pipelined SDUs.  The LLC must gate outstanding TX SDUs
+// at 1 regardless of the negotiated window field.
+
+/// With `connection_width == 0`, two rapid `TLA-DATA-Req-Al` primitives result
+/// in exactly one outstanding SDU and one pending SDU.
+#[test]
+fn al_conn_w_zero_serializes_tx() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue); // connection_width=0, win=3
+    drain_queue(&mut queue);
+
+    // Sanity: the negotiated window is still 3 for spec-modulus arithmetic,
+    // but the effective gate is 1.
+    {
+        let link = llc.al_links.get(&test_key()).expect("link must exist");
+        assert_eq!(link.tx_window, 3);
+        assert_eq!(link.effective_tx_sdu_window, 1,
+            "connection_width == 0 must clamp effective window to 1");
+    }
+
+    llc.tick_start(&mut queue, TdmaTime::default());
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"first".to_vec()));
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"second".to_vec()));
+
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.outstanding_sdus.len(), 1,
+        "only one SDU may be outstanding under conn_w=0 serialization");
+    assert_eq!(link.pending_sdus.len(), 1,
+        "second SDU must be buffered in pending_sdus");
+    assert_eq!(link.outstanding_sdus[0].n_s, 0);
+}
+
+/// After AL-ACK for N(S)=0, the pending second SDU is automatically promoted
+/// to outstanding and segmentation begins.
+#[test]
+fn al_pending_sdu_drains_on_ack() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"first".to_vec()));
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"second".to_vec()));
+    drain_queue(&mut queue);
+    {
+        let link = llc.al_links.get(&test_key()).unwrap();
+        assert_eq!(link.outstanding_sdus.len(), 1);
+        assert_eq!(link.pending_sdus.len(), 1);
+    }
+
+    // Peer ACKs N(S)=0 → outstanding retires; the drain loop in
+    // submit_al_activity_to_umac (invoked from tick_end) must promote the
+    // pending SDU to outstanding and emit its AL-DATA PDUs.
+    let ack_pdu = AlAckAlRnr {
+        kind: AlAckAlRnrKind::Ack,
+        first_block: AcknowledgementBlock {
+            n_r: 0,
+            ack_length: AckLength::EntireSduReceived,
+            s_r: None,
+            ack_bitmap: None,
+        },
+        other_blocks: vec![],
+    };
+    let mut buf = BitBuffer::new_autoexpand(64);
+    ack_pdu.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_tma_ind(buf));
+    let msgs = drain_queue(&mut queue);
+
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.pending_sdus.len(), 0, "pending SDU must drain after ACK");
+    assert_eq!(link.outstanding_sdus.len(), 1,
+        "the promoted SDU now occupies the window (N(S)=1)");
+    assert_eq!(link.outstanding_sdus[0].n_s, 1,
+        "the second SDU inherits N(S)=1");
+
+    let umac_pdus: Vec<_> = msgs.iter()
+        .filter(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_)))
+        .collect();
+    assert!(!umac_pdus.is_empty(),
+        "AL-DATA PDUs for the promoted SDU must be emitted");
+}
+
+/// Regression: a single low-rate SDU still segments and completes as before —
+/// the serialization gate must not change single-SDU behavior.
+#[test]
+fn al_single_sdu_unaffected_by_serialization_gate() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"just one".to_vec()));
+
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.outstanding_sdus.len(), 1, "single SDU must be outstanding");
+    assert_eq!(link.pending_sdus.len(), 0, "no pending");
+    assert_eq!(link.outstanding_sdus[0].n_s, 0);
+
+    let msgs = drain_queue(&mut queue);
+    let umac_pdus: Vec<_> = msgs.iter()
+        .filter(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_)))
+        .collect();
+    assert!(!umac_pdus.is_empty(), "AL-DATA PDUs must be emitted immediately");
+}
+
+/// With `connection_width == 1` (Extended AL), the negotiated window is honored
+/// and multiple SDUs may be outstanding concurrently.
+#[test]
+fn al_conn_w_one_honors_negotiated_window() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu_extended(SetupReport::ServiceDefinition));
+    drain_queue(&mut queue);
+
+    {
+        let link = llc.al_links.get(&test_key()).unwrap();
+        assert_eq!(link.tx_window, 3);
+        assert_eq!(link.effective_tx_sdu_window, 3,
+            "connection_width == 1 must preserve the negotiated window");
+    }
+
+    for i in 0..3u8 {
+        llc.rx_prim(&mut queue, make_tla_data_req_al_sap(vec![i; 10]));
+    }
+
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.outstanding_sdus.len(), 3,
+        "extended-AL peer must allow all three SDUs concurrent");
+    assert_eq!(link.pending_sdus.len(), 0, "nothing buffered");
 }
 
 /// Sending an SDU to an unknown AL link through the SAP must be a silent drop.

@@ -159,8 +159,16 @@ pub struct AlLink {
     // ── Negotiated parameters ─────────────────────────────────────────────────
     pub service: AdvancedLinkService,
     pub max_tl_sdu_octets: u16,
-    /// N.272 — window size; 1..=3 for original AL.
+    /// N.272 — window size; 1..=3 for original AL.  Drives the N(S) modulus
+    /// so peer ACK-window arithmetic stays spec-compliant.
     pub tx_window: u8,
+    /// Effective concurrency cap on outstanding TX SDUs.  Distinct from
+    /// `tx_window`: for a peer negotiating `connection_width == 0` (Original
+    /// AL, single-slot, non-DQPSK) we force this to 1 because such peers
+    /// cannot pipeline SDUs even if `tl_sdu_window_size_n272_n281` advertises
+    /// a larger window.  For `connection_width == 1` (Extended AL) we honor
+    /// the negotiated window.  See PD-5c-H15.
+    pub effective_tx_sdu_window: u8,
     /// N.273 — max SDU retransmissions.
     pub max_sdu_retx: u8,
     /// N.274 — max per-segment retransmissions.
@@ -1425,6 +1433,15 @@ impl Llc {
         } else {
             pdu.tl_sdu_window_size_n272_n281
         };
+        // PD-5c-H15: peers negotiating Original AL (`connection_width == 0`)
+        // are single-slot and cannot pipeline SDUs at line rate even if the
+        // window field advertises otherwise; serialize to 1 outstanding SDU.
+        // Extended AL peers keep the negotiated window.
+        let effective_tx_sdu_window = if pdu.connection_width == 0 {
+            1
+        } else {
+            tx_window
+        };
         let max_tl_sdu_octets = pdu.max_tl_sdu_length_n271.octets();
 
         // Accept: create or update the link.
@@ -1435,6 +1452,7 @@ impl Llc {
             service: pdu.advanced_link_service,
             max_tl_sdu_octets,
             tx_window,
+            effective_tx_sdu_window,
             max_sdu_retx: pdu.max_retx_n273_or_repetition_n282,
             max_segment_retx: pdu.max_segment_retx_n274,
             next_n_s: 0,
@@ -1466,6 +1484,7 @@ impl Llc {
         link.service = pdu.advanced_link_service;
         link.max_tl_sdu_octets = max_tl_sdu_octets;
         link.tx_window = tx_window;
+        link.effective_tx_sdu_window = effective_tx_sdu_window;
         link.max_sdu_retx = pdu.max_retx_n273_or_repetition_n282;
         link.max_segment_retx = pdu.max_segment_retx_n274;
 
@@ -1925,6 +1944,10 @@ impl Llc {
                         service: pdu.advanced_link_service,
                         max_tl_sdu_octets: al_cfg.max_tl_sdu_octets,
                         tx_window: al_cfg.tx_window,
+                        // No SETUP PDU on the reconnect self-heal path, so we
+                        // fall back to the config default without the
+                        // conservative `connection_width == 0` override.
+                        effective_tx_sdu_window: al_cfg.tx_window,
                         max_sdu_retx: al_cfg.max_sdu_retx,
                         max_segment_retx: al_cfg.max_segment_retx,
                         next_n_s: 0,
@@ -2245,7 +2268,7 @@ impl Llc {
             let mut to_send = Vec::new();
             for (key, link) in self.al_links.iter_mut() {
                 if link.phase == AlPhase::Established {
-                    while link.outstanding_sdus.len() < link.tx_window as usize {
+                    while link.outstanding_sdus.len() < link.effective_tx_sdu_window as usize {
                         if let Some(sdu) = link.pending_sdus.pop_front() {
                             to_send.push((*key, sdu));
                         } else {
@@ -2397,7 +2420,7 @@ impl Llc {
             return Err(AlError::SduTooLarge { got: sdu.len(), max: link.max_tl_sdu_octets });
         }
 
-        if link.outstanding_sdus.len() >= link.tx_window as usize {
+        if link.outstanding_sdus.len() >= link.effective_tx_sdu_window as usize {
             link.pending_sdus.push_back(sdu);
             return Ok(());
         }
