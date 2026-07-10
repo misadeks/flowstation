@@ -128,7 +128,10 @@ impl Default for CfgPacketDataTimers {
 #[derive(Debug, Clone)]
 pub struct CfgPacketDataPdch {
     /// Release a PDCH assignment after this many idle MAC frames.
-    /// Default: 18 (≈ 1 s at 18 frames/s).  Valid range: 1..=1024.
+    /// Default: 300 (≈ 17 s at 56 ms/frame). Real hardware needs enough
+    /// time for the browser to form and send an HTTP request after PDP
+    /// context activation — 18 frames (~1 s) is too aggressive and
+    /// causes MS to bounce SNDCP repeatedly. Valid range: 1..=1024.
     pub idle_release_frames: u32,
     /// Permit multi-slot PDCH.  V1 default: `false`.
     pub multi_slot: bool,
@@ -262,7 +265,7 @@ fn default_ready_timer() -> u8 { 8 }
 fn default_standby_timer() -> u8 { 5 }
 fn default_resp_wait_timer() -> u8 { 8 }
 fn default_pdu_priority_max() -> u8 { 4 }
-fn default_idle_release_frames() -> u32 { 18 }
+fn default_idle_release_frames() -> u32 { 300 }
 fn default_channel_width() -> u8 { 0 }
 
 // ─── Public helpers ───────────────────────────────────────────────────────────
@@ -502,7 +505,7 @@ mod tests {
         assert_eq!(cfg.timers.standby_timer, 5);
         assert_eq!(cfg.timers.resp_wait_timer, 8);
         assert_eq!(cfg.timers.pdu_priority_max, 4);
-        assert_eq!(cfg.pdch.idle_release_frames, 18);
+        assert_eq!(cfg.pdch.idle_release_frames, 300);
         assert!(!cfg.pdch.multi_slot);
         assert_eq!(cfg.pdch.channel_width, 0);
     }
