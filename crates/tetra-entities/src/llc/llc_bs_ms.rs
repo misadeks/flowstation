@@ -2129,9 +2129,21 @@ impl Llc {
                     };
                     let has_unacked = sdu.acked_segments.iter().any(|&a| !a);
                     if needs_retx && has_unacked {
+                        // PD-5c-H26 (2026-07-11 MTP3550 fix): peer-requested
+                        // retransmission (SduFcsFailure ACK sets `force_retx`)
+                        // is a different animal from time-based retx. When the
+                        // MS explicitly tells us "I got the SDU but the FCS
+                        // failed, please resend", honoring that is essential
+                        // for TETRA AL correctness — MS is still holding the
+                        // AL link open for our retry. Dropping in that case
+                        // caused MS to send AL-RECONNECT (link reset), forcing
+                        // a WSP-CONNECT loop and a red-blinking radio.
+                        // Time-based retx (T.252 expired, no ACK at all)
+                        // still honors max_sdu_retx.
+                        let peer_requested_retx = sdu.force_retx;
                         // Use the link's per-negotiated max_sdu_retx (from SETUP PDU or config
                         // default for reconnect-fallback links) rather than the global constant.
-                        if sdu.retx_count >= link.max_sdu_retx {
+                        if sdu.retx_count >= link.max_sdu_retx && !peer_requested_retx {
                             // PD-5c-H19: with max_sdu_retx=0 (MS-negotiated for Original AL /
                             // Motorola MTP3550), we've already transmitted the SDU once and by
                             // spec have no retry budget. Prior behaviour dropped with a WARN
@@ -2156,6 +2168,22 @@ impl Llc {
                             }
                             sdus_to_remove.push(sdu.n_s);
                             continue;
+                        }
+                        if peer_requested_retx && sdu.retx_count >= 3 {
+                            // Even peer-requested retx has an upper bound to avoid
+                            // infinite loops if the RF environment is genuinely broken.
+                            tracing::warn!(
+                                "AL link {:?} N(S)={} exceeded peer-requested retx cap (3), dropping",
+                                key, sdu.n_s
+                            );
+                            sdus_to_remove.push(sdu.n_s);
+                            continue;
+                        }
+                        if peer_requested_retx {
+                            tracing::debug!(
+                                "AL link {:?} N(S)={} peer-requested retx #{} (SduFcsFailure)",
+                                key, sdu.n_s, sdu.retx_count + 1
+                            );
                         }
                         sdu.force_retx = false;
                         sdu.sent_at = Some(dltime);
