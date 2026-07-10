@@ -242,4 +242,11 @@ pub struct LtpdMleUnitdataInd {
     pub received_tetra_address: TetraAddress, // ITSI/GSSI
     pub chan_change_resp_req: bool,
     pub chan_change_handle: Option<Todo>,
+    /// PD-5c-H13: AL provenance flag. `Some(n)` iff the SDU was assembled by
+    /// LLC on Advanced Link number `n` (from `TlaTlDataIndAl.al_link_number`);
+    /// `None` when it arrived over a Basic Link. SNDCP uses this to learn the
+    /// AL (link_id, endpoint_id) tuple to prefer for downlink SN-DATA — the
+    /// tuple captured at ACTIVATE PDP DEMAND is BL-only and stops routing to
+    /// the MS once it opens an AL.
+    pub al_link_number: Option<u8>,
 }

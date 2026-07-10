@@ -185,6 +185,13 @@ pub struct PdpContext {
     /// Link-layer addressing captured from the uplink ACTIVATE DEMAND.
     pub link_id: u32,
     pub endpoint_id: u32,
+    /// PD-5c-H13: Advanced Link (link_id, endpoint_id) learned from the most
+    /// recent uplink SN-DATA/UNITDATA whose `LtpdMleUnitdataInd.al_link_number`
+    /// was `Some`. When set, downlink user-data SN-PDUs prefer this tuple over
+    /// the BL tuple above, so the reply reaches the MS on the AL it opened for
+    /// the data phase rather than the BL that carried the ACTIVATE DEMAND.
+    /// `None` until we see the first uplink AL frame; falls back to BL then.
+    pub al_link: Option<(u32, u32)>,
 }
 
 /// Uplink IP payload surfaced to the higher layer (pd-gateway / tests).
@@ -439,6 +446,7 @@ impl Sndcp {
             pending_downlink: VecDeque::new(),
             link_id: ind.link_id,
             endpoint_id: ind.endpoint_id,
+            al_link: None,
         };
         self.ipv4_to_key.insert(ipv4, key);
         self.contexts.insert(key, ctx);
@@ -558,6 +566,13 @@ impl Sndcp {
         ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
         ctx.standby_deadline = None;
         ctx.last_activity = self.dltime;
+
+        // PD-5c-H13: if this SN-UNITDATA rode in on an Advanced Link, remember
+        // the (link_id, endpoint_id) so subsequent downlinks route back on the
+        // same AL instead of the BL captured at ACTIVATE DEMAND time.
+        if ind.al_link_number.is_some() {
+            ctx.al_link = Some((ind.link_id, ind.endpoint_id));
+        }
 
         self.uplink_ip_queue.push_back(GatewayUplink {
             main_address,
@@ -745,6 +760,13 @@ impl Sndcp {
         ctx.standby_deadline = None;
         ctx.resp_wait_deadline = None;
         ctx.last_activity = self.dltime;
+
+        // PD-5c-H13: if this SN-DATA rode in on an Advanced Link, remember the
+        // (link_id, endpoint_id) so subsequent downlink SN-DATA routes back on
+        // the same AL instead of the BL captured at ACTIVATE DEMAND time.
+        if ind.al_link_number.is_some() {
+            ctx.al_link = Some((ind.link_id, ind.endpoint_id));
+        }
 
         self.uplink_ip_queue.push_back(GatewayUplink {
             main_address,
@@ -961,6 +983,12 @@ impl Sndcp {
         let nsapi = Nsapi(key.nsapi);
         let link_id = ctx.link_id;
         let endpoint_id = ctx.endpoint_id;
+        // PD-5c-H13: for Ready-state user data, prefer the AL tuple learned
+        // from uplink AL-DATA. Keep the BL tuple for Standby/PAGE REQUEST —
+        // paging must reach the MS on a control channel it is monitoring.
+        let (data_link_id, data_endpoint_id) = ctx
+            .al_link
+            .unwrap_or((link_id, endpoint_id));
 
         match ctx.state {
             PdpState::Ready => {
@@ -973,7 +1001,7 @@ impl Sndcp {
                     return;
                 }
                 sdu.seek(0);
-                send_downlink(queue, main_address, link_id, endpoint_id, sdu,
+                send_downlink(queue, main_address, data_link_id, data_endpoint_id, sdu,
                     Layer2Service::Unacknowledged, true);
             }
             PdpState::Standby => {
@@ -1047,8 +1075,13 @@ impl Sndcp {
 
         let main_address = TetraAddress::issi(key.ssi);
         let nsapi = Nsapi(key.nsapi);
-        let link_id = ctx.link_id;
-        let endpoint_id = ctx.endpoint_id;
+        // PD-5c-H13: prefer the AL tuple learned from uplink AL-DATA over the
+        // BL tuple captured at ACTIVATE DEMAND time. Once the MS has opened an
+        // Advanced Link for the data phase, downlink SN-DATA must ride that AL
+        // or LLC will wrap it as BL-DATA on MCCH and the MS will ignore it.
+        let (link_id, endpoint_id) = ctx
+            .al_link
+            .unwrap_or((ctx.link_id, ctx.endpoint_id));
 
         ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
         ctx.last_activity = self.dltime;

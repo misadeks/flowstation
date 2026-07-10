@@ -256,6 +256,7 @@ fn make_uplink_ind(sdu: BitBuffer, issi: u32) -> SapMsg {
             received_tetra_address: TetraAddress::new(issi, SsiType::Issi),
             chan_change_resp_req: false,
             chan_change_handle: None,
+            al_link_number: None,
         }),
     }
 }
@@ -1077,4 +1078,163 @@ fn pd9_sndcp_feeds_downlink_ip_from_gateway_channel_as_sn_data() {
         }
         other => panic!("PD-9: expected SnPdu::Data, got {other:?}"),
     }
+}
+
+
+// -- PD-5c-H13: SNDCP tracks AL link and prefers it for downlink ---------------
+
+/// Like `make_uplink_ind_al` but lets the caller pick the link_id / endpoint_id
+/// / al_link_number so a test can simulate an MS that opened AL link 4 for its
+/// packet-data session after activating on BL link 1.
+fn make_uplink_ind_al_at(
+    sdu: BitBuffer,
+    issi: u32,
+    link_id: u32,
+    endpoint_id: u32,
+    al_link_number: u8,
+) -> SapMsg {
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::TlaTlDataIndAl(TlaTlDataIndAl {
+            main_address: TetraAddress::new(issi, SsiType::Issi),
+            link_id,
+            endpoint_id,
+            al_link_number,
+            tl_sdu: sdu,
+            subscriber_class: 0,
+            fcs_ok: true,
+            air_interface_encryption: None,
+        }),
+    }
+}
+
+/// PD-5c-H13: After the MS opens an Advanced Link, downlink SN-DATA must ride
+/// that AL (link_id learned from the uplink AL frame), not the BL link_id
+/// captured at ACTIVATE DEMAND time. Prior to H13, `ctx.link_id` was frozen at
+/// activation and every downlink went out on the ACTIVATE BL — the MS's WAP
+/// session was on AL and it ignored replies arriving on the wrong LLC channel.
+#[test]
+fn pd_al_uplink_learns_al_link_and_downlink_uses_it() {
+    debug::setup_logging_verbose();
+
+    let mut stack = TestStack::new();
+
+    // Activate PDP context over BL (as the real MS does): the ACTIVATE DEMAND
+    // arrives with link_id=0/endpoint_id=0 via `make_uplink_ind`, which is the
+    // BL tuple SNDCP caches into `ctx.link_id/endpoint_id`.
+    stack.queue.push_back(make_uplink_ind(
+        build_activate_demand_pdu(TEST_NSAPI),
+        TEST_ISSI,
+    ));
+    let setup = tick_stack(&mut stack);
+    let accept = match decode_dl_from_sdu(
+        &find_ltpd_unitdata_req(&setup).expect("H13: ACCEPT missing").sdu,
+    ) {
+        SnPdu::ActivatePdpContextAccept(a) => a,
+        other => panic!("H13: expected ACCEPT, got {other:?}"),
+    };
+    let allocated_ip = accept.ip4_address.expect("H13: ACCEPT must carry IPv4");
+
+    // Now inject uplink SN-DATA on an AL link (link_id=4, al_link_number=4) —
+    // simulating LLC delivering an AL-assembled SDU up to MLE after the MS
+    // opened an Advanced Link for its data phase.
+    let icmp_req: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x02, 0x00, 0x00,
+        0x40, 0x01, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x02,
+        0xc0, 0xa8, 0x64, 0x01,
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
+    ];
+    stack.queue.push_back(make_uplink_ind_al_at(
+        build_sn_data_pdu(TEST_NSAPI, &icmp_req),
+        TEST_ISSI,
+        /* link_id */ 4,
+        /* endpoint_id */ 0,
+        /* al_link_number */ 4,
+    ));
+    let _al_msgs = tick_stack(&mut stack);
+    // Drain the uplink so it doesn't shadow the downlink assertion below.
+    let _ = stack.sndcp.uplink_ip_queue.pop_front()
+        .expect("H13: SNDCP must consume the AL SN-DATA");
+
+    // Feed a downlink IP reply. The resulting LtpdMleUnitdataReq MUST use the
+    // AL link_id (4) — not the BL link_id (0) captured at activation.
+    let icmp_reply: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x03, 0x00, 0x00,
+        0x40, 0x01, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x01,
+        0xc0, 0xa8, 0x64, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01,
+    ];
+    stack.sndcp.feed_downlink_ip_acknowledged(
+        &mut stack.queue,
+        GatewayDownlink { dest_ipv4: allocated_ip, payload: icmp_reply.clone() },
+    );
+    let dl_msgs = tick_stack(&mut stack);
+
+    let ltpd_dl = find_ltpd_unitdata_req(&dl_msgs)
+        .expect("H13: SNDCP must emit LtpdMleUnitdataReq for downlink SN-DATA");
+    assert_eq!(
+        ltpd_dl.link_id, 4,
+        "H13: downlink SN-DATA must ride the AL link_id (4) learned from uplink AL-DATA, not the BL link_id (0) from ACTIVATE"
+    );
+    assert_eq!(ltpd_dl.endpoint_id, 0, "H13: downlink endpoint_id matches AL");
+    assert!(ltpd_dl.packet_data_flag, "H13: SN-DATA carries packet_data_flag");
+    match decode_dl_from_sdu(&ltpd_dl.sdu) {
+        SnPdu::Data(d) => {
+            assert_eq!(d.nsapi.0, TEST_NSAPI);
+            assert_eq!(d.n_pdu, icmp_reply);
+        }
+        other => panic!("H13: expected SN-DATA, got {other:?}"),
+    }
+}
+
+/// PD-5c-H13: If no AL uplink has been seen yet, downlink must fall back to
+/// the BL (link_id, endpoint_id) captured at ACTIVATE DEMAND. Otherwise we'd
+/// break the pre-H13 flow where every downlink correctly went out on BL.
+#[test]
+fn pd_downlink_falls_back_to_bl_when_no_al_link_yet() {
+    debug::setup_logging_verbose();
+
+    let mut stack = TestStack::new();
+
+    stack.queue.push_back(make_uplink_ind(
+        build_activate_demand_pdu(TEST_NSAPI),
+        TEST_ISSI,
+    ));
+    let setup = tick_stack(&mut stack);
+    let accept = match decode_dl_from_sdu(
+        &find_ltpd_unitdata_req(&setup).expect("H13-fallback: ACCEPT missing").sdu,
+    ) {
+        SnPdu::ActivatePdpContextAccept(a) => a,
+        other => panic!("H13-fallback: expected ACCEPT, got {other:?}"),
+    };
+    let allocated_ip = accept.ip4_address.expect("H13-fallback: IPv4");
+
+    // No AL uplink — feed the downlink directly.
+    let icmp_reply: Vec<u8> = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x04, 0x00, 0x00,
+        0x40, 0x01, 0x00, 0x00,
+        0xc0, 0xa8, 0x64, 0x01,
+        0xc0, 0xa8, 0x64, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01,
+    ];
+    stack.sndcp.feed_downlink_ip_acknowledged(
+        &mut stack.queue,
+        GatewayDownlink { dest_ipv4: allocated_ip, payload: icmp_reply },
+    );
+    let dl_msgs = tick_stack(&mut stack);
+
+    let ltpd_dl = find_ltpd_unitdata_req(&dl_msgs)
+        .expect("H13-fallback: SNDCP must emit LtpdMleUnitdataReq");
+    // The ACTIVATE DEMAND was injected via `make_uplink_ind` which sets
+    // link_id=0/endpoint_id=0; downlink must use those same values because no
+    // AL has been learned yet.
+    assert_eq!(
+        ltpd_dl.link_id, 0,
+        "H13-fallback: no AL learned — must fall back to BL link_id from ACTIVATE"
+    );
+    assert_eq!(ltpd_dl.endpoint_id, 0, "H13-fallback: BL endpoint_id from ACTIVATE");
 }

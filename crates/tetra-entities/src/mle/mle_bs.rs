@@ -109,13 +109,15 @@ impl MleBs {
             );
             sdu.seek(0);
         }
-        self.dispatch_tla_data_ind(queue, prim.main_address, prim.link_id, prim.endpoint_id, sdu);
+        self.dispatch_tla_data_ind(queue, prim.main_address, prim.link_id, prim.endpoint_id, None, sdu);
     }
 
     /// PD-5c-H12: uplink counterpart to `rx_tla_data_ind_bl` for AL-assembled
     /// SDUs delivered by LLC over the Advanced Link. Reuses the same
-    /// protocol-discriminator dispatch as the BL path; SNDCP does not
-    /// differentiate provenance for the current MVP.
+    /// protocol-discriminator dispatch as the BL path. PD-5c-H13: we now also
+    /// forward the AL provenance (as `Some(al_link_number)`) to SNDCP so it
+    /// can learn the AL (link_id, endpoint_id) tuple for downlink SN-DATA;
+    /// other higher layers still ignore the flag.
     fn rx_tla_data_ind_al(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::TlaTlDataIndAl(prim) = &mut message.msg else {
             tracing::error!("BUG: unexpected message or state -- routing error");
@@ -136,18 +138,29 @@ impl MleBs {
             );
             sdu.seek(0);
         }
-        self.dispatch_tla_data_ind(queue, prim.main_address, prim.link_id, prim.endpoint_id, sdu);
+        self.dispatch_tla_data_ind(
+            queue,
+            prim.main_address,
+            prim.link_id,
+            prim.endpoint_id,
+            Some(prim.al_link_number),
+            sdu,
+        );
     }
 
     /// Common dispatch for both BL and AL TL-DATA indications. Reads the
     /// 3-bit MLE protocol discriminator and forwards the remaining SDU to
-    /// MM/CMCE/SNDCP or handles it as an MLE PDU internally.
+    /// MM/CMCE/SNDCP or handles it as an MLE PDU internally. `al_link_number`
+    /// is `Some(n)` when the SDU came from an Advanced Link (`n` is the AL
+    /// number) and `None` for Basic Link; only the SNDCP path currently
+    /// forwards this flag (PD-5c-H13).
     fn dispatch_tla_data_ind(
         &mut self,
         queue: &mut MessageQueue,
         main_address: TetraAddress,
         link_id: LinkId,
         endpoint_id: EndpointId,
+        al_link_number: Option<u8>,
         mut sdu: BitBuffer,
     ) {
         let Some(bits) = sdu.read_bits(3) else {
@@ -201,6 +214,7 @@ impl MleBs {
                     received_tetra_address: main_address,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
+                    al_link_number,
                 };
                 // SNDCP (packet data, MLE protocol discriminator 4) belongs to the SNDCP entity,
                 // not CMCE. Route it over the TLPD SAP so the packet-data layer receives it.

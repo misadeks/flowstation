@@ -115,6 +115,7 @@ fn make_ind(sdu: BitBuffer, ssi: u32) -> SapMsg {
             received_tetra_address: test_addr(ssi),
             chan_change_resp_req: false,
             chan_change_handle: None,
+            al_link_number: None,
         }),
     }
 }
