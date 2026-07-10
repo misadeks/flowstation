@@ -12,6 +12,7 @@ members = [
     # Binaries
     "bins/bluestation-bs",
     "bins/pd-gateway",
+    "crates/wap-gateway",
     #"bins/bluestation-telemetry",
     #"bins/bluestation-control",
     #"bins/pdu-tool",
@@ -121,3 +122,8 @@ ctrlc = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 tokio = { version = "1" }
+bytes = "1"
+anyhow = "1"
+thiserror = "2"
+dashmap = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

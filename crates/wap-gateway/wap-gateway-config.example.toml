@@ -1,0 +1,16 @@
+# FlowStation WAP gateway example config.
+#
+# Copy to `/etc/flowstation/wap-gateway-config.toml` (or pass with `-c`) and
+# adjust to your host. Either `listen_addr` or `flowstation_config` must be
+# set — the latter causes the gateway to read `packet_data.tun_addr` from the
+# main FlowStation config (also accepts the `[sndcp]` alias).
+
+# --- Option A: pull tun_addr from the FlowStation config -------------------
+flowstation_config = "/home/pi/flowstation-config.toml"
+
+# --- Option B: explicit bind address (skips flowstation_config) ------------
+# listen_addr = "10.222.0.1"
+
+listen_port = 9201
+upstream_url = "http://127.0.0.1:8081"
+log_level = "info"
