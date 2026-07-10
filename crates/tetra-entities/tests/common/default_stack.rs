@@ -38,6 +38,7 @@ pub fn default_test_config_bs() -> StackConfig {
         emergency: CfgEmergency::default(),
         llc: CfgLlc::default(),
         packet_data: CfgPacketData::default(),
+        wap_gateway: tetra_config::bluestation::CfgWapGateway::disabled(std::net::Ipv4Addr::new(10, 222, 0, 1)),
     }
 }
 
