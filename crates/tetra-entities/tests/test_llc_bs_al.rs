@@ -20,7 +20,10 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_entities::llc::llc_bs_ms::{AlLinkKey, AlPhase, Llc};
 use tetra_entities::{MessageQueue, TetraEntityTrait};
 use tetra_pdus::llc::al::segmenter::{SegmenterConfig, segment_sdu};
-use tetra_pdus::llc::consts::timers::{T261_SETUP_WAITING_TIMER, T272_RECEIVER_NOT_READY_FOR_RX_TIMER};
+use tetra_pdus::llc::consts::timers::{
+    T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER, T261_SETUP_WAITING_TIMER,
+    T272_RECEIVER_NOT_READY_FOR_RX_TIMER,
+};
 use tetra_pdus::llc::enums::advanced_link_service::AdvancedLinkService;
 use tetra_pdus::llc::enums::advanced_link_symmetry::AdvancedLinkSymmetry;
 use tetra_pdus::llc::enums::al_disc_cause::AlDiscCause;
@@ -1229,3 +1232,163 @@ fn al_data_after_completed_sdu_still_works_via_natural_advancement() {
 }
 
 
+
+
+
+// ─── PD-5c-H16: AL TX retx timer must use T.252, not the BL T.251 ────────────
+//
+// The AL retransmission path in `submit_al_activity_to_umac` must wait
+// T252_ACK_WAITING_TIMER (Annex A.1, 9 signalling frames ≈ 510 ms) before
+// declaring an outstanding SDU due for retransmission or drop. Using
+// T251_SENDER_RETRY_TIMER (4 frames ≈ 226 ms — the Basic Link retry timer)
+// drops downlink SDUs before the MS's AL-ACK physically reaches us on a
+// granted PDCH.
+
+/// Build an AL-SETUP with a specific `max_retx_n273_or_repetition_n282`
+/// (mapped into `link.max_sdu_retx`). Uses the default (Ack, window=3, 256B).
+fn make_setup_pdu_with_retx(report: SetupReport, max_retx: u8) -> AlSetup {
+    AlSetup {
+        max_retx_n273_or_repetition_n282: max_retx,
+        ..make_setup_pdu(report)
+    }
+}
+
+/// Establish a link with a peer-negotiated `max_retx`, drain the setup reply,
+/// then push one TLA-DATA-Req-Al through and drain the resulting AL-DATA
+/// segments. Returns the `TdmaTime` at which the SDU's initial send was
+/// stamped (== `TdmaTime::default()`).
+fn establish_and_tx_one_sdu(
+    llc: &mut Llc,
+    queue: &mut MessageQueue,
+    max_retx: u8,
+    sdu: Vec<u8>,
+) -> TdmaTime {
+    send_setup_to_llc(llc, queue, make_setup_pdu_with_retx(SetupReport::ServiceDefinition, max_retx));
+    drain_queue(queue);
+    // Initial send: enqueue_al_sdu stamps sent_at = self.dltime, which is
+    // TdmaTime::default() until tick_start is called with a later value.
+    llc.rx_prim(queue, make_tla_data_req_al_sap(sdu));
+    drain_queue(queue);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1, "one SDU must be outstanding after tx");
+    assert_eq!(link.max_sdu_retx, max_retx, "negotiated max_sdu_retx must be honored");
+    TdmaTime::default()
+}
+
+/// Advance dltime to `t` and run one empty tick (no rx). Returns any messages
+/// pushed by `submit_al_activity_to_umac`.
+fn tick_at(llc: &mut Llc, queue: &mut MessageQueue, t: TdmaTime) -> Vec<SapMsg> {
+    llc.tick_start(queue, t);
+    llc.tick_end(queue, t);
+    drain_queue(queue)
+}
+
+/// After T.251 elapses (≈ 226 ms) but before T.252 (≈ 510 ms), the AL TX path
+/// must NOT retransmit or drop the SDU. This is the core regression: the old
+/// code would fire at T.251 and (with `max_retx=0`) drop the SDU before the
+/// ACK could physically arrive.
+#[test]
+fn al_tx_no_retx_before_t252() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, /* max_retx */ 3, b"h16 keepalive".to_vec());
+
+    // Advance just past T.251 but well before T.252.
+    let t1 = t0.add_timeslots(T251_SENDER_RETRY_TIMER as i32 + 1);
+    assert!((T251_SENDER_RETRY_TIMER + 1) < T252_ACK_WAITING_TIMER,
+        "test invariant: T.251+1 must be strictly less than T.252");
+    let msgs = tick_at(&mut llc, &mut queue, t1);
+
+    // SDU must still be outstanding and no AL-DATA retransmission emitted.
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1, "SDU must still be outstanding before T.252");
+    assert_eq!(link.outstanding_sdus[0].retx_count, 0, "no retransmission before T.252");
+    let umac_pdus: Vec<_> = msgs.iter()
+        .filter(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_)))
+        .collect();
+    assert!(umac_pdus.is_empty(),
+        "no TmaUnitdataReq must be emitted before T.252 elapses (got {})", umac_pdus.len());
+}
+
+/// After T.252 elapses with `max_sdu_retx >= 1`, the SDU must be retransmitted
+/// (not dropped). This confirms the timer path itself still functions.
+#[test]
+fn al_tx_retransmits_after_t252() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, /* max_retx */ 3, b"h16 retx".to_vec());
+
+    // Advance past T.252 by one timeslot.
+    let t1 = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    let msgs = tick_at(&mut llc, &mut queue, t1);
+
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1, "SDU must still be outstanding (retxed, not dropped)");
+    assert!(link.outstanding_sdus[0].retx_count >= 1,
+        "retx_count must advance after T.252 elapses; got {}", link.outstanding_sdus[0].retx_count);
+    let umac_pdus: Vec<_> = msgs.iter()
+        .filter(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_)))
+        .collect();
+    assert!(!umac_pdus.is_empty(),
+        "a TmaUnitdataReq retransmission must be emitted after T.252 elapses");
+}
+
+/// With `max_sdu_retx = 0` (peer negotiated "no retransmissions"), the SDU is
+/// given one full T.252 ACK window and only then dropped. This is the
+/// hardware-observed configuration on Motorola MTP3550.
+#[test]
+fn al_tx_sdu_dropped_after_t252_when_max_retx_zero() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, /* max_retx */ 0, b"h16 drop".to_vec());
+
+    // Ticking before T.252 must not drop.
+    let t_pre = t0.add_timeslots(T251_SENDER_RETRY_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t_pre);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1, "SDU must survive until T.252 has elapsed");
+
+    // Ticking past T.252 fires the drop (retx_count=0 >= max_sdu_retx=0).
+    let t_post = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t_post);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "SDU must be dropped once T.252 elapsed and max_sdu_retx is exhausted");
+}
+
+/// An AL-ACK that arrives within the T.252 window (e.g. ~ 300 ms after emit,
+/// which is well after the old T.251 threshold but still comfortably inside
+/// T.252) must clear the outstanding SDU without any drop.
+#[test]
+fn al_ack_within_t252_prevents_drop() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, /* max_retx */ 0, b"h16 late ack".to_vec());
+
+    // Advance dltime past T.251 (would have been the drop point pre-H16) but
+    // strictly less than T.252 — this is where hardware traces show the ACK
+    // physically arriving.
+    let t_ack = t0.add_timeslots(T251_SENDER_RETRY_TIMER as i32 + 2);
+    assert!((T251_SENDER_RETRY_TIMER + 2) < T252_ACK_WAITING_TIMER,
+        "test invariant: T.251+2 must still be inside the T.252 window");
+
+    // Feed an AL-ACK EntireSduReceived for N(S)=0 at t_ack.
+    let ack_pdu = AlAckAlRnr {
+        kind: AlAckAlRnrKind::Ack,
+        first_block: AcknowledgementBlock {
+            n_r: 0,
+            ack_length: AckLength::EntireSduReceived,
+            s_r: None,
+            ack_bitmap: None,
+        },
+        other_blocks: vec![],
+    };
+    let mut buf = BitBuffer::new_autoexpand(64);
+    ack_pdu.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, t_ack, make_tma_ind(buf));
+
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "AL-ACK arriving inside the T.252 window must clear the SDU without a drop");
+}
