@@ -16,6 +16,8 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
+reqwest = { workspace = true }
+url = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "test-util"] }

@@ -95,7 +95,7 @@ pub async fn run(cfg: RunConfig, shutdown: CancellationToken) -> WapResult<()> {
         "wap-gateway listening",
     );
 
-    let wsp_state = WspGatewayState::new();
+    let wsp_state = WspGatewayState::with_upstream(cfg.upstream_url.clone());
     let handler = {
         let wsp = WspHandler::new(wsp_state);
         handler_fn(move |peer, payload| {
