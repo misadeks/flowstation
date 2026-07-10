@@ -60,10 +60,26 @@ pub mod pdu_type {
     pub const CONFIRMED_PUSH: u8 = 0x07;
     pub const SUSPEND: u8 = 0x08;
     pub const RESUME: u8 = 0x09;
-    // 0x40..=0x5F: Get variants (Get / Options / Head / Delete / Trace).
+    // 0x40..=0x5F: GET-like methods (Get / Options / Head / Delete / Trace + extended).
     pub const GET: u8 = 0x40;
-    // 0x60..=0x7F: Post variants.
+    pub const OPTIONS: u8 = 0x41;
+    pub const HEAD: u8 = 0x42;
+    pub const DELETE: u8 = 0x43;
+    pub const TRACE: u8 = 0x44;
+    // 0x60..=0x7F: POST-like methods (Post / Put + extended).
     pub const POST: u8 = 0x60;
+    pub const PUT: u8 = 0x61;
+
+    /// True iff `code` is in the GET-like method range (0x40..=0x5F).
+    /// GET-like methods share the wire format `[code][uri-len][uri][headers]`.
+    pub fn is_get_like(code: u8) -> bool {
+        (0x40..=0x5F).contains(&code)
+    }
+    /// True iff `code` is in the POST-like method range (0x60..=0x7F).
+    /// POST-like methods add `content-type` + `data` after the URI.
+    pub fn is_post_like(code: u8) -> bool {
+        (0x60..=0x7F).contains(&code)
+    }
 }
 
 /// A WSP PDU as it appears on the wire between the MS and this gateway.
@@ -89,6 +105,15 @@ pub enum WspPdu {
     /// real HTTP relay; PD-10b only needs the encoder to answer "501 Not
     /// Implemented" for anything that isn't Connect.
     Reply { status: u8, headers: HeaderBlock, body: Vec<u8> },
+    /// S-MethodInvoke for a GET-like method (0x40..=0x5F). Wire format is
+    /// `[type][uri-len uintvar][uri][headers]` where `headers` implicitly
+    /// consumes the rest of the PDU (WAP-230 §8.5.2). PD-10c dispatches
+    /// `Get` (0x40) to the HTTP relay; other codes are answered 405.
+    MethodInvoke {
+        method_code: u8,
+        uri: String,
+        headers: HeaderBlock,
+    },
     /// Any PDU type we haven't modelled — payload preserved verbatim.
     Unknown { pdu_type: u8, payload: Vec<u8> },
 }
@@ -148,6 +173,7 @@ impl WspPdu {
                 Ok(Self::Disconnect { server_session_id: sid })
             }
             pdu_type::REPLY => decode_reply(rest),
+            code if pdu_type::is_get_like(code) => decode_get_like(code, rest),
             other => Ok(Self::Unknown {
                 pdu_type: other,
                 payload: rest.to_vec(),
@@ -196,6 +222,12 @@ impl WspPdu {
                 out.extend_from_slice(&headers.raw);
                 out.extend_from_slice(body);
             }
+            Self::MethodInvoke { method_code, uri, headers } => {
+                out.push(*method_code);
+                uintvar::encode(uri.len() as u32, &mut out);
+                out.extend_from_slice(uri.as_bytes());
+                out.extend_from_slice(&headers.raw);
+            }
             Self::Unknown { pdu_type, payload } => {
                 out.push(*pdu_type);
                 out.extend_from_slice(payload);
@@ -211,6 +243,7 @@ impl WspPdu {
             Self::ConnectReply { .. } => pdu_type::CONNECT_REPLY,
             Self::Disconnect { .. } => pdu_type::DISCONNECT,
             Self::Reply { .. } => pdu_type::REPLY,
+            Self::MethodInvoke { method_code, .. } => *method_code,
             Self::Unknown { pdu_type, .. } => *pdu_type,
         }
     }
@@ -289,6 +322,37 @@ fn decode_reply(rest: &[u8]) -> WapResult<WspPdu> {
         headers: HeaderBlock::from_bytes(&rest[hdrs_start..hdrs_end]),
         body: rest[hdrs_end..].to_vec(),
     })
+}
+
+/// Decode a GET-like method PDU (WAP-230 §8.5.2). Wire format:
+///
+/// ```text
+///   [type] [URI-length uintvar] [URI bytes] [headers ...]
+/// ```
+///
+/// `headers` implicitly consumes the rest of the PDU (there is no explicit
+/// headers-length field for GET-like methods). If nothing follows the URI —
+/// which is what MTP3550 / UP.Browser 6.3 does in the observed capture —
+/// the header block is empty. The URI is ASCII per WAP-230, never
+/// NUL-terminated on the wire.
+fn decode_get_like(method_code: u8, rest: &[u8]) -> WapResult<WspPdu> {
+    let (uri_len, n) = uintvar::decode(rest)?;
+    let uri_start = n;
+    let uri_end = uri_start
+        .checked_add(uri_len as usize)
+        .ok_or_else(|| WapError::WspDecode("Get URI length overflow".to_owned()))?;
+    if rest.len() < uri_end {
+        return Err(WapError::Truncated {
+            expected: uri_end + 1,
+            actual: rest.len() + 1,
+        });
+    }
+    let uri_bytes = &rest[uri_start..uri_end];
+    let uri = std::str::from_utf8(uri_bytes)
+        .map_err(|e| WapError::WspDecode(format!("Get URI is not valid UTF-8/ASCII: {e}")))?
+        .to_owned();
+    let headers = HeaderBlock::from_bytes(&rest[uri_end..]);
+    Ok(WspPdu::MethodInvoke { method_code, uri, headers })
 }
 
 // ── Builders ─────────────────────────────────────────────────────────────────
@@ -379,6 +443,112 @@ pub fn build_status_reply(status: u8) -> WspPdu {
 
 /// WAP-230 §8.7.3.5 — Status = "Not Implemented".
 pub const STATUS_NOT_IMPLEMENTED: u8 = 0x60;
+/// WAP-230 §8.7.3.1 — Status = "OK" (200).
+pub const STATUS_OK: u8 = 0x20;
+/// WAP-230 §8.7.3.4 — Status = "Bad Request" (400).
+pub const STATUS_BAD_REQUEST: u8 = 0x40;
+/// WAP-230 §8.7.3.4 — Status = "Not Found" (404).
+pub const STATUS_NOT_FOUND: u8 = 0x44;
+/// WAP-230 §8.7.3.4 — Status = "Method Not Allowed" (405).
+pub const STATUS_METHOD_NOT_ALLOWED: u8 = 0x45;
+/// WAP-230 §8.7.3.5 — Status = "Internal Server Error" (500).
+pub const STATUS_INTERNAL_ERROR: u8 = 0x50;
+/// WAP-230 §8.7.3.5 — Status = "Bad Gateway" (502).
+pub const STATUS_BAD_GATEWAY: u8 = 0x52;
+
+/// WSP Content-Type value (WAP-230 §8.4.2.24). Two representations map onto
+/// the two spec forms:
+///
+/// * [`ContentType::WellKnown`] — a single-byte short-integer form; the
+///   raw well-known code is stored WITHOUT the 0x80 continuation flag and
+///   is OR'd on at encode time. E.g. `application/vnd.wap.wmlc` is
+///   well-known code `0x08`, encoded as the single byte `0x88`.
+/// * [`ContentType::Text`] — the fallback text-string form for MIME types
+///   we don't have a well-known code for; encoded as the ASCII bytes
+///   followed by a single 0x00 terminator.
+///
+/// The well-known table lives at WAP-230 §Appendix A / assigned numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentType {
+    WellKnown(u8),
+    Text(String),
+}
+
+impl ContentType {
+    /// WAP well-known code for `application/vnd.wap.wmlc` (compiled WML).
+    pub const WMLC: u8 = 0x14;
+    /// WAP well-known code for `text/vnd.wap.wml` (WML source).
+    pub const WML: u8 = 0x08;
+    /// WAP well-known code for `image/vnd.wap.wbmp`.
+    pub const WBMP: u8 = 0x21;
+    /// WAP well-known code for `text/plain`.
+    pub const TEXT_PLAIN: u8 = 0x03;
+    /// WAP well-known code for `application/octet-stream`.
+    pub const OCTET_STREAM: u8 = 0x11;
+
+    /// Map an HTTP `Content-Type` MIME token (bare, no `; charset=…`) to the
+    /// most compact WSP encoding we can. Anything unknown falls through to
+    /// the text-string form.
+    ///
+    /// The well-known table is per WAP-230 Appendix A (WSP Content-Type
+    /// Assignments). We only enumerate the handful of MIME types the WAP
+    /// browser fleet in this deployment actually asks for; adding more is
+    /// a one-line append here.
+    pub fn from_http(mime: &str) -> Self {
+        // Ignore parameters after ';' and trim whitespace.
+        let bare = mime.split(';').next().unwrap_or(mime).trim();
+        let lower = bare.to_ascii_lowercase();
+        match lower.as_str() {
+            "text/plain" => Self::WellKnown(Self::TEXT_PLAIN),
+            "text/html" => Self::WellKnown(0x02),
+            "text/vnd.wap.wml" => Self::WellKnown(Self::WML),
+            "text/vnd.wap.wmlscript" => Self::WellKnown(0x09),
+            "application/octet-stream" => Self::WellKnown(Self::OCTET_STREAM),
+            "application/vnd.wap.wmlc" => Self::WellKnown(Self::WMLC),
+            "application/vnd.wap.wmlscriptc" => Self::WellKnown(0x15),
+            "application/vnd.wap.wbxml" => Self::WellKnown(0x29),
+            "image/gif" => Self::WellKnown(0x1D),
+            "image/jpeg" => Self::WellKnown(0x1E),
+            "image/vnd.wap.wbmp" => Self::WellKnown(Self::WBMP),
+            _ => Self::Text(bare.to_owned()),
+        }
+    }
+
+    /// Serialize as WSP wire bytes (WAP-230 §8.4.2.24 Content-general-form
+    /// — restricted to the two forms we emit).
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::WellKnown(code) => out.push(0x80 | (code & 0x7F)),
+            Self::Text(s) => {
+                // WAP-230 §8.4.2.1 text-string: characters MUST be > 0x7F
+                // for the first byte to disambiguate from short-integer.
+                // Content-types are always US-ASCII, so we're fine emitting
+                // them raw + NUL terminator. If the first byte is high we
+                // must prefix with a 0x7F "quote" per §8.4.2.1; MIME never
+                // starts with such a char, so skip that branch.
+                out.extend_from_slice(s.as_bytes());
+                out.push(0x00);
+            }
+        }
+    }
+}
+
+/// Build a WSP Reply for a successful (or unsuccessful) HTTP relay.
+///
+/// The Reply's headers block starts with the Content-Type value in Kannel's
+/// implicit-content-type convention: the first entry of the headers block
+/// IS the Content-Type value (no field-code prefix). See
+/// `wap/wsp_headers.c::wsp_headers_pack` in Kannel 1.4.5 for the reference
+/// encoding UP.Browser 6.3 expects. No other headers are emitted in v0.1.
+pub fn build_get_reply(status: u8, content_type: ContentType, body: Vec<u8>) -> WspPdu {
+    let mut headers = Vec::with_capacity(4);
+    content_type.encode(&mut headers);
+    WspPdu::Reply {
+        status,
+        headers: HeaderBlock::from_bytes(headers),
+        body,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -402,12 +572,14 @@ mod tests {
 
     #[test]
     fn unknown_pdu_preserves_bytes() {
-        let bytes = [0x40, 0xAA, 0xBB, 0xCC];
+        // Use 0x30 which is not in any implemented range (Connect=0x01..0x09,
+        // Reply=0x04, method PDUs=0x40..=0x7F).
+        let bytes = [0x30, 0xAA, 0xBB, 0xCC];
         let pdu = WspPdu::decode(&bytes).unwrap();
         assert_eq!(
             pdu,
             WspPdu::Unknown {
-                pdu_type: 0x40,
+                pdu_type: 0x30,
                 payload: vec![0xAA, 0xBB, 0xCC],
             }
         );
@@ -426,12 +598,7 @@ mod tests {
             headers: HeaderBlock::empty(),
         };
         let reply = build_connect_reply(&connect, 1, HeaderBlock::empty()).unwrap();
-        let WspPdu::ConnectReply {
-            capabilities,
-            headers,
-            ..
-        } = &reply
-        else {
+        let WspPdu::ConnectReply { capabilities, headers, .. } = &reply else {
             panic!("build_connect_reply returned non-ConnectReply: {reply:?}");
         };
         // (1) Protocol-Options: top 4 bits cleared.
@@ -461,5 +628,160 @@ mod tests {
         assert!(hb.contains(b"UP.Browser/6.3.0.1"));
         assert!(!hb.contains(b"MSIE"));
         assert!(hb.contains(b"")); // empty needle is trivially present
+    }
+
+    // ── PD-10c: WSP Get decoder + Reply builder tests ────────────────────
+
+    /// The WSP payload MTP3550 emits after ConnectReply (WTP header stripped).
+    /// Wire bytes from tcpdump 2026-07-10 22:33:53. Notice there is NO
+    /// headers-length byte or headers block after the URI — the packet
+    /// simply ends. Our decoder must treat the remainder as an empty
+    /// [`HeaderBlock`] rather than error out.
+    const MTP3550_GET_WSP_PAYLOAD: &[u8] = &[
+        0x40, // WSP Get PDU type
+        0x20, // URI-length uintvar = 32
+        b'h', b't', b't', b'p', b':', b'/', b'/', b'1', b'0', b'.', b'2', b'2', b'2', b'.', b'0', b'.', b'1', b':', b'8', b'0', b'8', b'1',
+        b'/', b'i', b'n', b'd', b'e', b'x', b'.', b'w', b'm', b'l',
+    ];
+
+    #[test]
+    fn decodes_get_with_uri_and_no_headers() {
+        let pdu = WspPdu::decode(MTP3550_GET_WSP_PAYLOAD).unwrap();
+        let WspPdu::MethodInvoke { method_code, uri, headers } = pdu else {
+            panic!("expected MethodInvoke, got {pdu:?}");
+        };
+        assert_eq!(method_code, pdu_type::GET);
+        assert_eq!(uri, "http://10.222.0.1:8081/index.wml");
+        assert!(headers.is_empty(), "MTP3550 sends no headers-length after URI; block must be empty");
+    }
+
+    #[test]
+    fn decodes_get_with_uri_and_headers() {
+        // Synthetic Get with a trailing 3-byte "header block" (opaque —
+        // decoder just preserves it verbatim).
+        let mut bytes = vec![pdu_type::GET, 0x03, b'/', b'a', b'b'];
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let pdu = WspPdu::decode(&bytes).unwrap();
+        let WspPdu::MethodInvoke { uri, headers, .. } = pdu else {
+            panic!("expected MethodInvoke");
+        };
+        assert_eq!(uri, "/ab");
+        assert_eq!(headers.raw, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn decodes_all_get_like_method_codes() {
+        // 0x40..=0x5F should all round-trip through MethodInvoke, preserving
+        // the exact method code so the handler can return 405 for anything
+        // that isn't 0x40 (Get).
+        for code in [pdu_type::OPTIONS, pdu_type::HEAD, pdu_type::DELETE, 0x5F] {
+            let bytes = [code, 0x01, b'/'];
+            let pdu = WspPdu::decode(&bytes).unwrap();
+            assert!(
+                matches!(pdu, WspPdu::MethodInvoke { method_code, .. } if method_code == code),
+                "code {code:#x} did not decode as MethodInvoke: {pdu:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_get_with_truncated_uri() {
+        // URI-length says 10 but only 2 bytes present.
+        let bytes = [pdu_type::GET, 0x0A, b'/', b'a'];
+        assert!(matches!(WspPdu::decode(&bytes), Err(WapError::Truncated { .. })));
+    }
+
+    #[test]
+    fn decode_rejects_get_with_non_utf8_uri() {
+        let bytes = [pdu_type::GET, 0x02, 0xFF, 0xFE];
+        assert!(matches!(WspPdu::decode(&bytes), Err(WapError::WspDecode(_))));
+    }
+
+    #[test]
+    fn method_invoke_round_trips() {
+        let pdu = WspPdu::MethodInvoke {
+            method_code: pdu_type::GET,
+            uri: "/index.wml".to_owned(),
+            headers: HeaderBlock::from_bytes(vec![0xDE, 0xAD]),
+        };
+        let bytes = pdu.encode();
+        let back = WspPdu::decode(&bytes).unwrap();
+        assert_eq!(back, pdu);
+    }
+
+    #[test]
+    fn content_type_wellknown_encodes_as_short_int() {
+        let mut buf = Vec::new();
+        ContentType::WellKnown(ContentType::WMLC).encode(&mut buf);
+        assert_eq!(buf, vec![0x80 | ContentType::WMLC]);
+        // wmlc code = 0x14, so short-int = 0x94.
+        assert_eq!(buf, vec![0x94]);
+    }
+
+    #[test]
+    fn content_type_from_http_maps_wellknown_mimes() {
+        assert_eq!(
+            ContentType::from_http("application/vnd.wap.wmlc"),
+            ContentType::WellKnown(ContentType::WMLC)
+        );
+        // Case- and parameter-insensitive.
+        assert_eq!(
+            ContentType::from_http("Application/vnd.wap.WMLC; charset=utf-8"),
+            ContentType::WellKnown(ContentType::WMLC)
+        );
+        assert_eq!(
+            ContentType::from_http("text/plain"),
+            ContentType::WellKnown(ContentType::TEXT_PLAIN)
+        );
+    }
+
+    #[test]
+    fn content_type_from_http_falls_back_to_text_for_unknown() {
+        assert_eq!(
+            ContentType::from_http("application/x-flowstation"),
+            ContentType::Text("application/x-flowstation".to_owned())
+        );
+    }
+
+    #[test]
+    fn content_type_text_encodes_null_terminated() {
+        let mut buf = Vec::new();
+        ContentType::Text("application/x-flowstation".to_owned()).encode(&mut buf);
+        assert_eq!(&buf[..buf.len() - 1], b"application/x-flowstation");
+        assert_eq!(*buf.last().unwrap(), 0x00);
+    }
+
+    #[test]
+    fn build_get_reply_encodes_content_type_wellknown() {
+        let reply = build_get_reply(STATUS_OK, ContentType::WellKnown(ContentType::WMLC), b"hello".to_vec());
+        let bytes = reply.encode();
+        // 04 (Reply type) | 20 (status OK) | 01 (headers-len=1) | 94 (wmlc short-int) | body
+        assert_eq!(&bytes[..4], &[0x04, 0x20, 0x01, 0x94]);
+        assert_eq!(&bytes[4..], b"hello");
+    }
+
+    #[test]
+    fn build_get_reply_encodes_content_type_literal() {
+        let reply = build_get_reply(STATUS_OK, ContentType::from_http("application/x-flowstation"), b"x".to_vec());
+        let bytes = reply.encode();
+        // 04 20 <hdrs-len> "application/x-flowstation" 00 78
+        assert_eq!(&bytes[..2], &[0x04, 0x20]);
+        // headers-len = 25 chars + 1 NUL = 26 = 0x1A
+        assert_eq!(bytes[2], 0x1A);
+        assert_eq!(&bytes[3..3 + 25], b"application/x-flowstation");
+        assert_eq!(bytes[3 + 25], 0x00);
+        assert_eq!(bytes[3 + 25 + 1], b'x');
+    }
+
+    #[test]
+    fn build_get_reply_round_trip_matches_observed_wire_format() {
+        let reply = build_get_reply(STATUS_OK, ContentType::WellKnown(ContentType::WMLC), vec![0xDE, 0xAD]);
+        let bytes = reply.encode();
+        // Byte-for-byte assertion matching the Kannel wire format observed
+        // on the pi from Nokia 6210 / UP.Browser sessions in prior PDs.
+        assert_eq!(bytes, vec![0x04, 0x20, 0x01, 0x94, 0xDE, 0xAD]);
+        // Decoder must reconstruct an equivalent Reply.
+        let back = WspPdu::decode(&bytes).unwrap();
+        assert_eq!(back, reply);
     }
 }

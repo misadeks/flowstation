@@ -49,7 +49,9 @@ use dashmap::DashMap;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::wsp::pdu::{HeaderBlock, STATUS_NOT_IMPLEMENTED, WspPdu, build_connect_reply, build_status_reply};
+use crate::wsp::pdu::{
+    HeaderBlock, STATUS_BAD_REQUEST, STATUS_NOT_IMPLEMENTED, STATUS_OK, WspPdu, build_connect_reply, build_status_reply,
+};
 
 /// Idle timeout after which a session is dropped from the table.
 /// WAP-230 §7.4 doesn't specify a wall value; 90 s matches the WTP
@@ -219,11 +221,6 @@ impl WspHandler {
     }
 }
 
-/// WAP-230 §8.7.3.1 — Status = "OK".
-pub const STATUS_OK: u8 = 0x20;
-/// WAP-230 §8.7.3.4 — Status = "Bad Request".
-pub const STATUS_BAD_REQUEST: u8 = 0x40;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,8 +284,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_pdu_replies_501() {
         let h = WspHandler::new(WspGatewayState::new());
-        // 0x40 = Get, which PD-10b does not implement.
-        let reply_bytes = h.handle(loopback_peer(), vec![0x40, 0x00, 0x00]).await;
+        // 0x30 is unassigned; decodes as WspPdu::Unknown. PD-10c re-routes
+        // 0x40 (Get) into the HTTP relay path so it no longer answers 501.
+        let reply_bytes = h.handle(loopback_peer(), vec![0x30, 0x00, 0x00]).await;
         let WspPdu::Reply { status, .. } = WspPdu::decode(&reply_bytes).unwrap() else {
             panic!("expected Reply");
         };
