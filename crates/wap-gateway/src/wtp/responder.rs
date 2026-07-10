@@ -249,6 +249,38 @@ impl Responder {
             return Ok(());
         }
 
+        // PD-10c-H25 (2026-07-11 MTP3550 fix): a fresh Invoke from this peer
+        // with a NEW TID implicitly confirms that any earlier class-2
+        // transaction on the same peer is done from the MS's perspective —
+        // the MS wouldn't be starting a new request if it was still processing
+        // an outstanding Result. MTP3550 in particular never sends the WAP-201
+        // §9.5.7 "final Ack" for the Result, so our responder kept retx'ing
+        // the ConnectReply every ~15 s (sweeper interval) after CONNECT had
+        // already succeeded — each retx being another AL SDU that MTP3550
+        // couldn't reconcile with its state, causing the radio to blink red.
+        //
+        // Evict stale non-Done transactions in ResultSent/Handling for this
+        // peer whose TID differs from the incoming one.
+        let mut stale_keys: Vec<TxnKey> = Vec::new();
+        for entry in self.txns.iter() {
+            let k = *entry.key();
+            if k.0 == peer && k.1 != tid {
+                stale_keys.push(k);
+            }
+        }
+        for k in stale_keys {
+            if let Some((_k, txn_ref)) = self.txns.remove(&k) {
+                let txn = txn_ref.lock().await;
+                info!(
+                    %peer,
+                    stale_tid = k.1,
+                    new_tid = tid,
+                    phase = ?txn.phase,
+                    "H25: evicting stale txn on new Invoke from same peer"
+                );
+            }
+        }
+
         let key = (peer, tid);
         let entry = self
             .txns
