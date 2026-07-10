@@ -273,8 +273,12 @@ fn wire_wap_gateway(wg: &tetra_config::bluestation::CfgWapGateway) {
         upstream_url: wg.upstream_url.clone(),
     };
 
+    // Fire-and-forget: process shutdown drops the runtime which cancels the
+    // task. When bluestation-bs grows a coordinated-shutdown token, feed
+    // it in via `token.child_token()` instead of `CancellationToken::new()`.
+    let shutdown = tokio_util::sync::CancellationToken::new();
     rt.spawn(async move {
-        if let Err(e) = wap_gateway::run(run_cfg).await {
+        if let Err(e) = wap_gateway::run(run_cfg, shutdown).await {
             tracing::error!("PD-10: wap-gateway task failed: {e}");
         }
     });

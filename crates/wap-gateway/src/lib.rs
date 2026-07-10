@@ -48,6 +48,7 @@ pub mod wtp;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub use error::{WapError, WapResult};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::wdp::Wdp;
@@ -68,9 +69,12 @@ pub struct RunConfig {
     pub upstream_url: String,
 }
 
-/// Run the WAP gateway forever. Returns only on a fatal I/O error (e.g. the
-/// UDP socket dies). Cancellation is via the tokio task handle — the caller
-/// aborts the task at process shutdown.
+/// Run the WAP gateway until [`CancellationToken::cancel`] is called on
+/// `shutdown` (graceful) or a fatal I/O error propagates from the socket.
+///
+/// Callers typically drive this from a shared `CancellationToken` on
+/// `bluestation-bs`. Pass [`CancellationToken::new`] if you don't need
+/// cooperative shutdown.
 ///
 /// # Placeholder handler
 ///
@@ -79,7 +83,7 @@ pub struct RunConfig {
 /// Invoke → Ack → Result → Ack path against real MS hardware without
 /// pretending to be a functional WSP-CO gateway yet.
 #[tracing::instrument(skip_all, fields(listen = %format!("{}:{}", cfg.listen_addr, cfg.listen_port)))]
-pub async fn run(cfg: RunConfig) -> WapResult<()> {
+pub async fn run(cfg: RunConfig, shutdown: CancellationToken) -> WapResult<()> {
     let bind: SocketAddr = SocketAddr::new(IpAddr::V4(cfg.listen_addr), cfg.listen_port);
     let wdp = Wdp::bind(bind).await?;
     info!(
@@ -96,5 +100,12 @@ pub async fn run(cfg: RunConfig) -> WapResult<()> {
         vec![0x05, 0x00, 0x00]
     });
     let responder = Responder::new(wdp, handler, ResponderConfig::default());
-    responder.run().await
+
+    tokio::select! {
+        res = responder.run() => res,
+        () = shutdown.cancelled() => {
+            info!("wap-gateway shutdown requested");
+            Ok(())
+        }
+    }
 }

@@ -26,6 +26,7 @@ tetra-entities = { workspace = true }
 pd-gateway = { path = "../pd-gateway" }
 wap-gateway = { path = "../../crates/wap-gateway" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-util = { version = "0.7", default-features = false }
 
 clap = { workspace = true }
 crossbeam-channel = { workspace = true }
