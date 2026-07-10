@@ -1269,10 +1269,55 @@ fn establish_and_tx_one_sdu(
     // TdmaTime::default() until tick_start is called with a later value.
     llc.rx_prim(queue, make_tla_data_req_al_sap(sdu));
     drain_queue(queue);
+    // PD-5c-H17: simulate UMAC actually airing every segment at t0 by
+    // marking each per-segment TxReporter as Transmitted and stamping
+    // last_segment_tx_at to the current dltime. This is what the pre-step
+    // in submit_al_activity_to_umac would do on the next tick after UMAC
+    // aired the tail; in these H16 unit tests we short-circuit it so the
+    // T.252 clock is measured from the SDU's initial submission time.
+    mark_all_segments_transmitted_at(llc, TdmaTime::default());
     let link = llc.al_links.get(&test_key()).expect("link exists");
     assert_eq!(link.outstanding_sdus.len(), 1, "one SDU must be outstanding after tx");
     assert_eq!(link.max_sdu_retx, max_retx, "negotiated max_sdu_retx must be honored");
     TdmaTime::default()
+}
+
+/// PD-5c-H17 test helper: for every outstanding AL SDU on `llc`, mark each
+/// Pending segment `TxReporter` as `Transmitted` (as if UMAC aired the PDU
+/// this tick) and directly stamp `last_segment_tx_at` on the SDU with the
+/// supplied `now`. This is the "single-tick, no UMAC pacing" case that
+/// mirrors pre-H17 behavior for single-fragment SDUs.
+fn mark_all_segments_transmitted_at(llc: &mut Llc, now: TdmaTime) {
+    for (_key, link) in llc.al_links.iter_mut() {
+        for sdu in link.outstanding_sdus.iter_mut() {
+            for rep_opt in sdu.segment_reporters.iter_mut() {
+                if let Some(rep) = rep_opt.as_ref() {
+                    if rep.get_state() == tetra_core::TxState::Pending {
+                        rep.mark_transmitted();
+                    }
+                }
+            }
+            if sdu.last_segment_tx_at.is_none() {
+                sdu.last_segment_tx_at = Some(now);
+            }
+        }
+    }
+}
+
+/// PD-5c-H17 test helper: mark a *specific* segment index of the first
+/// outstanding SDU on the given link as Transmitted. Does NOT touch
+/// `last_segment_tx_at` — that is left for the retx tick pre-step to stamp,
+/// so multi-fragment tests can drive the pre-step through its real code
+/// path.
+fn mark_segment_transmitted(llc: &mut Llc, key: &AlLinkKey, seg_idx: usize) {
+    let link = llc.al_links.get_mut(key).expect("link exists");
+    let sdu = link.outstanding_sdus.iter_mut().next().expect("one outstanding SDU");
+    let rep = sdu.segment_reporters.get(seg_idx)
+        .and_then(|r| r.as_ref())
+        .expect("reporter exists for segment");
+    if rep.get_state() == tetra_core::TxState::Pending {
+        rep.mark_transmitted();
+    }
 }
 
 /// Advance dltime to `t` and run one empty tick (no rx). Returns any messages
@@ -1391,4 +1436,290 @@ fn al_ack_within_t252_prevents_drop() {
     let link = llc.al_links.get(&test_key()).expect("link exists");
     assert_eq!(link.outstanding_sdus.len(), 0,
         "AL-ACK arriving inside the T.252 window must clear the SDU without a drop");
+}
+
+// ─── PD-5c-H17: T.252 must start from LAST fragment TX ────────────────────────
+//
+// The AL TX retx clock must not open until UMAC finishes airing the tail of
+// the SDU. For multi-fragment SDUs, LLC pushes all segments in a single tick
+// but UMAC paces them across many frames. Pre-H17, `sent_at` was stamped at
+// submission time — for a 6-segment SDU whose last frag left the air 240 ms
+// after enqueue, T.252 fired before the peer's AL-ACK could physically
+// arrive. Post-H17, each segment carries a `TxReporter`; the T.252 window
+// only opens once every unacked reporter reports `Transmitted`, and the
+// clock is stamped `last_segment_tx_at` on the first tick that observes
+// the tail as transmitted.
+
+/// Establish a link with a peer-negotiated `max_retx`, then push a multi-
+/// fragment SDU. Does NOT mark reporters transmitted — the caller drives
+/// per-segment `mark_transmitted()` at chosen timestamps to exercise the
+/// UMAC pacing behavior.
+#[allow(dead_code)]
+fn establish_and_tx_multifrag_sdu(
+    llc: &mut Llc,
+    queue: &mut MessageQueue,
+    max_retx: u8,
+    sdu: Vec<u8>,
+    expected_segments: usize,
+) {
+    send_setup_to_llc(llc, queue, make_setup_pdu_with_retx(SetupReport::ServiceDefinition, max_retx));
+    drain_queue(queue);
+    llc.rx_prim(queue, make_tla_data_req_al_sap(sdu));
+    drain_queue(queue);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1, "one SDU must be outstanding after tx");
+    assert_eq!(link.outstanding_sdus[0].pdus.len(), expected_segments,
+        "SDU must segment into the expected number of fragments (got {})",
+        link.outstanding_sdus[0].pdus.len());
+    assert_eq!(link.outstanding_sdus[0].segment_reporters.len(), expected_segments,
+        "one TxReporter per fragment must be attached");
+    assert!(link.outstanding_sdus[0].last_segment_tx_at.is_none(),
+        "T.252 clock must not be started before any fragment has been transmitted");
+}
+
+/// Build a 200-byte payload (well under the default 256-byte `max_tl_sdu`
+/// negotiated in tests) which, combined with `set_small_segment_size(llc)`,
+/// segments into ≥ 4 AL-DATA fragments.
+fn multifrag_payload() -> Vec<u8> {
+    (0..200u16).map(|i| (i & 0xff) as u8).collect()
+}
+
+/// Reduce the LLC's segment payload size so the 200-byte payload above
+/// produces multiple fragments. `al_segment_payload_bits` is a pub field
+/// on `Llc` used only by the segmenter.
+fn set_small_segment_size(llc: &mut Llc) {
+    llc.al_segment_payload_bits = 400; // 50 bytes → 4 fragments for 200-byte SDU
+}
+
+/// H17 baseline: a single-fragment SDU whose reporter transitions to
+/// Transmitted at t0 behaves identically to pre-H17 — retx after T.252,
+/// no earlier. This confirms the reporter path is a strict superset of
+/// the old `sent_at` path when UMAC paces a single frag in one frame.
+#[test]
+fn al_tx_single_frag_baseline_unchanged_h17() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    // Tiny SDU so segmenter emits exactly 1 fragment.
+    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, /* max_retx */ 3, b"h17 baseline".to_vec());
+
+    // Just before T.252: no retx.
+    let t_pre = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 - 1);
+    tick_at(&mut llc, &mut queue, t_pre);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus[0].retx_count, 0,
+        "no retx before T.252 (H16 semantics preserved)");
+
+    // One tick past T.252: retx must fire.
+    let t_post = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    let msgs = tick_at(&mut llc, &mut queue, t_post);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert!(link.outstanding_sdus[0].retx_count >= 1,
+        "retx must fire after T.252 for single-frag SDU (baseline)");
+    let umac_pdus: Vec<_> = msgs.iter()
+        .filter(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_)))
+        .collect();
+    assert!(!umac_pdus.is_empty(), "retransmission PDU must be emitted");
+}
+
+/// H17 core case: a multi-fragment SDU whose last fragment leaves the air
+/// 400 ms after enqueue must NOT be dropped even though T.252 (~510 ms)
+/// counted from enqueue would have exhausted before an ACK could arrive.
+/// The AL-ACK arrives 200 ms after the last fragment's air transmission —
+/// well inside T.252 measured from `last_segment_tx_at`.
+#[test]
+fn al_tx_multifrag_no_drop_when_ack_arrives_after_last_frag_h17() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = TdmaTime::default();
+    set_small_segment_size(&mut llc);
+    let sdu = multifrag_payload();
+    // Determine segment count dynamically. The default segmenter for
+    // signalling frames produces multiple fragments for 512-byte payloads.
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_retx(SetupReport::ServiceDefinition, /* max_retx */ 0));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(sdu));
+    drain_queue(&mut queue);
+    let seg_count = {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert_eq!(link.outstanding_sdus.len(), 1);
+        let n = link.outstanding_sdus[0].pdus.len();
+        assert!(n >= 4, "test payload must produce ≥ 4 fragments (got {})", n);
+        assert!(link.outstanding_sdus[0].last_segment_tx_at.is_none(),
+            "T.252 must not start before any fragment is aired");
+        n
+    };
+
+    // Stage 1: at t0 + 100 ms worth of slots, mark the first fragment as
+    // transmitted. The retx tick must NOT yet stamp last_segment_tx_at.
+    let key = test_key();
+    let t_frag_first = t0.add_timeslots((T252_ACK_WAITING_TIMER as i32) / 6); // ~85 ms
+    mark_segment_transmitted(&mut llc, &key, 0);
+    tick_at(&mut llc, &mut queue, t_frag_first);
+    {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert!(link.outstanding_sdus[0].last_segment_tx_at.is_none(),
+            "last_segment_tx_at must remain None until every unacked fragment is Transmitted");
+        assert_eq!(link.outstanding_sdus[0].retx_count, 0);
+    }
+
+    // Stage 2: mark ALL remaining fragments transmitted, then tick at a
+    // timestamp well past the pre-H17 T.252 drop point (t0 + T.252 - 1).
+    // Under pre-H17 semantics this tick would drop/retx the SDU (max_retx=0
+    // ⇒ drop). Post-H17 it must not, because last_segment_tx_at gets
+    // stamped at this very tick and the T.252 window opens fresh here.
+    for idx in 0..seg_count {
+        mark_segment_transmitted(&mut llc, &key, idx);
+    }
+    let t_last_frag = t0.add_timeslots((T252_ACK_WAITING_TIMER as i32) - 10);
+    tick_at(&mut llc, &mut queue, t_last_frag);
+    {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert!(link.outstanding_sdus[0].last_segment_tx_at.is_some(),
+            "last_segment_tx_at must be stamped once every fragment is Transmitted");
+        assert_eq!(link.outstanding_sdus.len(), 1,
+            "multi-fragment SDU must NOT be dropped just because the pre-H17 clock \
+             from enqueue would have expired — H17 measures from last-frag TX");
+        assert_eq!(link.outstanding_sdus[0].retx_count, 0,
+            "no retx yet — T.252 measured from last-frag TX has not elapsed");
+    }
+
+    // Stage 3: AL-ACK for the SDU arrives at half of T.252 past the last
+    // fragment's TX. Still well inside the T.252 window; SDU must be
+    // cleared cleanly.
+    let t_ack = t_last_frag.add_timeslots((T252_ACK_WAITING_TIMER as i32) / 2);
+
+    let ack_pdu = AlAckAlRnr {
+        kind: AlAckAlRnrKind::Ack,
+        first_block: AcknowledgementBlock {
+            n_r: 0,
+            ack_length: AckLength::EntireSduReceived,
+            s_r: None,
+            ack_bitmap: None,
+        },
+        other_blocks: vec![],
+    };
+    let mut buf = BitBuffer::new_autoexpand(64);
+    ack_pdu.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, t_ack, make_tma_ind(buf));
+
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "AL-ACK arriving within T.252 of the last fragment's TX must clear the SDU");
+}
+
+/// H17 exhaustion still fires — just later. A multi-fragment SDU that is
+/// never ACKed must still be dropped (with `max_sdu_retx=0`) or
+/// retransmitted (with `max_sdu_retx≥1`), but only after T.252 has
+/// elapsed *from the last fragment's air transmission*, not from
+/// initial enqueue.
+#[test]
+fn al_tx_multifrag_exhausts_after_t252_past_last_frag_h17() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = TdmaTime::default();
+    set_small_segment_size(&mut llc);
+    let sdu = multifrag_payload();
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_retx(SetupReport::ServiceDefinition, /* max_retx */ 0));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(sdu));
+    drain_queue(&mut queue);
+    let seg_count = {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        link.outstanding_sdus[0].pdus.len()
+    };
+    assert!(seg_count >= 4);
+
+    // Mark all fragments transmitted at t0 (bulk simulation).
+    let key = test_key();
+    for idx in 0..seg_count {
+        mark_segment_transmitted(&mut llc, &key, idx);
+    }
+
+    // Tick at t0 + eps (small delta) — this stamps last_segment_tx_at
+    // = t_tick. Store that so we can measure from it.
+    let t_tick = t0.add_timeslots(1);
+    tick_at(&mut llc, &mut queue, t_tick);
+    let clock_start = {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        link.outstanding_sdus[0].last_segment_tx_at
+            .expect("clock must be stamped once every reporter is Transmitted")
+    };
+
+    // At clock_start + T.252 - 1: SDU must still be outstanding.
+    let t_pre = clock_start.add_timeslots(T252_ACK_WAITING_TIMER as i32 - 1);
+    tick_at(&mut llc, &mut queue, t_pre);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1,
+        "SDU must survive until T.252 elapses past the last fragment's TX");
+
+    // At clock_start + T.252 + 1: max_retx=0 forces drop.
+    let t_post = clock_start.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t_post);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "SDU must be dropped once T.252 measured from last-frag TX elapses (max_retx=0)");
+}
+
+/// H17 retransmission resets the T.252 clock: after retx, the new
+/// TxReporters are Pending again and `last_segment_tx_at` is cleared.
+/// The next T.252 window only opens once the retx tail lands.
+#[test]
+fn al_tx_multifrag_retx_resets_last_segment_tx_at_h17() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = TdmaTime::default();
+    set_small_segment_size(&mut llc);
+    let sdu = multifrag_payload();
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_retx(SetupReport::ServiceDefinition, /* max_retx */ 2));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(sdu));
+    drain_queue(&mut queue);
+    let seg_count = {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        link.outstanding_sdus[0].pdus.len()
+    };
+
+    let key = test_key();
+    for idx in 0..seg_count {
+        mark_segment_transmitted(&mut llc, &key, idx);
+    }
+    let t_stamp = t0.add_timeslots(1);
+    tick_at(&mut llc, &mut queue, t_stamp);
+    let clock_start = {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        link.outstanding_sdus[0].last_segment_tx_at.expect("clock stamped")
+    };
+
+    // Force retx by ticking past T.252.
+    let t_retx = clock_start.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    let msgs = tick_at(&mut llc, &mut queue, t_retx);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1, "SDU must be retxed, not dropped");
+    assert!(link.outstanding_sdus[0].retx_count >= 1, "retx_count must advance");
+    assert!(link.outstanding_sdus[0].last_segment_tx_at.is_none(),
+        "retx must clear last_segment_tx_at so the T.252 clock restarts");
+    // Fresh reporters must be Pending.
+    for rep_opt in &link.outstanding_sdus[0].segment_reporters {
+        let rep = rep_opt.as_ref().expect("reporter present after retx");
+        assert_eq!(rep.get_state(), tetra_core::TxState::Pending,
+            "retx replaces reporters with fresh Pending ones");
+    }
+    let umac_pdus: Vec<_> = msgs.iter()
+        .filter(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_)))
+        .collect();
+    assert!(!umac_pdus.is_empty(), "retransmission PDUs emitted");
+
+    // Ticking again at t_retx + T.252 must NOT drop or retx again — the new
+    // reporters are still Pending, so the T.252 clock is not running.
+    let t_after = t_retx.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t_after);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1,
+        "with reporters still Pending, T.252 clock must not run, so no drop");
+    assert_eq!(link.outstanding_sdus[0].retx_count, 1,
+        "no second retx — clock did not restart until retx tail is Transmitted");
 }

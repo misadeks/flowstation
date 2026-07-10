@@ -141,9 +141,34 @@ pub struct OutstandingSdu {
     /// Encoded AL-DATA / AL-FINAL PDUs in S(S) order.
     pub pdus: Vec<AlDataAlFinal>,
     /// Time this SDU was last (re-)submitted to UMAC; `None` = not yet sent.
+    ///
+    /// NOTE (PD-5c-H17): this stamps the *submission* moment, not the moment
+    /// UMAC actually finished putting the tail of the SDU on the air. It is
+    /// kept for diagnostics / first-send tracking, but the T.252 ACK-wait
+    /// clock is driven by `last_segment_tx_at`, not this field.
     pub sent_at: Option<TdmaTime>,
     /// Per-segment ACK flag indexed by S(S).  `true` = peer confirmed receipt.
     pub acked_segments: Vec<bool>,
+    /// Per-segment `TxReporter` (indexed by S(S)). LLC hands each reporter to
+    /// UMAC when the segment is pushed for transmission; UMAC calls
+    /// `mark_transmitted()` when the PDU actually leaves the air. On
+    /// retransmission the entry is replaced with a fresh `Pending` reporter.
+    /// `None` means the slot has no outstanding TX (already acked or never
+    /// pushed) — such slots are ignored by the T.252 gate.
+    pub segment_reporters: Vec<Option<TxReporter>>,
+    /// dltime at which the T.252 ACK-wait clock started — i.e. the tick on
+    /// which the *last* still-unacked segment of the current transmission
+    /// round transitioned to `Transmitted`. `None` while at least one
+    /// unacked segment is still `Pending` (UMAC has not aired it yet), and
+    /// cleared on retransmission so the clock restarts once the retx tail
+    /// leaves the air.
+    ///
+    /// PD-5c-H17: the previous implementation compared against `sent_at`
+    /// (submission time). For multi-fragment SDUs UMAC paces segments
+    /// across many frames, so `sent_at` fires T.252 too early and the SDU
+    /// is dropped before the peer's AL-ACK for the last fragment can
+    /// physically arrive. Compare against `last_segment_tx_at` instead.
+    pub last_segment_tx_at: Option<TdmaTime>,
     /// Number of SDU-level retransmissions performed so far (vs N.273).
     pub retx_count: u8,
     /// When `true` the SDU is (re)sent on the very next `submit_al_activity_to_umac`
@@ -2042,15 +2067,65 @@ impl Llc {
             if link.phase == AlPhase::Established {
                 let mut sdus_to_remove: Vec<u8> = Vec::new();
                 for sdu in link.outstanding_sdus.iter_mut() {
+                    // PD-5c-H17: gate the T.252 clock on UMAC actually having
+                    // aired the tail of this SDU. `last_segment_tx_at` stays
+                    // `None` until every still-unacked segment reports
+                    // `Transmitted`; at that point we stamp `dltime` and the
+                    // T.252 ACK-wait window opens. Discarded segments (UMAC
+                    // congestion) trigger an immediate `force_retx` so we
+                    // don't stall waiting for a tail that will never fly.
+                    if sdu.last_segment_tx_at.is_none() {
+                        let mut all_transmitted = true;
+                        let mut any_discarded = false;
+                        for (idx, rep_opt) in sdu.segment_reporters.iter().enumerate() {
+                            if sdu.acked_segments.get(idx).copied().unwrap_or(false) {
+                                continue; // ignore already-acked slots
+                            }
+                            match rep_opt {
+                                Some(rep) => {
+                                    if rep.is_discarded() {
+                                        any_discarded = true;
+                                    } else if !rep.is_transmitted() {
+                                        all_transmitted = false;
+                                    }
+                                }
+                                None => {
+                                    // Unacked slot without a reporter — treat
+                                    // as not-yet-transmitted so we don't open
+                                    // the ACK window prematurely.
+                                    all_transmitted = false;
+                                }
+                            }
+                        }
+                        if any_discarded {
+                            sdu.force_retx = true;
+                        } else if all_transmitted && !sdu.segment_reporters.is_empty() {
+                            sdu.last_segment_tx_at = Some(dltime);
+                        }
+                    }
+
                     // ETSI TS 100 392-2 v3.10.1 clause 21.4.5, Annex A.1 T.252
                     // (AL acknowledgement waiting timer, 9 signalling frames
                     // ≈ 510 ms). T.251 is the Basic Link retry timer and must
                     // not be used here — AL RTT on granted PDCH can exceed
                     // T.251 (≈ 226 ms) so a peer-negotiated `max_retx = 0`
                     // would otherwise drop the SDU before its AL-ACK arrives.
-                    let needs_retx = sdu.force_retx || match sdu.sent_at {
-                        Some(t) => dltime.diff(t) as u64 >= T252_ACK_WAITING_TIMER as u64,
-                        None => true, // not yet sent at all
+                    //
+                    // PD-5c-H17: measure against `last_segment_tx_at` — the
+                    // moment UMAC finished airing the tail — not the initial
+                    // submission time. Multi-fragment SDUs whose last frag
+                    // leaves the air hundreds of ms after enqueue would
+                    // otherwise be dropped before the peer's AL-ACK could
+                    // physically arrive. SDUs that have `sent_at == None`
+                    // were buffered while the link was FlowControlled (or
+                    // similarly deferred) and have never been submitted to
+                    // UMAC yet — those still need to be pushed through this
+                    // loop for their *initial* send, so treat them as
+                    // needing tx immediately.
+                    let needs_retx = sdu.force_retx || match (sdu.sent_at, sdu.last_segment_tx_at) {
+                        (None, _) => true, // never sent — initial send from buffered state
+                        (Some(_), None) => false, // tail not yet aired — T.252 has not started
+                        (Some(_), Some(t)) => dltime.diff(t) as u64 >= T252_ACK_WAITING_TIMER as u64,
                     };
                     let has_unacked = sdu.acked_segments.iter().any(|&a| !a);
                     if needs_retx && has_unacked {
@@ -2066,17 +2141,28 @@ impl Llc {
                         }
                         sdu.force_retx = false;
                         sdu.sent_at = Some(dltime);
+                        // PD-5c-H17: retx opens a new T.252 window. Clear the
+                        // previous stamp; it will be re-set once every fresh
+                        // reporter reports `Transmitted`.
+                        sdu.last_segment_tx_at = None;
                         if sdu.retx_count > 0 {
                             sdu.retx_count += 1;
                         } else {
                             // First send (not a retransmission).
                         }
-                        // (Re)send only the unacknowledged segments.
+                        // (Re)send only the unacknowledged segments. Hand a
+                        // fresh `TxReporter` to UMAC per segment so we can
+                        // observe when the tail actually leaves the air.
                         for (idx, pdu) in sdu.pdus.iter().enumerate() {
                             if !sdu.acked_segments.get(idx).copied().unwrap_or(false) {
                                 let mut buf = BitBuffer::new_autoexpand(256);
                                 pdu.to_bitbuf(&mut buf);
                                 buf.seek(0);
+                                let reporter = TxReporter::new();
+                                // Overwrite any stale reporter for this slot.
+                                if idx < sdu.segment_reporters.len() {
+                                    sdu.segment_reporters[idx] = Some(reporter.clone());
+                                }
                                 msgs.push(SapMsg {
                                     sap: Sap::TmaSap,
                                     src: TetraEntity::Llc,
@@ -2094,7 +2180,7 @@ impl Llc {
                                         stealing_repeats_flag: None,
                                         data_category: None,
                                         chan_alloc: None,
-                                        tx_reporter: None,
+                                        tx_reporter: Some(reporter),
                                         packet_data_flag: false, // AL retransmissions are signalling
                                     }),
                                 });
@@ -2453,6 +2539,11 @@ impl Llc {
 
         let seg_count = output.pdus.len();
         let acked_segments = vec![false; seg_count];
+        // PD-5c-H17: create one TxReporter per segment so LLC can observe
+        // (via UMAC's `mark_transmitted`) when the tail actually leaves the
+        // air. UMAC paces segments across many frames; the T.252 ACK-wait
+        // clock must not start until the last one is gone.
+        let reporters: Vec<TxReporter> = (0..seg_count).map(|_| TxReporter::new()).collect();
 
         let link = self.al_links.get_mut(&key).ok_or(AlError::UnknownLink(key))?;
         link.next_n_s = (n_s + 1) % (tx_window + 1);
@@ -2461,6 +2552,8 @@ impl Llc {
             pdus: output.pdus.clone(),
             sent_at: None,
             acked_segments,
+            segment_reporters: reporters.iter().cloned().map(Some).collect(),
+            last_segment_tx_at: None,
             retx_count: 0,
             force_retx: false,
         });
@@ -2468,7 +2561,7 @@ impl Llc {
         let link = self.al_links.get(&key).ok_or(AlError::UnknownLink(key))?;
         let is_established = link.phase == AlPhase::Established;
         if is_established {
-            for pdu in &output.pdus {
+            for (pdu, reporter) in output.pdus.iter().zip(reporters.iter()) {
                 let mut buf = BitBuffer::new_autoexpand(256);
                 pdu.to_bitbuf(&mut buf);
                 buf.seek(0);
@@ -2489,7 +2582,7 @@ impl Llc {
                         stealing_repeats_flag: None,
                         data_category: None,
                         chan_alloc: None,
-                        tx_reporter: None,
+                        tx_reporter: Some(reporter.clone()),
                         packet_data_flag: false, // AL SDU segments are signalling
                     }),
                 });
