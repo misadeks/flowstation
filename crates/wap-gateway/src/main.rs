@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use wap_gateway::wtp::WtpPdu;
+use wap_gateway::wtp::{Responder, ResponderConfig, handler_fn};
 use wap_gateway::{GatewayConfig, wdp::Wdp};
 
 #[derive(Parser, Debug)]
@@ -55,7 +55,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!(local = %wdp.local_addr(), "UDP socket bound");
 
-    let recv_task = tokio::spawn(receive_loop(wdp.clone()));
+    // Placeholder handler for PD-10a: echo a 3-byte WSP Disconnect stub so we
+    // exercise the full Invoke → Ack → Result → Ack path from real MS
+    // hardware. PD-10b replaces this with a WSP-CO ConnectReply handler and
+    // PD-10c with a WSP Get → HTTP → WSP Reply pipeline.
+    let handler = handler_fn(|_peer, _payload| async move {
+        // WSP Disconnect PDU: PDU type = 5 (Disconnect) followed by a
+        // 1-octet session-id-uintvar of 0. This keeps the responder honest
+        // on-wire without pretending to be a fully functional gateway yet.
+        vec![0x05, 0x00, 0x00]
+    });
+    let responder = Responder::new(wdp, handler, ResponderConfig::default());
+    let recv_task = tokio::spawn(async move { responder.run().await });
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -63,9 +74,9 @@ async fn main() -> anyhow::Result<()> {
         }
         res = recv_task => {
             match res {
-                Ok(Ok(())) => warn!("receive loop exited without error"),
-                Ok(Err(e)) => error!(err = %e, "receive loop failed"),
-                Err(e)     => error!(err = %e, "receive loop panicked"),
+                Ok(Ok(())) => warn!("responder exited without error"),
+                Ok(Err(e)) => error!(err = %e, "responder failed"),
+                Err(e)     => error!(err = %e, "responder panicked"),
             }
         }
     }
@@ -86,23 +97,20 @@ fn reinit_tracing_if_needed(level: &str) {
 
 /// Read datagrams forever, decode the WTP header, and log summaries.
 ///
-/// The full responder FSM lands in PD-10a-3; for now this proves the UDP
-/// path is alive end-to-end and confirms byte-level ingestion by echoing
-/// decoded PDU type + TID to logs.
+/// Retained for reference; the live loop now runs through
+/// [`Responder`]. Kept here so a future v0.2+ "monitor mode" can be
+/// re-attached without re-deriving the log formatting.
+#[allow(dead_code)]
 #[tracing::instrument(skip(wdp))]
 async fn receive_loop(wdp: Wdp) -> anyhow::Result<()> {
+    use tracing::debug;
+    use wap_gateway::wtp::WtpPdu;
     loop {
         let (peer, bytes) = wdp.recv().await.context("wdp recv")?;
         let head = hex_head(&bytes, 32);
         match WtpPdu::decode(&bytes) {
             Ok(pdu) => {
-                info!(
-                    %peer,
-                    ty = ?pdu.pdu_type(),
-                    tid = pdu.tid(),
-                    len = bytes.len(),
-                    "wtp pdu"
-                );
+                info!(%peer, ty = ?pdu.pdu_type(), tid = pdu.tid(), len = bytes.len(), "wtp pdu");
                 debug!(%peer, head = %head, "wtp pdu bytes (first 32)");
             }
             Err(e) => {
@@ -113,6 +121,7 @@ async fn receive_loop(wdp: Wdp) -> anyhow::Result<()> {
 }
 
 /// Render up to `max` bytes of `buf` as hex.
+#[allow(dead_code)]
 fn hex_head(buf: &[u8], max: usize) -> String {
     let mut s = String::with_capacity(max * 3);
     for (i, b) in buf.iter().take(max).enumerate() {

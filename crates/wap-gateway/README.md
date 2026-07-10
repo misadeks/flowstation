@@ -25,7 +25,7 @@ control over the Openwave quirks.
 |-----------|--------|----------------------------------------------------------|
 | PD-10a-1  | ✅     | Crate skeleton, TOML config, UDP loop                    |
 | PD-10a-2  | ✅     | WTP PDU codec (Invoke, Result, Ack, Abort, SAR, N-Ack)   |
-| PD-10a-3  | ⏳     | WTP responder state machine (class 2, retx, SAR)         |
+| PD-10a-3  | ✅     | WTP responder state machine (class 2, retx, SAR)         |
 | PD-10b    | ⏳     | WSP-CO Connect / ConnectReply with Openwave cap echo     |
 | PD-10c    | ⏳     | WSP Get → HTTP backend → WSP Reply                       |
 
