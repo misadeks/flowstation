@@ -622,6 +622,30 @@ voice_service = true
 
 ###############################################################################
 
+# OPTIONAL: WAP 1.x gateway (PD-10) — in-process replacement for Kannel.
+#
+# When enabled, bluestation-bs opens a UDP socket on `<listen_addr>:<listen_port>`
+# and services WSP-CO requests from Motorola MTP3550 handsets (UP.Browser 6.3).
+# Requires [packet_data].enabled = true (the UDP socket binds on the TUN address).
+# All fields except `enabled` are optional; defaults shown.
+#
+# [wap_gateway]
+# enabled = false
+#
+# # Overrides [packet_data].tun_addr when set. Most operators leave this unset.
+# # listen_addr = "192.168.100.1"
+#
+# # UDP port the gateway listens on. 9201 is the WSP connection-oriented default.
+# listen_port  = 9201
+#
+# # HTTP backend that serves the WML/WBXML pages the gateway proxies.
+# upstream_url = "http://127.0.0.1:8081"
+#
+# # tracing env-filter directive for gateway logs.
+# log_level    = "info"
+
+###############################################################################
+
 # OPTIONAL: Web dashboard — accessible at http://<BTS-IP>:8080 (FlowStation)
 #
 # Live view of terminals, active calls, log, config editor, kick and SDS.

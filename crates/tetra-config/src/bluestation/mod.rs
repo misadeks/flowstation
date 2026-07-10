@@ -67,5 +67,8 @@ pub use sec_llc::*;
 pub mod sec_packet_data;
 pub use sec_packet_data::*;
 
+pub mod sec_wap_gateway;
+pub use sec_wap_gateway::*;
+
 pub mod state;
 pub use state::*;

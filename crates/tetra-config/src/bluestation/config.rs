@@ -13,6 +13,7 @@ use super::sec_llc::CfgLlc;
 use super::sec_packet_data::CfgPacketData;
 use super::sec_telegram::CfgTelegram;
 use super::sec_telemetry::CfgTelemetry;
+use super::sec_wap_gateway::CfgWapGateway;
 
 /// Wrapper for a string that should be treated as a secret. Display and Debug will redact the actual value,
 /// to prevent accidental logging of secrets.
@@ -128,6 +129,10 @@ pub struct StackConfig {
     /// Packet-data runtime configuration.  Always present;
     /// defaults match PD-4/PD-5's prior hardcoded values.
     pub packet_data: CfgPacketData,
+
+    /// WAP 1.x gateway runtime configuration (PD-10). Disabled by default;
+    /// bluestation-bs spawns the gateway task only when `enabled = true`.
+    pub wap_gateway: CfgWapGateway,
 }
 
 impl StackConfig {
