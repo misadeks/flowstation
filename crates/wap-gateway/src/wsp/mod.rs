@@ -14,4 +14,5 @@
 //!   WTP-handler adapter that dispatches PDUs to it.
 
 pub mod caps;
+pub mod pdu;
 pub mod uintvar;
