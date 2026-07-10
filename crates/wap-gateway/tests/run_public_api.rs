@@ -40,7 +40,11 @@ async fn run_serves_invoke_and_shuts_down_on_cancel() {
     let gw = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port());
 
     let invoke = WtpPdu::Invoke {
-        flags: HeaderFlags { gtr: false, ttr: true, rid: false },
+        flags: HeaderFlags {
+            gtr: false,
+            ttr: true,
+            rid: false,
+        },
         tid: 0x00CD,
         version: 0,
         tid_new: true,
@@ -54,8 +58,10 @@ async fn run_serves_invoke_and_shuts_down_on_cancel() {
     let mut got_result = false;
     for _ in 0..2 {
         let mut buf = [0u8; 2048];
-        let (n, _peer) =
-            tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await.expect("recv timed out").unwrap();
+        let (n, _peer) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("recv timed out")
+            .unwrap();
         let pdu = WtpPdu::decode(&buf[..n]).expect("valid PDU from gateway");
         match pdu {
             WtpPdu::Ack { tid, .. } => {
@@ -75,6 +81,9 @@ async fn run_serves_invoke_and_shuts_down_on_cancel() {
 
     // Now cooperative shutdown.
     shutdown.cancel();
-    let outcome = tokio::time::timeout(Duration::from_secs(2), task).await.expect("gateway did not shut down in time").unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("gateway did not shut down in time")
+        .unwrap();
     assert!(outcome.is_ok(), "gateway returned error: {outcome:?}");
 }
