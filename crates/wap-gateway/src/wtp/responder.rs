@@ -444,8 +444,9 @@ async fn sweep_loop(resp: Responder) {
 // ── Result segmentation ──────────────────────────────────────────────────────
 
 /// Chop `payload` into a `Result` PDU followed by zero or more
-/// `SegmentedResult` PDUs, all sharing `tid`. The last PDU carries
-/// `GTR=1, TTR=1`; single-segment Results carry `TTR=1` alone.
+/// `SegmentedResult` PDUs, all sharing `tid`. For a group of N>1 segments the
+/// closing Segmented Result carries `GTR=1, TTR=1`; single-segment (unsegmented)
+/// Results carry `GTR=0, TTR=1` only, per WAP-201 §8.4.3.
 pub(crate) fn segment_result(tid: u16, payload: &[u8]) -> Vec<Vec<u8>> {
     let chunks: Vec<&[u8]> = if payload.is_empty() {
         vec![&[][..]]
@@ -457,8 +458,12 @@ pub(crate) fn segment_result(tid: u16, payload: &[u8]) -> Vec<Vec<u8>> {
 
     for (i, chunk) in chunks.iter().enumerate() {
         let is_last = i == n - 1;
+        // WAP-201 §8.4.3 unsegmented Result: GTR=0, TTR=1.
+        // For a group of N>1 segments the closing Segmented Result carries
+        // GTR=1, TTR=1; intermediate segments GTR=0, TTR=0.
+        let is_segmented_group = n > 1;
         let flags = HeaderFlags {
-            gtr: is_last,
+            gtr: is_last && is_segmented_group,
             ttr: is_last,
             rid: false,
         };
@@ -497,12 +502,25 @@ mod tests {
         match pdu {
             WtpPdu::Result { flags, tid, payload } => {
                 assert_eq!(tid, 0x1234);
+                // WAP-201 §8.4.3: unsegmented Result = TTR=1, GTR=0.
                 assert!(flags.ttr);
-                assert!(flags.gtr);
+                assert!(!flags.gtr);
+                assert!(!flags.rid);
                 assert_eq!(payload, b"hello");
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Regression: on hardware, MS UP.Browser silently discarded our single-segment
+    /// Result and re-Invoked repeatedly when we set GTR=1 alongside TTR=1. The fix
+    /// (GTR=0 on unsegmented Results) is validated by the wire byte here: octet 0
+    /// must be exactly 0x12 (Type=Result=0010, GTR=0, TTR=1, RID=0).
+    #[test]
+    fn segment_result_single_segment_octet0_is_0x12() {
+        let out = segment_result(0x14b1, b"abc");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0], 0x12, "unsegmented Result octet 0 must be 0x12 for UP.Browser compat");
     }
 
     #[test]
