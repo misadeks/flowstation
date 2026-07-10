@@ -318,7 +318,15 @@ impl Responder {
                 drop(txn);
                 info!(%peer, tid, "H33: re-Invoke on ResultSent txn — replaying cached Result");
                 for bytes in &segments {
-                    if let Err(e) = self.wdp.send(peer, bytes).await {
+                    // H33+H34: flip WTP RID bit on the replayed bytes so MS
+                    // sees this as a retransmission (matches retransmit_result
+                    // behavior). Some MS-side WTP clients discard duplicate
+                    // Results with RID=0 and only accept RID=1 for retries.
+                    let mut retx = bytes.clone();
+                    if let Some(first) = retx.first_mut() {
+                        *first |= 0b0000_0001;
+                    }
+                    if let Err(e) = self.wdp.send(peer, &retx).await {
                         warn!(peer = %peer, tid, err = %e, "H33: failed to replay Result");
                         return Ok(());
                     }
@@ -499,11 +507,17 @@ impl Responder {
             return;
         };
         if txn.retx_count >= self.cfg.max_retx {
-            warn!(%peer, tid, retx = txn.retx_count, "max retx reached; giving up");
-            txn.phase = Phase::Done;
+            // PD-10c-H34 (2026-07-11 hardware fix): with max_retx=0 (H30) we
+            // used to remove the txn immediately here. That created a window
+            // where MS's WTP-layer retry (typically 4-9 s later on MTP3550)
+            // landed on an empty slot, forcing us to re-run the handler
+            // from scratch. Instead, keep the txn alive in ResultSent state
+            // so H33 (re-Invoke replay) catches MS retries and re-sends the
+            // byte-identical cached Result. The txn is still evicted by
+            // last_activity + idle_timeout (default 90 s) so no permanent
+            // memory pressure.
+            debug!(%peer, tid, retx = txn.retx_count, "max retx reached; keeping txn cached for potential MS re-Invoke (H34)");
             txn.retx_at = None;
-            drop(txn);
-            self.txns.remove(&key);
             return;
         }
         txn.retx_count += 1;
