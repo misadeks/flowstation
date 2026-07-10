@@ -232,6 +232,14 @@ pub struct LtpdMleUnitdataReq {
     /// MLE forwards this unchanged through the LTPD→TLA path; LLC and UMAC
     /// already thread it end-to-end on the TLA and TMA SAPs.
     pub chan_alloc: Option<CmceChanAllocReq>,
+    /// PD-5c-H14: N.261 Advanced Link number (0..=3) captured by SNDCP from
+    /// the most recent uplink AL frame (via `LtpdMleUnitdataInd.al_link_number`,
+    /// H13). When `Some`, MLE routes the downlink onto `TlaTlDataReqAl` so LLC
+    /// segments it as AL-DATA on the MS's open AL link. `None` keeps the
+    /// legacy BL path (`TlaTlDataReqBl`) — required for SNDCP control PDUs
+    /// (SN-ACTIVATE/PAGE) that must ride BL before the AL exists, and for any
+    /// non-packet-data ack-BL traffic (CMCE/MM).
+    pub al_link_number: Option<u8>,
 }
 
 #[derive(Debug, Clone)]

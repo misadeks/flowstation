@@ -185,13 +185,28 @@ pub struct PdpContext {
     /// Link-layer addressing captured from the uplink ACTIVATE DEMAND.
     pub link_id: u32,
     pub endpoint_id: u32,
-    /// PD-5c-H13: Advanced Link (link_id, endpoint_id) learned from the most
-    /// recent uplink SN-DATA/UNITDATA whose `LtpdMleUnitdataInd.al_link_number`
-    /// was `Some`. When set, downlink user-data SN-PDUs prefer this tuple over
-    /// the BL tuple above, so the reply reaches the MS on the AL it opened for
-    /// the data phase rather than the BL that carried the ACTIVATE DEMAND.
+    /// PD-5c-H13/H14: Advanced Link tuple learned from the most recent uplink
+    /// SN-DATA/UNITDATA whose `LtpdMleUnitdataInd.al_link_number` was `Some`.
+    /// When set, downlink user-data SN-PDUs prefer this tuple over the BL
+    /// tuple above, so the reply reaches the MS on the AL it opened for the
+    /// data phase rather than the BL that carried the ACTIVATE DEMAND.
     /// `None` until we see the first uplink AL frame; falls back to BL then.
-    pub al_link: Option<(u32, u32)>,
+    ///
+    /// H14: the tuple now also carries the N.261 `al_link_number` (0..=3) so
+    /// MLE can address the correct AL segmenter via `TlaTlDataReqAl`.
+    pub al_link: Option<AlLinkTuple>,
+}
+
+/// PD-5c-H14: SNDCP-cached Advanced Link addressing for a PDP context.
+///
+/// `link_id` / `endpoint_id` mirror the LLC-side addressing (u32 aliases from
+/// `tetra_core::sap_fields`); `al_link_number` is the N.261 index (0..=3) that
+/// LLC's AL entities key on when segmenting/reassembling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlLinkTuple {
+    pub link_id: u32,
+    pub endpoint_id: u32,
+    pub al_link_number: u8,
 }
 
 /// Uplink IP payload surfaced to the higher layer (pd-gateway / tests).
@@ -570,8 +585,14 @@ impl Sndcp {
         // PD-5c-H13: if this SN-UNITDATA rode in on an Advanced Link, remember
         // the (link_id, endpoint_id) so subsequent downlinks route back on the
         // same AL instead of the BL captured at ACTIVATE DEMAND time.
-        if ind.al_link_number.is_some() {
-            ctx.al_link = Some((ind.link_id, ind.endpoint_id));
+        // PD-5c-H14: also remember the N.261 `al_link_number` so MLE can address
+        // the AL segmenter via `TlaTlDataReqAl.al_link_number`.
+        if let Some(n) = ind.al_link_number {
+            ctx.al_link = Some(AlLinkTuple {
+                link_id: ind.link_id,
+                endpoint_id: ind.endpoint_id,
+                al_link_number: n,
+            });
         }
 
         self.uplink_ip_queue.push_back(GatewayUplink {
@@ -712,7 +733,7 @@ impl Sndcp {
         };
         send_downlink_with_chan_alloc(
             queue, main_address, ind.link_id, ind.endpoint_id,
-            sdu, Layer2Service::Acknowledged, false, Some(chan_alloc),
+            sdu, Layer2Service::Acknowledged, false, Some(chan_alloc), None,
         );
     }
 
@@ -764,8 +785,13 @@ impl Sndcp {
         // PD-5c-H13: if this SN-DATA rode in on an Advanced Link, remember the
         // (link_id, endpoint_id) so subsequent downlink SN-DATA routes back on
         // the same AL instead of the BL captured at ACTIVATE DEMAND time.
-        if ind.al_link_number.is_some() {
-            ctx.al_link = Some((ind.link_id, ind.endpoint_id));
+        // PD-5c-H14: also cache the N.261 `al_link_number` for the AL segmenter.
+        if let Some(n) = ind.al_link_number {
+            ctx.al_link = Some(AlLinkTuple {
+                link_id: ind.link_id,
+                endpoint_id: ind.endpoint_id,
+                al_link_number: n,
+            });
         }
 
         self.uplink_ip_queue.push_back(GatewayUplink {
@@ -988,6 +1014,7 @@ impl Sndcp {
         // paging must reach the MS on a control channel it is monitoring.
         let (data_link_id, data_endpoint_id) = ctx
             .al_link
+            .map(|t| (t.link_id, t.endpoint_id))
             .unwrap_or((link_id, endpoint_id));
 
         match ctx.state {
@@ -1079,9 +1106,12 @@ impl Sndcp {
         // BL tuple captured at ACTIVATE DEMAND time. Once the MS has opened an
         // Advanced Link for the data phase, downlink SN-DATA must ride that AL
         // or LLC will wrap it as BL-DATA on MCCH and the MS will ignore it.
-        let (link_id, endpoint_id) = ctx
-            .al_link
-            .unwrap_or((ctx.link_id, ctx.endpoint_id));
+        // PD-5c-H14: also thread the cached N.261 `al_link_number` so MLE can
+        // emit `TlaTlDataReqAl` (BL fallback keeps `al_link_number = None`).
+        let (link_id, endpoint_id, al_link_number) = match ctx.al_link {
+            Some(t) => (t.link_id, t.endpoint_id, Some(t.al_link_number)),
+            None => (ctx.link_id, ctx.endpoint_id, None),
+        };
 
         ctx.ready_deadline = Some(self.dltime.add_timeslots(READY_TIMER_SLOTS));
         ctx.last_activity = self.dltime;
@@ -1093,8 +1123,8 @@ impl Sndcp {
             return;
         }
         sdu.seek(0);
-        send_downlink(queue, main_address, link_id, endpoint_id, sdu,
-            Layer2Service::Acknowledged, true);
+        send_downlink_with_al(queue, main_address, link_id, endpoint_id, sdu,
+            Layer2Service::Acknowledged, true, al_link_number);
     }
 
     // -- Timer housekeeping ----------------------------------------------------
@@ -1251,7 +1281,27 @@ fn send_downlink(
 ) {
     send_downlink_with_chan_alloc(
         queue, main_address, link_id, endpoint_id,
-        sdu, layer2service, packet_data_flag, None,
+        sdu, layer2service, packet_data_flag, None, None,
+    );
+}
+
+/// PD-5c-H14: send a downlink request that carries an N.261 `al_link_number`
+/// so MLE routes it onto `TlaTlDataReqAl` (Advanced Link) rather than the
+/// default `TlaTlDataReqBl`. Used for downlink SN-DATA once SNDCP has learned
+/// the MS's AL from an uplink AL frame.
+fn send_downlink_with_al(
+    queue: &mut MessageQueue,
+    main_address: TetraAddress,
+    link_id: u32,
+    endpoint_id: u32,
+    sdu: BitBuffer,
+    layer2service: Layer2Service,
+    packet_data_flag: bool,
+    al_link_number: Option<u8>,
+) {
+    send_downlink_with_chan_alloc(
+        queue, main_address, link_id, endpoint_id,
+        sdu, layer2service, packet_data_flag, None, al_link_number,
     );
 }
 
@@ -1268,6 +1318,7 @@ fn send_downlink_with_chan_alloc(
     layer2service: Layer2Service,
     packet_data_flag: bool,
     chan_alloc: Option<CmceChanAllocReq>,
+    al_link_number: Option<u8>,
 ) {
     queue.push_back(SapMsg {
         sap: Sap::TlpdSap,
@@ -1283,6 +1334,7 @@ fn send_downlink_with_chan_alloc(
             air_interface_encryption: None,
             tx_reporter: None,
             chan_alloc,
+            al_link_number,
         }),
     });
 }

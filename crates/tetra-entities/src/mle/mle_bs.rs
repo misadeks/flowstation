@@ -6,7 +6,7 @@ use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, Sap, TdmaTime, Te
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::lmm::LmmMleUnitdataInd;
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
-use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataReqBl};
+use tetra_saps::tla::{TlaTlDataReqAl, TlaTlDataReqBl, TlaTlUnitdataReqBl};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
@@ -301,10 +301,16 @@ impl MleBs {
 
     fn rx_tlpd_prim(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlpd_prim");
-        // NOTE: spec ambiguous - PD-3 dispatches both Bl and "Ack service on BL"
-        // (BL supports acknowledged transfers via BL-DATA). Real AL routing requires
-        // SNDCP to supply an al_link_number, which lands in PD-4 if that path is
-        // chosen. Until then, Acknowledged -> TlaTlDataReqBl.
+        // PD-5c-H14: three-way split of the downstream TLA request.
+        //   - Unacknowledged             -> TlaTlUnitdataReqBl (BL-UNITDATA)
+        //   - Acknowledged + AL          -> TlaTlDataReqAl     (AL-DATA, packet data)
+        //   - Acknowledged + no AL       -> TlaTlDataReqBl     (BL-DATA fallback)
+        //
+        // The AL branch fires only when SNDCP populates `al_link_number`
+        // (H14), which it does after learning the MS's AL from an uplink AL
+        // frame (H13). Pre-AL-learn SNDCP control traffic (SN-ACTIVATE, PAGE
+        // REQUEST) and any non-packet-data ack-BL traffic (CMCE/MM) still
+        // ride BL-DATA.
         let SapMsgInner::LtpdMleUnitdataReq(prim) = &mut message.msg else {
             tracing::error!("BUG: unexpected message on TlpdSap: {:?}", message);
             return;
@@ -340,6 +346,38 @@ impl MleBs {
                     data_class_info: None,
                     req_handle: 0,
                     chan_alloc: chan_alloc.clone(),
+                    tx_reporter: prim.tx_reporter.take(),
+                }),
+            }
+        } else if prim.packet_data_flag && prim.al_link_number.is_some() {
+            // PD-5c-H14: SNDCP has cached the MS's Advanced Link — route the
+            // downlink SN-DATA onto AL so LLC's AL segmenter emits AL-DATA
+            // that advances the MS's AL RX window (BL-DATA would be ignored).
+            if chan_alloc.is_some() {
+                // AL downlink implies the PDCH grant was already negotiated
+                // on the uplink AL handshake; piggybacking a fresh chan_alloc
+                // is not meaningful here and there is no wire slot for it on
+                // TlaTlDataReqAl. Drop with a warning so we notice if this
+                // ever fires in the wild.
+                tracing::warn!(
+                    "PD-5c-H14: dropping chan_alloc piggyback on AL downlink; \
+                     AL grants are already delivered on the uplink handshake"
+                );
+            }
+            SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Llc,
+                msg: SapMsgInner::TlaTlDataReqAl(TlaTlDataReqAl {
+                    main_address: prim.main_address,
+                    link_id: prim.link_id,
+                    endpoint_id: prim.endpoint_id,
+                    al_link_number: prim.al_link_number.unwrap(),
+                    tl_sdu: pdu,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: prim.air_interface_encryption,
+                    req_handle: 0,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }
