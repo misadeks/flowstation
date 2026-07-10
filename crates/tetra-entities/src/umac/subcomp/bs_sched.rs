@@ -552,7 +552,24 @@ impl BsChannelScheduler {
         res_req: &ReservationRequirement,
     ) -> Option<(BasicSlotgrant, Option<u8>)> {
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
-        let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+        let raw_requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+
+        // PD-5c-H32 (2026-07-11 hardware fix): the scheduler can walk at most
+        // MACSCHED_NUM_FRAMES-1 = 17 usable frames on a target UL timeslot
+        // (frame 18 is skipped). If MS asks for Req25Slots or Req34Slots we
+        // physically cannot grant that many in a single multiframe scan;
+        // returning None (old behavior) left MS re-requesting the same value
+        // every ~1 s in a tight loop with no progress and hung the radio.
+        // Always grant as much as our window allows — 17 slots for large
+        // requests. MS uses what we give and re-requests the rest if it
+        // still needs more (standard TETRA behavior per ETSI §21.5.2).
+        let requested_cap = raw_requested_cap.min(MACSCHED_NUM_FRAMES - 1);
+        if requested_cap != raw_requested_cap {
+            tracing::debug!(
+                "ul_process_cap_req: capping res_req {:?} ({} slots) to {} slots (scheduler window limit) for addr {}",
+                res_req, raw_requested_cap, requested_cap, addr
+            );
+        }
 
         // PD-5c-H7: MS keeps piggybacking `reservation_req` on every uplink
         // frame while its multi-slot reservation is active. Per ETSI
