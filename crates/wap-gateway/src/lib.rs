@@ -52,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::wdp::Wdp;
+use crate::wsp::session::{WspGatewayState, WspHandler};
 use crate::wtp::{Responder, ResponderConfig, handler_fn};
 
 /// Runtime configuration for [`run`].
@@ -76,12 +77,14 @@ pub struct RunConfig {
 /// `bluestation-bs`. Pass [`CancellationToken::new`] if you don't need
 /// cooperative shutdown.
 ///
-/// # Placeholder handler
+/// # WSP handler
 ///
-/// Until PD-10b lands, [`run`] responds to every completed Invoke with a
-/// 3-byte WSP Disconnect stub. This is enough to exercise the full
-/// Invoke → Ack → Result → Ack path against real MS hardware without
-/// pretending to be a functional WSP-CO gateway yet.
+/// [`run`] instantiates a [`WspHandler`] backed by a fresh
+/// [`WspGatewayState`] and wires it into the WTP responder. On every
+/// completed Class-2 Invoke the handler decodes the WSP PDU, dispatches
+/// Connect / Disconnect through the session state machine, and answers
+/// any other PDU with WSP status `501 Not Implemented` (PD-10c replaces
+/// that stub with the real HTTP relay).
 #[tracing::instrument(skip_all, fields(listen = %format!("{}:{}", cfg.listen_addr, cfg.listen_port)))]
 pub async fn run(cfg: RunConfig, shutdown: CancellationToken) -> WapResult<()> {
     let bind: SocketAddr = SocketAddr::new(IpAddr::V4(cfg.listen_addr), cfg.listen_port);
@@ -92,13 +95,14 @@ pub async fn run(cfg: RunConfig, shutdown: CancellationToken) -> WapResult<()> {
         "wap-gateway listening",
     );
 
-    let handler = handler_fn(|_peer, _payload| async move {
-        // WSP Disconnect stub: Type=5, followed by a 1-byte uintvar session
-        // id 0 and a trailing padding zero. Just enough to be a well-formed
-        // Result payload; PD-10b replaces this with the real WSP-CO
-        // ConnectReply / Reply builder.
-        vec![0x05, 0x00, 0x00]
-    });
+    let wsp_state = WspGatewayState::new();
+    let handler = {
+        let wsp = WspHandler::new(wsp_state);
+        handler_fn(move |peer, payload| {
+            let wsp = wsp.clone();
+            async move { wsp.handle(peer, payload).await }
+        })
+    };
     let responder = Responder::new(wdp, handler, ResponderConfig::default());
 
     tokio::select! {

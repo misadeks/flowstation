@@ -15,4 +15,5 @@
 
 pub mod caps;
 pub mod pdu;
+pub mod session;
 pub mod uintvar;
