@@ -60,6 +60,25 @@ impl CfgWapGateway {
             log_level: DEFAULT_WAP_LOG_LEVEL.to_owned(),
         }
     }
+
+    /// Resolve the effective UDP bind address.
+    ///
+    /// Convenience helper for callers who prefer late-resolution instead of
+    /// trusting the value materialised by [`apply_wap_gateway_patch`] at
+    /// parse time. Falls back to `packet_data_tun_addr` when the operator
+    /// did not set an explicit override. Kept idempotent so calling it
+    /// after `apply_wap_gateway_patch` still returns the same address.
+    pub fn resolved_listen_addr(&self, packet_data_tun_addr: Ipv4Addr) -> Ipv4Addr {
+        // `apply_wap_gateway_patch` already materialised `listen_addr`; the
+        // only case where it can still equal `Ipv4Addr::UNSPECIFIED` is if
+        // the caller built a `CfgWapGateway` by hand without going through
+        // the validator. Handle that gracefully.
+        if self.listen_addr.is_unspecified() {
+            packet_data_tun_addr
+        } else {
+            self.listen_addr
+        }
+    }
 }
 
 // ─── Serde DTO ───────────────────────────────────────────────────────────────
@@ -251,6 +270,20 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.listen_addr, TUN);
+    }
+
+    #[test]
+    fn resolved_listen_addr_uses_explicit_when_set() {
+        let mut cfg = CfgWapGateway::disabled(TUN);
+        cfg.listen_addr = Ipv4Addr::new(127, 0, 0, 5);
+        assert_eq!(cfg.resolved_listen_addr(TUN), Ipv4Addr::new(127, 0, 0, 5));
+    }
+
+    #[test]
+    fn resolved_listen_addr_falls_back_to_tun_when_unspecified() {
+        let mut cfg = CfgWapGateway::disabled(TUN);
+        cfg.listen_addr = Ipv4Addr::UNSPECIFIED;
+        assert_eq!(cfg.resolved_listen_addr(TUN), TUN);
     }
 
     #[test]
