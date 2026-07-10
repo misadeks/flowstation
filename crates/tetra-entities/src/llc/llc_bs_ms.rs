@@ -28,8 +28,9 @@ use tetra_pdus::llc::al::error::SegmentationError;
 use tetra_pdus::llc::al::reassembler::{Reassembler, ReassemblerFeed, UnackReassembler, UnackReassemblerFeed};
 use tetra_pdus::llc::al::segmenter::{SegmenterConfig, UnackSegmenterConfig, segment_sdu, segment_unack_sdu};
 use tetra_pdus::llc::consts::timers::{
-    T261_SETUP_WAITING_TIMER, T263_DISCONNECT_WAITING_TIMER, T265_RECONNECT_WAITING_TIMER,
-    T271_RECEIVER_NOT_READY_FOR_TX_TIMER, T272_RECEIVER_NOT_READY_FOR_RX_TIMER,
+    T252_ACK_WAITING_TIMER, T261_SETUP_WAITING_TIMER, T263_DISCONNECT_WAITING_TIMER,
+    T265_RECONNECT_WAITING_TIMER, T271_RECEIVER_NOT_READY_FOR_TX_TIMER,
+    T272_RECEIVER_NOT_READY_FOR_RX_TIMER,
 };
 use tetra_pdus::llc::enums::advanced_link_service::AdvancedLinkService;
 use tetra_pdus::llc::enums::advanced_link_type::AdvancedLinkType;
@@ -2004,8 +2005,10 @@ impl Llc {
     /// Called from `tick_end` to handle AL retransmissions, deferred ACKs, and
     /// timer expiry for every known link.
     ///
-    /// ETSI TS 100 392-2 v3.10.1 clauses 21.4.2 – 21.4.7, timers T.251/T.261/
-    /// T.263/T.265/T.271/T.272.
+    /// ETSI TS 100 392-2 v3.10.1 clauses 21.4.2 – 21.4.7, timers T.252/T.261/
+    /// T.263/T.265/T.271/T.272. Note: T.251 is a *Basic Link* timer and is
+    /// deliberately not used on the AL retx path — AL uses T.252 (Annex A.1,
+    /// "AL acknowledgement waiting timer", 9 signalling frames ≈ 510 ms).
     fn submit_al_activity_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
         let dltime = self.dltime;
         // Extract config-driven retry limits before the loop to avoid borrow conflicts
@@ -2039,8 +2042,14 @@ impl Llc {
             if link.phase == AlPhase::Established {
                 let mut sdus_to_remove: Vec<u8> = Vec::new();
                 for sdu in link.outstanding_sdus.iter_mut() {
+                    // ETSI TS 100 392-2 v3.10.1 clause 21.4.5, Annex A.1 T.252
+                    // (AL acknowledgement waiting timer, 9 signalling frames
+                    // ≈ 510 ms). T.251 is the Basic Link retry timer and must
+                    // not be used here — AL RTT on granted PDCH can exceed
+                    // T.251 (≈ 226 ms) so a peer-negotiated `max_retx = 0`
+                    // would otherwise drop the SDU before its AL-ACK arrives.
                     let needs_retx = sdu.force_retx || match sdu.sent_at {
-                        Some(t) => dltime.diff(t) as u64 >= T251_SENDER_RETRY_TIMER as u64,
+                        Some(t) => dltime.diff(t) as u64 >= T252_ACK_WAITING_TIMER as u64,
                         None => true, // not yet sent at all
                     };
                     let has_unacked = sdu.acked_segments.iter().any(|&a| !a);
