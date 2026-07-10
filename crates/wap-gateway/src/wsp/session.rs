@@ -242,6 +242,30 @@ impl WspHandler {
     }
 
     fn handle_connect(&self, peer: SocketAddr, connect: WspPdu) -> Vec<u8> {
+        // PD-10c-H27 (2026-07-11 MTP3550 fix): evict any prior WSP sessions
+        // for this peer BEFORE allocating a fresh one. WSP-CO doesn't require
+        // explicit Disconnect, and flaky MTP3550 firmware can retry CONNECT
+        // several times per real user attempt — each one allocating a fresh
+        // session_id. Left alone the sessions map grew across the lifetime of
+        // the process; the "only works after reboot" symptom is a strong
+        // signal that per-peer state accumulated to the point where MS's
+        // cached session view diverged from ours. Mirror H25 (WTP txn
+        // eviction) one layer up.
+        let stale: Vec<SessionKey> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|entry| entry.key().0 == peer)
+            .map(|entry| *entry.key())
+            .collect();
+        let stale_count = stale.len();
+        for k in stale {
+            self.state.sessions.remove(&k);
+        }
+        if stale_count > 0 {
+            info!(peer = %peer, evicted = stale_count, "H27: evicted stale WSP sessions on CONNECT");
+        }
+
         let sid = self.state.allocate_session_id();
         let key: SessionKey = (peer, sid);
 
@@ -268,7 +292,7 @@ impl WspHandler {
                 last_seen: Instant::now(),
             },
         );
-        info!(peer = %peer, sid, "wsp: session established");
+        info!(peer = %peer, sid, sessions_total = self.state.sessions.len(), "wsp: session established");
         reply.encode()
     }
 
