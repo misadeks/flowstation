@@ -300,6 +300,34 @@ impl Responder {
         }
 
         let key = (peer, tid);
+
+        // PD-10c-H33 (2026-07-11 hardware fix): if this is a retry of an
+        // already-served Class-2 Invoke (same peer, same TID, phase =
+        // ResultSent), just re-send the cached Result. The old code fell
+        // through to invoke_buf.extend_from_slice() which appended the retry
+        // payload to the previous one and then re-ran the handler with the
+        // concatenated garbage — every WSP retry produced a bad Result and
+        // MS entered an infinite loop showing 'request timed out'. Standard
+        // WTP-Class-2 responder behavior is to cache the Result and re-send
+        // on Invoke retry (WAP-201 §8.3).
+        if let Some(existing) = self.txns.get(&key).map(|r| r.clone()) {
+            let mut txn = existing.lock().await;
+            if let Phase::ResultSent { segments } = &txn.phase {
+                let segments = segments.clone();
+                txn.touch();
+                drop(txn);
+                info!(%peer, tid, "H33: re-Invoke on ResultSent txn — replaying cached Result");
+                for bytes in &segments {
+                    if let Err(e) = self.wdp.send(peer, bytes).await {
+                        warn!(peer = %peer, tid, err = %e, "H33: failed to replay Result");
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            }
+            // Not in ResultSent — allow normal path (reassembly continuation etc.)
+        }
+
         let entry = self
             .txns
             .entry(key)
