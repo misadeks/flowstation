@@ -69,6 +69,12 @@ pub struct ResponderConfig {
     pub idle_timeout: Duration,
     /// Interval at which we sweep the transaction table for idle entries.
     pub sweep_interval: Duration,
+    /// PD-10c-H24: if the handler produces the Result within this window, skip
+    /// the intermediate "hold-on" Ack — the Result is an implicit Ack. Sending
+    /// Ack+Result back-to-back on the same TETRA AL link crashed MTP3550's AL
+    /// state machine. Set to just below the initiator's Invoke retx timer
+    /// (WAP-201 §11 Awt ≈ 3 s).
+    pub hold_on_ack_delay: Duration,
 }
 
 impl Default for ResponderConfig {
@@ -80,6 +86,7 @@ impl Default for ResponderConfig {
             max_retx: 3,
             idle_timeout: Duration::from_secs(90),
             sweep_interval: Duration::from_secs(15),
+            hold_on_ack_delay: Duration::from_millis(2500),
         }
     }
 }
@@ -327,18 +334,21 @@ impl Responder {
     // ── Transaction progression ────────────────────────────────────────────
 
     async fn complete_invoke(&self, txn: &mut Transaction) {
-        // 1. Ack the Invoke. Per WAP-201 §8.1.2 the responder must use
-        //    SendTID = RcvTID ^ 0x8000 on every outbound PDU; the initiator
-        //    matches its transaction against SendTID and silently discards
-        //    any PDU carrying RcvTID unchanged. `WtpPdu::ack()` does the XOR.
-        let ack = WtpPdu::ack(txn.tid);
-        if let Err(e) = self.wdp.send(txn.peer, &ack.encode()).await {
-            warn!(peer = %txn.peer, tid = txn.tid, err = %e, "failed to send Ack");
-            return;
-        }
-        info!(peer = %txn.peer, tid = txn.tid, "sent Ack for Invoke");
+        // PD-10c-H24 (2026-07-11 MTP3550 fix): dispatch to the handler FIRST,
+        // then decide whether to send a "hold-on" Ack. Per WAP-201 §8.3 the
+        // Result implicitly acknowledges the Invoke; the intermediate Ack is
+        // only required when the handler cannot produce the Result before the
+        // initiator's retransmission timer fires (~3 s). Kannel behaves the
+        // same way — no hold-on Ack for fast responses.
+        //
+        // Old flow (Ack-then-Result back-to-back) crashed MTP3550's AL state
+        // machine: two rapid downlink AL SDUs on the same link within
+        // milliseconds caused the MS to fail to AL-ACK the second SDU (the
+        // Result), triggering T252, WTP retx, and eventual "connecting" hang
+        // with a red-blinking radio. MTP6550 handled it fine, so it's an
+        // MTP3550 firmware quirk exposed by rapid consecutive AR requests.
 
-        // 2. Dispatch to the user handler.
+        // 1. Dispatch to the user handler.
         let class = match txn.phase {
             Phase::Reassembling { class, .. } => class,
             Phase::Handling { class } => class,
@@ -348,15 +358,36 @@ impl Responder {
         let payload = std::mem::take(&mut txn.invoke_buf);
         let handler = self.handler.clone();
         let peer = txn.peer;
+        let handler_started = Instant::now();
         let response = (handler)(peer, payload).await;
+        let handler_elapsed = handler_started.elapsed();
 
         // Class 1 = "reliable Invoke, no Result". Just terminate.
         if class == TransactionClass::Class1 {
+            // Class 1 has no Result to carry an implicit Ack; always send Ack.
+            let ack = WtpPdu::ack(txn.tid);
+            if let Err(e) = self.wdp.send(txn.peer, &ack.encode()).await {
+                warn!(peer = %txn.peer, tid = txn.tid, err = %e, "failed to send Ack");
+            }
             txn.phase = Phase::Done;
             return;
         }
 
-        // 3. Segment the Result and send.
+        // 2. Class 2: only send the "hold-on" Ack if the handler was slow
+        //    enough that the initiator might have retransmitted the Invoke.
+        //    Threshold matches WAP-201 §11 Awt default (~3 s), leaving margin
+        //    below the initiator's Invoke retx timer.
+        if handler_elapsed >= self.cfg.hold_on_ack_delay {
+            let ack = WtpPdu::ack(txn.tid);
+            if let Err(e) = self.wdp.send(txn.peer, &ack.encode()).await {
+                warn!(peer = %txn.peer, tid = txn.tid, err = %e, "failed to send hold-on Ack");
+                return;
+            }
+            info!(peer = %txn.peer, tid = txn.tid, elapsed_ms = handler_elapsed.as_millis(), "sent hold-on Ack for slow handler");
+        }
+
+        // 3. Segment the Result and send. The Result carries the implicit Ack
+        //    for the original Invoke via TID matching.
         let segments = segment_result(txn.tid, &response);
         for bytes in &segments {
             if let Err(e) = self.wdp.send(txn.peer, bytes).await {
@@ -369,6 +400,7 @@ impl Responder {
             tid = txn.tid,
             segments = segments.len(),
             body = response.len(),
+            handler_ms = handler_elapsed.as_millis(),
             "sent Result"
         );
 
@@ -571,8 +603,10 @@ mod tests {
     }
 
     /// End-to-end integration test: bind the responder on loopback, send a
-    /// single-segment Class-2 Invoke as if we were the MS, and expect an Ack
-    /// then a Result whose body is what the handler returned.
+    /// single-segment Class-2 Invoke as if we were the MS, and expect a
+    /// Result whose body is what the handler returned. Post-H24 the responder
+    /// skips the intermediate "hold-on" Ack for fast handlers, so only the
+    /// Result should arrive.
     #[tokio::test]
     async fn responder_invoke_ack_result_roundtrip() {
         let server_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
@@ -605,31 +639,23 @@ mod tests {
         };
         client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
 
-        // Expect Ack + Result (order Ack first). Responder XORs TID with 0x8000
-        // per WAP-201 §8.1.2 (SendTID). Our Invoke used RcvTID=0x0042, so
-        // outbound PDUs carry SendTID=0x8042.
-        let mut got_ack = false;
-        let mut got_result = None;
-        for _ in 0..2 {
-            let (_peer, bytes) = tokio::time::timeout(Duration::from_secs(2), client_wdp.recv())
-                .await
-                .expect("receive timed out")
-                .unwrap();
-            let pdu = WtpPdu::decode(&bytes).unwrap();
-            match pdu {
-                WtpPdu::Ack { tid, .. } => {
-                    assert_eq!(tid, 0x8042);
-                    got_ack = true;
-                }
-                WtpPdu::Result { tid, payload, .. } => {
-                    assert_eq!(tid, 0x8042);
-                    got_result = Some(payload);
-                }
-                other => panic!("unexpected PDU from responder: {other:?}"),
+        // H24: with a fast handler the intermediate Ack is suppressed — the
+        // Result carries the implicit ack. Responder XORs TID with 0x8000 per
+        // WAP-201 §8.1.2 (SendTID). Our Invoke used RcvTID=0x0042, so the
+        // outbound Result carries SendTID=0x8042.
+        let (_peer, bytes) = tokio::time::timeout(Duration::from_secs(2), client_wdp.recv())
+            .await
+            .expect("receive timed out")
+            .unwrap();
+        let pdu = WtpPdu::decode(&bytes).unwrap();
+        let payload = match pdu {
+            WtpPdu::Result { tid, payload, .. } => {
+                assert_eq!(tid, 0x8042);
+                payload
             }
-        }
-        assert!(got_ack, "responder never sent Ack");
-        assert_eq!(got_result.unwrap(), b"echo:hi");
+            other => panic!("expected Result, got: {other:?}"),
+        };
+        assert_eq!(payload, b"echo:hi");
     }
 
     /// A multi-segment Invoke (TTR=0 on segment 0 + S-Invoke with TTR=1) is

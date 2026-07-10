@@ -60,7 +60,6 @@ async fn end_to_end_mtp3550_connect_gets_openwave_connect_reply() {
     };
     client.send_to(&invoke.encode(), gw).await.unwrap();
 
-    let mut got_ack = false;
     let mut connect_reply: Option<WspPdu> = None;
 
     // On TETRA hardware the Result may be segmented across several
@@ -75,11 +74,6 @@ async fn end_to_end_mtp3550_connect_gets_openwave_connect_reply() {
         };
         let pdu = WtpPdu::decode(&buf[..n]).expect("valid PDU from gateway");
         match pdu {
-            WtpPdu::Ack { tid, .. } => {
-                // Gateway XORs TID with 0x8000 per WAP-201 §8.1.2 SendTID.
-                assert_eq!(tid, 0x14B1 ^ 0x8000, "gateway must send SendTID");
-                got_ack = true;
-            }
             WtpPdu::Result { tid, payload, .. } => {
                 assert_eq!(tid, 0x14B1 ^ 0x8000, "gateway must send SendTID");
                 let reply = WspPdu::decode(&payload).expect("Result carries a valid WSP PDU");
@@ -100,12 +94,11 @@ async fn end_to_end_mtp3550_connect_gets_openwave_connect_reply() {
             }
             other => panic!("unexpected PDU from gateway: {other:?}"),
         }
-        if got_ack && connect_reply.is_some() {
+        if connect_reply.is_some() {
             break;
         }
     }
 
-    assert!(got_ack, "gateway must Ack the Invoke");
     let reply = connect_reply.expect("gateway must send a WSP ConnectReply");
     let WspPdu::ConnectReply {
         server_session_id,

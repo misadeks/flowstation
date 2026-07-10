@@ -70,55 +70,46 @@ async fn run_serves_wsp_connect_and_shuts_down_on_cancel() {
     };
     client.send_to(&invoke.encode(), gw).await.unwrap();
 
-    let mut got_ack = false;
-    let mut got_result = false;
-    for _ in 0..2 {
-        let mut buf = [0u8; 2048];
-        let (n, _peer) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
-            .await
-            .expect("recv timed out")
-            .unwrap();
-        let pdu = WtpPdu::decode(&buf[..n]).expect("valid PDU from gateway");
-        match pdu {
-            WtpPdu::Ack { tid, .. } => {
-                // Responder XORs TID with 0x8000 per WAP-201 §8.1.2 SendTID.
-                assert_eq!(tid, 0x00CD ^ 0x8000);
-                got_ack = true;
-            }
-            WtpPdu::Result { tid, payload, .. } => {
-                assert_eq!(tid, 0x00CD ^ 0x8000);
-                // Payload must be a WSP ConnectReply matching Kannel's
-                // sanitize_capabilities() behaviour (see build_connect_reply).
-                let reply = WspPdu::decode(&payload).expect("Result carries a valid WSP PDU");
-                let WspPdu::ConnectReply {
-                    server_session_id,
-                    capabilities,
-                    headers,
-                    ..
-                } = reply
-                else {
-                    panic!("expected ConnectReply, got {reply:?}");
-                };
-                assert!(server_session_id >= 1);
-                assert!(
-                    capabilities.contains(&Capability::ProtocolOptions(0x00)),
-                    "ConnectReply must SANITIZE Protocol-Options (0xF0 → 0x00) to match Kannel"
-                );
-                assert!(
-                    capabilities.contains(&Capability::ExtendedMethods(Vec::new())),
-                    "ConnectReply must REFUSE Extended-Methods / Header-Code-Pages (empty payload = refusal)"
-                );
-                assert_eq!(
-                    headers.raw,
-                    vec![0xC3, 0x93],
-                    "ConnectReply headers block must contain Encoding-Version: 1.3"
-                );
-                got_result = true;
-            }
-            other => panic!("unexpected PDU from gateway: {other:?}"),
+    // H24: fast handlers skip the intermediate Ack — expect only the Result.
+    let mut buf = [0u8; 2048];
+    let (n, _peer) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("recv timed out")
+        .unwrap();
+    let pdu = WtpPdu::decode(&buf[..n]).expect("valid PDU from gateway");
+    let payload = match pdu {
+        WtpPdu::Result { tid, payload, .. } => {
+            assert_eq!(tid, 0x00CD ^ 0x8000);
+            payload
         }
-    }
-    assert!(got_ack && got_result, "expected both Ack and Result");
+        other => panic!("expected Result, got: {other:?}"),
+    };
+    // Payload must be a WSP ConnectReply matching Kannel's
+    // sanitize_capabilities() behaviour (see build_connect_reply).
+    let reply = WspPdu::decode(&payload).expect("Result carries a valid WSP PDU");
+    let WspPdu::ConnectReply {
+        server_session_id,
+        capabilities,
+        headers,
+        ..
+    } = reply
+    else {
+        panic!("expected ConnectReply, got {reply:?}");
+    };
+    assert!(server_session_id >= 1);
+    assert!(
+        capabilities.contains(&Capability::ProtocolOptions(0x00)),
+        "ConnectReply must SANITIZE Protocol-Options (0xF0 → 0x00) to match Kannel"
+    );
+    assert!(
+        capabilities.contains(&Capability::ExtendedMethods(Vec::new())),
+        "ConnectReply must REFUSE Extended-Methods / Header-Code-Pages (empty payload = refusal)"
+    );
+    assert_eq!(
+        headers.raw,
+        vec![0xC3, 0x93],
+        "ConnectReply headers block must contain Encoding-Version: 1.3"
+    );
 
     // Now cooperative shutdown.
     shutdown.cancel();
