@@ -2132,10 +2132,28 @@ impl Llc {
                         // Use the link's per-negotiated max_sdu_retx (from SETUP PDU or config
                         // default for reconnect-fallback links) rather than the global constant.
                         if sdu.retx_count >= link.max_sdu_retx {
-                            tracing::warn!(
-                                "AL link {:?} N(S)={} exhausted retransmissions, dropping SDU",
-                                key, sdu.n_s
-                            );
+                            // PD-5c-H19: with max_sdu_retx=0 (MS-negotiated for Original AL /
+                            // Motorola MTP3550), we've already transmitted the SDU once and by
+                            // spec have no retry budget. Prior behaviour dropped with a WARN
+                            // which is misleading — the bits are on the air, the peer simply
+                            // hasn't sent an AL-ACK (either it did receive them but its stack
+                            // suppresses AL-ACK to app-layer failures, or the ACK crossed
+                            // with a schedule change). Dropping does NOT undo the transmission;
+                            // it only frees our outstanding-SDU slot so we can enqueue the next
+                            // one. Log at DEBUG (fire-and-forget completion) instead of WARN
+                            // (protocol failure) — this stops the alarm-log storm on every
+                            // downlink SDU when the peer doesn't AL-ACK.
+                            if link.max_sdu_retx == 0 {
+                                tracing::debug!(
+                                    "AL link {:?} N(S)={} fire-and-forget SDU released (max_sdu_retx=0)",
+                                    key, sdu.n_s
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "AL link {:?} N(S)={} exhausted retransmissions, dropping SDU",
+                                    key, sdu.n_s
+                                );
+                            }
                             sdus_to_remove.push(sdu.n_s);
                             continue;
                         }
