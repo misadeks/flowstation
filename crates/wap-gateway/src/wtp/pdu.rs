@@ -462,12 +462,17 @@ impl WtpPdu {
 // ── Convenience constructors ─────────────────────────────────────────────────
 
 impl WtpPdu {
-    /// Build a responder Ack (TTR=1 by default; a positive final Ack).
+    /// Build a responder Ack.
+    ///
+    /// WAP-201 §8.4.1: for Ack PDUs, bits 2 and 1 of byte 0 are **reserved
+    /// (must be 0)** — they are NOT GTR/TTR (those flags only exist on
+    /// Invoke/Result/Segmented\* PDUs). RID is 0 for a fresh Ack; set by the
+    /// caller (or higher layer) when retransmitting.
     pub fn ack(tid: u16) -> Self {
         Self::Ack {
             flags: HeaderFlags {
                 gtr: false,
-                ttr: true,
+                ttr: false,
                 rid: false,
             },
             tid,
@@ -569,7 +574,11 @@ mod tests {
     fn ack_encodes_to_exactly_three_bytes() {
         let bytes = WtpPdu::ack(0x14b1).encode();
         assert_eq!(bytes.len(), 3, "Ack must be 3 bytes on the wire");
-        assert_eq!(bytes[0] & 0x78, 0x18, "PDU Type = Ack (0011 in bits 6-3)");
+        // Byte 0: CON=0, Type=Ack(0011), reserved=00, RID=0 → 0x18.
+        assert_eq!(
+            bytes[0], 0x18,
+            "Ack byte 0 must be 0x18 (reserved bits 2 and 1 = 0, per WAP-201 §8.4.1)"
+        );
         // TID = 0x14b1 with TVE=0 → byte 1 = 0x14, byte 2 = 0xb1.
         assert_eq!(bytes[1], 0x14);
         assert_eq!(bytes[2], 0xb1);
@@ -669,10 +678,18 @@ mod tests {
 
     #[test]
     fn ack_short_form_decodes() {
-        // Some real UP.Browser Acks omit the TVE octet: only 3 bytes total.
-        let bytes = [0b0_0011_010, 0x12, 0x34]; // Type=3 (Ack), TTR=1
+        // Some real UP.Browser Acks set reserved bit (bit 1) in byte 0.
+        // Decoder must tolerate: decode as Ack with proper TID; higher layer
+        // ignores the strayed flag.
+        let bytes = [0b0_0011_010, 0x12, 0x34];
         let pdu = WtpPdu::decode(&bytes).unwrap();
-        assert_eq!(pdu, WtpPdu::ack(0x1234));
+        match pdu {
+            WtpPdu::Ack { tid, tve, .. } => {
+                assert_eq!(tid, 0x1234);
+                assert!(!tve);
+            }
+            other => panic!("expected Ack, got {other:?}"),
+        }
     }
 
     #[test]
