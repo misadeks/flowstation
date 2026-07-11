@@ -92,17 +92,21 @@ handlers only take a short read-lock on `MetarCache`.
   non-portal hits still fall through to upstream.
 * `RunConfig` extension + `bluestation-bs` wiring behind
   `[wap_gateway.portal].enabled`.
+* **Live radios page** — `BluestationPortalData` reads `DashboardState.ms_map`
+  under a short read-lock, sorts by most-recent `last_seen`, truncates to
+  `radios_max`, and copies out owned `RadioSnapshot`s. `DashboardServer` now
+  supports `::with_state` so the HTTP dashboard and the portal share the
+  same `Arc<RwLock<DashboardStateInner>>`.
+* **Live PDP count on system page** — `Sndcp` now publishes its
+  `contexts.len()` into an `Arc<AtomicUsize>` (`pdp_count_observer`) on every
+  insert / remove; the portal adapter loads this atomic per `system()` call.
+  This avoids needing an `Arc<Sndcp>` (which would collide with the
+  MessageRouter taking ownership) and stays lock-free on the hot path.
 
-**Deferred to a follow-up (intentionally not blocking hardware validation):**
+**Deferred (small, additive):**
 
-* Real `DashboardState`-backed `radios()` implementation. The current adapter
-  returns an empty list, so `/portal/radios` renders `(none)`. Full wiring
-  needs `DashboardServer` refactored to accept an externally-owned
-  `DashboardState` so the same handle can be shared with the portal adapter
-  — currently the server constructs it internally, and `wire_wap_gateway`
-  runs before that construction.
-* `Sndcp::pdp_count()` accessor + wiring. Today the system page shows
-  `pdp 0` unconditionally.
+* Callsign resolution on the radios page — lives inside `DashboardServer`'s
+  `RadioIdCache` today. Portal shows `-` until that cache is factored out.
 * Cell-load metric on the system page (`load n/a` until a cheap accessor
   exists on the LMAC/PHY side).
 * Send-SDS POST form (Phase 4) — WSP `handle_get` still returns 405 for POST.

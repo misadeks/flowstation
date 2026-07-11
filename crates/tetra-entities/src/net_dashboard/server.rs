@@ -730,13 +730,24 @@ pub struct DashboardServer {
 
 impl DashboardServer {
     pub fn new(config_path: String) -> Self {
+        let state = Arc::new(RwLock::new(DashboardStateInner::new(config_path.clone())));
+        Self::with_state(config_path, state)
+    }
+
+    /// Same as [`Self::new`] but takes an externally-owned [`DashboardState`].
+    ///
+    /// Callers use this when they need another subsystem to observe the same
+    /// live state — e.g. `bluestation-bs` shares the state with the built-in
+    /// WAP portal's `PortalDataSource` adapter so both surfaces render the
+    /// exact same radio table.
+    pub fn with_state(config_path: String, state: DashboardState) -> Self {
         // RadioID callsign cache lives next to the active config file.
         let radioid_path = std::path::Path::new(&config_path)
             .parent()
             .map(|d| d.join("radioid_cache.json"))
             .unwrap_or_else(|| std::path::PathBuf::from("radioid_cache.json"));
         Self {
-            state: Arc::new(RwLock::new(DashboardStateInner::new(config_path.clone()))),
+            state,
             clients: Arc::new(Mutex::new(Vec::new())),
             config_path,
             shared_config: None,
