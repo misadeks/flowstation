@@ -169,3 +169,138 @@ fn test_stealing_bl_udata_fallback_uses_unlinked_llc_context() {
     assert_eq!(*carrier_num, Some(MAIN_CARRIER));
     assert_eq!(*link_id, 0);
 }
+
+// PD-5c-H42 (audit LLC-04): outbound BL TX must enforce ETSI N.251 (BL
+// TL-SDU maximum length) at 2595 bits. Motorola TSC gates this at
+// 0x02a25548; without the guard we would emit over-sized SDUs that the
+// peer's MAC/LLC silently drops.
+
+use tetra_pdus::llc::consts::consts::N251_BL_MAX_TLSDU_LEN_BITS;
+use tetra_saps::tla::TlaTlUnitdataReqBl;
+
+fn make_oversized_bitbuf() -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(1024);
+    // Exceed N.251 by 1 bit — pattern doesn't matter, the guard is length-based.
+    for _ in 0..(N251_BL_MAX_TLSDU_LEN_BITS as usize + 1) {
+        sdu.write_bits(1, 1);
+    }
+    sdu.seek(0);
+    sdu
+}
+
+#[test]
+fn test_bl_tldata_req_over_n251_is_dropped() {
+    debug::setup_logging_verbose();
+    let req = TlaTlDataReqBl {
+        main_address: TetraAddress::new(2200699, SsiType::Issi),
+        link_id: 3,
+        endpoint_id: 0,
+        tl_sdu: make_oversized_bitbuf(),
+        stealing_permission: true,
+        subscriber_class: 0,
+        fcs_flag: false,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_class_info: None,
+        req_handle: 0,
+        graceful_degradation: None,
+        chan_alloc: None,
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac]);
+    test.submit_message(SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlDataReqBl(req),
+    });
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        sink_msgs.is_empty(),
+        "over-N.251 BL TL-SDU must not be forwarded to UMAC (got {} msgs)",
+        sink_msgs.len()
+    );
+}
+
+#[test]
+fn test_bl_tlunitdata_req_over_n251_is_dropped() {
+    debug::setup_logging_verbose();
+    let req = TlaTlUnitdataReqBl {
+        main_address: TetraAddress::new(2200699, SsiType::Issi),
+        link_id: 3,
+        endpoint_id: 0,
+        tl_sdu: make_oversized_bitbuf(),
+        stealing_permission: true,
+        subscriber_class: 0,
+        fcs_flag: false,
+        air_interface_encryption: None,
+        packet_data_flag: false,
+        n_tlsdu_repeats: 0,
+        data_class_info: None,
+        req_handle: 0,
+        chan_alloc: None,
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac]);
+    test.submit_message(SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlUnitdataReqBl(req),
+    });
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        sink_msgs.is_empty(),
+        "over-N.251 BL-UDATA TL-SDU must not be forwarded to UMAC (got {} msgs)",
+        sink_msgs.len()
+    );
+}
+
+#[test]
+fn test_bl_tldata_req_at_n251_boundary_is_accepted() {
+    debug::setup_logging_verbose();
+    let mut sdu = BitBuffer::new_autoexpand(1024);
+    for _ in 0..(N251_BL_MAX_TLSDU_LEN_BITS as usize) {
+        sdu.write_bits(1, 1);
+    }
+    sdu.seek(0);
+
+    let req = TlaTlDataReqBl {
+        main_address: TetraAddress::new(2200699, SsiType::Issi),
+        link_id: 3,
+        endpoint_id: 0,
+        tl_sdu: sdu,
+        stealing_permission: true,
+        subscriber_class: 0,
+        fcs_flag: false,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_class_info: None,
+        req_handle: 0,
+        graceful_degradation: None,
+        chan_alloc: None,
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac]);
+    test.submit_message(SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlDataReqBl(req),
+    });
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert_eq!(
+        sink_msgs.len(),
+        1,
+        "exact N.251-bit SDU must still be forwarded (boundary is inclusive)"
+    );
+}

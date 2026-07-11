@@ -16,6 +16,7 @@ use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::llc::al_events::{AlDeliveryEvent, AlDeliveryHook, AlDeliveryOutcome};
 use crate::llc::components::fcs;
+use tetra_pdus::llc::consts::consts::N251_BL_MAX_TLSDU_LEN_BITS;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
 use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
@@ -483,6 +484,18 @@ impl Llc {
         let pdu = BlUdata { has_fcs: false };
         pdu.to_bitbuf(&mut pdu_buf);
         let sdu_len = prim.tl_sdu.get_len_remaining();
+        // PD-5c-H42 (audit LLC-04): enforce ETSI N.251 BL TL-SDU max length
+        // on TX. Motorola TSC gates the same limit at 0x02a25548
+        // (size_to_bl_limit <= bl_size); over-sized SDUs would be silently
+        // dropped by the peer's MAC/LLC. Reject rather than truncate so the
+        // upper layer sees a hard error instead of a corrupt SDU on the wire.
+        if sdu_len > N251_BL_MAX_TLSDU_LEN_BITS as usize {
+            tracing::warn!(
+                "LLC BL-UDATA TX (unitdata_req): TL-SDU len {} bits exceeds N.251 max {} bits — dropping",
+                sdu_len, N251_BL_MAX_TLSDU_LEN_BITS
+            );
+            return;
+        }
         pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
         pdu_buf.seek(0);
         tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
@@ -537,6 +550,20 @@ impl Llc {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
+
+        // PD-5c-H42 (audit LLC-04): enforce ETSI N.251 BL TL-SDU max length
+        // (2595 bits) on every BL TX path. Motorola TSC gates the same limit
+        // at 0x02a25548 (size_to_bl_limit <= bl_size). Reject at the entry
+        // point so all four downstream builds (BL-ACK-piggyback, BL-UDATA
+        // fallback, BL-ADATA, BL-DATA) are covered uniformly.
+        let sdu_len_bits = prim.tl_sdu.get_len_remaining();
+        if sdu_len_bits > N251_BL_MAX_TLSDU_LEN_BITS as usize {
+            tracing::warn!(
+                "LLC BL TX (tldata_req): TL-SDU len {} bits exceeds N.251 max {} bits — dropping",
+                sdu_len_bits, N251_BL_MAX_TLSDU_LEN_BITS
+            );
+            return;
+        }
 
         let preferred_carrier = prim
             .chan_alloc
