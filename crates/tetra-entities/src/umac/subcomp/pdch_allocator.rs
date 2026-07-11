@@ -48,10 +48,10 @@ pub struct PdchAllocator {
     pub reservations: HashMap<u32, PdchReservation>,
     /// Number of idle frames before a reservation is auto-released.
     pub idle_release_frames: u32,
-    /// The timeslot currently allocated for PDCH use, or `None` if no PDCH slot
-    /// could be picked this hyperframe (e.g. voice took all eligible slots).
-    /// Updated each hyperframe by the UMAC scheduler.
-    pub current_timeslot: Option<u8>,
+    /// The timeslots currently allocated for PDCH use (ordered by preference: TS4 first).
+    /// Empty when no PDCH slot could be picked this hyperframe (e.g. voice took all eligible
+    /// slots).  Updated each hyperframe by the UMAC scheduler.
+    pub current_timeslots: Vec<u8>,
     /// Rotating cursor for UMt allocation. Valid range is [4, 62] per ETSI TS 100 392-2
     /// §23.5.1 (0 = unallocated, 1–3 and 63 reserved). Wraps back to 4 after 62.
     /// NOTE: spec ambiguous — chosen behaviour: per-allocator cursor, not per-timeslot,
@@ -64,7 +64,7 @@ impl PdchAllocator {
         Self {
             reservations: HashMap::new(),
             idle_release_frames,
-            current_timeslot: None,
+            current_timeslots: Vec::new(),
             next_umt: 4, // Start at 4; range [4, 62] per spec
         }
     }
@@ -149,6 +149,14 @@ impl PdchAllocator {
         if let Some(r) = self.reservations.get_mut(&issi) {
             r.last_used_at = now;
         }
+    }
+
+    /// Return the primary (first-preference) PDCH timeslot, or `None` when the set is empty.
+    ///
+    /// Compat helper for callers that only need a single slot (single-slot paths and
+    /// legacy code that hasn't been widened to the full set yet).
+    pub fn primary_timeslot(&self) -> Option<u8> {
+        self.current_timeslots.first().copied()
     }
 
     /// Explicitly release the reservation for `issi`.
@@ -330,5 +338,21 @@ mod tests {
         for r in alloc.reservations.values() {
             assert!(seen.insert(r.umt), "duplicate UMt {} across live reservations", r.umt);
         }
+    }
+
+    // ── PD-5c-H52: current_timeslots ────────────────────────────────────────
+
+    #[test]
+    fn current_timeslots_ordered_ts4_first() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        // Simulate the scheduler assigning TS4 then TS3 (preference order).
+        alloc.current_timeslots = vec![4, 3];
+        assert_eq!(alloc.primary_timeslot(), Some(4), "primary must be TS4 (first in preference order)");
+        // Single-slot assignment matches primary.
+        alloc.current_timeslots = vec![3];
+        assert_eq!(alloc.primary_timeslot(), Some(3));
+        // Empty → None.
+        alloc.current_timeslots.clear();
+        assert_eq!(alloc.primary_timeslot(), None);
     }
 }

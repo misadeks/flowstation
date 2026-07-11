@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use tetra_core::{
     BitBuffer, Direction, LinkId, PhyBlockNum, PhysicalChannel, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log,
 };
@@ -138,21 +140,21 @@ pub struct BsChannelScheduler {
     /// Issuing a real marker fixes that.
     next_usage_marker: [u8; 4],
 
-    /// The timeslot currently serving as the Packet Data Channel (PDCH), or
-    /// `None` if no PDCH is active.  When `Some(ts)`, `generate_bbk_block`
-    /// emits `AssignedControl` / `AssignedOnly` in the AACH for that slot so
-    /// the MS knows the timeslot is an assigned SCCH and may transmit control-
-    /// plane uplink bursts (SchF / MAC-DATA) on the corresponding uplink slot.
+    /// The set of timeslots currently serving as Packet Data Channels (PDCH), ordered by
+    /// ascending timeslot number (BTreeSet iteration order).  The preference for selection
+    /// is TS4 > TS3 > TS2; a non-empty set means at least one PDCH is active.
     ///
-    /// Set by `emit_pdch_mac_resource` immediately after a grant is built.
-    /// Cleared when the last PDCH reservation expires, when an explicit
-    /// `PdchReleaseReq` empties all reservations, or when a voice circuit
-    /// preempts the slot via `create_circuit`.
+    /// When a TS is in this set, `generate_bbk_block` emits `AssignedControl` /
+    /// `AssignedOnly` in the AACH for that slot so the MS knows the timeslot is an
+    /// assigned SCCH and may transmit control-plane uplink bursts (SchF / MAC-DATA).
+    ///
+    /// Each TS is added by `set_pdch_timeslots` / `set_pdch_timeslot` shim and removed
+    /// individually when a voice circuit preempts that specific TS (`create_circuit`).
+    /// The whole set is cleared when the last PDCH reservation expires or an explicit
+    /// `PdchReleaseReq` empties all reservations.
     ///
     /// Priority in `generate_bbk_block`: hangtime > PDCH > Traffic/Unallocated.
-    /// Voice hangtime takes precedence so the circuit teardown signalling is
-    /// not disrupted by a stale PDCH marker.
-    pdch_timeslot: Option<u8>,
+    pdch_timeslots: BTreeSet<u8>,
 }
 
 #[derive(Debug)]
@@ -208,7 +210,7 @@ impl BsChannelScheduler {
             mcch_chan_alloc_sent_this_frame: false,
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
-            pdch_timeslot: None,
+            pdch_timeslots: BTreeSet::new(),
         }
     }
 
@@ -224,19 +226,34 @@ impl BsChannelScheduler {
         self.carrier_num
     }
 
-    /// Activate or deactivate PDCH signalling on the given timeslot (2–4).
+    /// Activate PDCH signalling on the given timeslots (2–4).
     ///
-    /// When `Some(ts)`, `generate_bbk_block` will emit `AssignedControl` /
-    /// `AssignedOnly` in the AACH for that slot on every downlink frame,
-    /// telling the MS that an assigned SCCH is available for packet-data
-    /// uplink bursts.  Pass `None` to revert the slot to `Unallocated`.
-    pub fn set_pdch_timeslot(&mut self, ts: Option<u8>) {
-        self.pdch_timeslot = ts;
+    /// Replaces the entire PDCH set.  Pass an empty slice to deactivate all PDCH slots.
+    pub fn set_pdch_timeslots(&mut self, slots: &[u8]) {
+        self.pdch_timeslots = slots.iter().copied().collect();
     }
 
-    /// Return the timeslot currently configured as PDCH, if any.
+    /// Compat shim: activate or deactivate a single PDCH slot.
+    ///
+    /// `Some(ts)` → set becomes `{ts}`; `None` → set is cleared.
+    /// Callers migrating to multi-slot should use `set_pdch_timeslots` directly.
+    pub fn set_pdch_timeslot(&mut self, ts: Option<u8>) {
+        match ts {
+            Some(t) => self.pdch_timeslots = BTreeSet::from([t]),
+            None => self.pdch_timeslots.clear(),
+        }
+    }
+
+    /// Return the lowest-numbered active PDCH timeslot, or `None` when the set is empty.
+    ///
+    /// Compat getter for single-slot callers.  For the full set use `pdch_timeslots_ref()`.
     pub fn pdch_timeslot(&self) -> Option<u8> {
-        self.pdch_timeslot
+        self.pdch_timeslots.iter().next().copied()
+    }
+
+    /// Borrow the full PDCH timeslot set.
+    pub fn pdch_timeslots_ref(&self) -> &BTreeSet<u8> {
+        &self.pdch_timeslots
     }
 
     pub fn allow_mcch(&self) -> bool {
@@ -1059,20 +1076,23 @@ impl BsChannelScheduler {
             );
             return;
         }
-        // Preemption guard: if a voice circuit is claiming the active PDCH slot,
-        // clear the PDCH AACH signalling before the circuit goes in.  This ensures
-        // the slot transitions atomically (same frame) from AssignedControl to
-        // Traffic so the MS does not see an inconsistent AACH state.
+        // Preemption guard: if a voice circuit is claiming a timeslot in the active PDCH set,
+        // remove that TS from the set before the circuit goes in.  This ensures the slot
+        // transitions atomically (same frame) from AssignedControl to Traffic so the MS does
+        // not see an inconsistent AACH state.  Other PDCH slots (if any) are unaffected —
+        // per ETSI TS 100 392-2 §23.5.5.2, voice preemption is per-slot, not per-pool.
         // TODO(PD-future): send PdchReleaseInd to SNDCP so it can move affected
         // contexts to Standby and (optionally) trigger reassignment.
-        if Some(circuit.ts) == self.pdch_timeslot {
+        if self.pdch_timeslots.contains(&circuit.ts) {
             tracing::warn!(
-                "BsChannelScheduler: {:?} circuit on ts {} preempts active PDCH slot — \
-                 clearing AssignedControl AACH",
+                "BsChannelScheduler: {:?} circuit on ts {} preempts PDCH slot — \
+                 removing ts {} from PDCH set (remaining: {:?})",
                 dir,
-                circuit.ts
+                circuit.ts,
+                circuit.ts,
+                self.pdch_timeslots,
             );
-            self.pdch_timeslot = None;
+            self.pdch_timeslots.remove(&circuit.ts);
         }
         // New/updated circuit implies traffic mode.
         if (1..=4).contains(&circuit.ts) {
@@ -1825,7 +1845,7 @@ impl BsChannelScheduler {
                             access_code: 0,
                             base_frame_len: 4,
                         });
-                    } else if self.pdch_timeslot == Some(ts.t) {
+                    } else if self.pdch_timeslots.contains(&ts.t) {
                         // PDCH assigned SCCH — priority: hangtime > PDCH > Traffic/Unallocated.
                         // Hangtime takes precedence above so voice teardown signalling is
                         // not disrupted.  PDCH overrides the plain Unallocated path below so

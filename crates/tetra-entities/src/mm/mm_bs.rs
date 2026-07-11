@@ -672,6 +672,9 @@ impl MmBs {
         // Store and log class_of_ms
         if let Some(ref class) = pdu.class_of_ms {
             tracing::info!("MS {} class_of_ms: {}", issi, class);
+            // Record multislot_phase_mod in shared state so UMAC can gate multi-slot DL.
+            // ETSI TS 100 392-2 §6.5 bit 22.
+            self.config.state_write().ms_multislot_cap.insert(issi, class.multislot_phase_mod);
         }
         // Per ETSI EN 300 392-2 clause 16.9.4: if the MS signals clch_needed=true or
         // common_scch=true, the BS must populate scch_information_and_distribution_on_18th_frame
@@ -2249,6 +2252,67 @@ impl MmBs {
             tracing::debug!("mm_bs: re-registering ISSI {}", issi);
             Self::send_d_location_update_command(queue, issi, 0);
         }
+    }
+
+    /// Return the `multislot_phase_mod` capability bit (ETSI TS 100 392-2 §6.5 bit 22) for
+    /// the given ISSI as last reported in U-LOCATION-UPDATE-DEMAND.
+    ///
+    /// Returns:
+    /// - `Some(true)`  — MS advertised multislot phase modulation capability.
+    /// - `Some(false)` — MS explicitly reported no capability.
+    /// - `None`        — no class_of_ms received yet (never registered, or not yet sent).
+    pub fn multislot_phase_mod_for_issi(&self, issi: u32) -> Option<bool> {
+        self.config.state_read().ms_multislot_cap.get(&issi).copied()
+    }
+}
+
+#[cfg(test)]
+mod multislot_cap_tests {
+    use super::*;
+    use tetra_config::bluestation::{SharedConfig, parsing::from_toml_str};
+
+    fn make_shared() -> SharedConfig {
+        let toml = r#"
+            config_version = "0.6"
+            stack_mode = "Bs"
+            [phy_io]
+            backend = "None"
+            [net_info]
+            mcc = 901
+            mnc = 9999
+            [cell_info]
+            main_carrier = 1584
+            freq_band = 4
+            freq_offset = 0
+            duplex_spacing = 4
+            reverse_operation = false
+            location_area = 1
+        "#;
+        SharedConfig::from_parts(from_toml_str(toml).expect("test config"), None)
+    }
+
+    fn make_mm() -> MmBs {
+        MmBs::new(make_shared(), None, None)
+    }
+
+    #[test]
+    fn getter_returns_none_for_unknown_issi() {
+        let mm = make_mm();
+        assert_eq!(mm.multislot_phase_mod_for_issi(12345), None);
+    }
+
+    #[test]
+    fn getter_returns_true_after_set() {
+        let mm = make_mm();
+        mm.config.state_write().ms_multislot_cap.insert(9001, true);
+        assert_eq!(mm.multislot_phase_mod_for_issi(9001), Some(true));
+    }
+
+    #[test]
+    fn getter_returns_false_after_set() {
+        let mm = make_mm();
+        mm.config.state_write().ms_multislot_cap.insert(9002, false);
+        assert_eq!(mm.multislot_phase_mod_for_issi(9002), Some(false));
     }
 }
 

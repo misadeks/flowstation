@@ -549,6 +549,11 @@ pub struct StackState {
     /// downlink (incoming-call D-SETUP, SDS) until the MS is awake on its window
     /// (ETSI EN 300 392-2 §16.7). Empty when no MS is in energy economy.
     pub ee_monitoring_windows: std::collections::HashMap<u32, (u8, u8, u8)>,
+    /// Per-MS multislot phase-modulation capability (ETSI TS 100 392-2 §6.5 bit 22).
+    /// Written by MM on U-LOCATION-UPDATE-DEMAND; read by UMAC at PDCH drain time to
+    /// gate multi-slot DL delivery.  `true` = MS declared multislot_phase_mod = 1.
+    /// An absent ISSI is treated as non-multislot-capable (conservative).
+    pub ms_multislot_cap: HashMap<u32, bool>,
 }
 
 #[cfg(test)]
@@ -716,6 +721,7 @@ impl Default for StackState {
             geoalarm_status: GeoalarmRuntimeStatus::default(),
             active_call_ts: std::collections::HashMap::new(),
             ee_monitoring_windows: std::collections::HashMap::new(),
+            ms_multislot_cap: HashMap::new(),
         }
     }
 }

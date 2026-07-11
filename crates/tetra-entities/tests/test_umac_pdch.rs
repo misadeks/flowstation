@@ -239,7 +239,7 @@ fn first_packet_data_pdu_arms_pdch_bookkeeping() {
         "first packet-data PDU must reserve PDCH for ISSI={TEST_ISSI}"
     );
     assert_eq!(
-        umac.pdch_allocator().current_timeslot,
+        umac.pdch_allocator().primary_timeslot(),
         Some(4),
         "with no voice circuits, PDCH must prefer TS4 (highest eligible)"
     );
@@ -548,7 +548,7 @@ fn packet_data_enabled_via_config_auto_enables_pdch() {
         .expect("downcast to UmacBs");
 
     assert!(
-        umac.pdch_allocator().current_timeslot.is_some(),
+        umac.pdch_allocator().primary_timeslot().is_some(),
         "packet_data.enabled=true in config must auto-enable PDCH \
          (current_timeslot must be Some after packet-data uplink)"
     );
@@ -639,7 +639,7 @@ fn pdch_yields_to_voice_when_all_slots_taken() {
 
     // No PDCH timeslot should have been chosen.
     assert_eq!(
-        umac.pdch_allocator().current_timeslot,
+        umac.pdch_allocator().primary_timeslot(),
         None,
         "PDCH must yield when all eligible timeslots (TS2/3/4) are occupied by voice"
     );

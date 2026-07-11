@@ -1665,7 +1665,7 @@ impl UmacBs {
                     match self.pdch_allocator.reserve(prim.main_address.ssi, 0, self.dltime) {
                         Some(_) => {
                             self.channel_scheduler.set_pdch_timeslot(Some(ts));
-                            self.pdch_allocator.current_timeslot = Some(ts);
+                            self.pdch_allocator.current_timeslots = vec![ts];
                             tracing::info!(
                                 "UMAC: piggyback PDCH grant issi={} ts={} carrier={} — armed AACH",
                                 prim.main_address.ssi, ts, carrier_num
@@ -1743,7 +1743,7 @@ impl UmacBs {
         // If this was the last reservation, deactivate PDCH AACH signalling.
         if self.pdch_allocator.reservations.is_empty() {
             self.channel_scheduler.set_pdch_timeslot(None);
-            self.pdch_allocator.current_timeslot = None;
+            self.pdch_allocator.current_timeslots.clear();
         }
     }
 
@@ -1845,7 +1845,7 @@ impl UmacBs {
                 // Bookkeeping mirrors the piggyback path in
                 // rx_ul_tma_unitdata_req_carrier (see PD-5c-H2 block).
                 self.channel_scheduler.set_pdch_timeslot(Some(ts));
-                self.pdch_allocator.current_timeslot = Some(ts);
+                self.pdch_allocator.current_timeslots = vec![ts];
             } else {
                 tracing::info!(
                     "UMAC: PDCH SN-UNITDATA-first fallback for issi={} deferred — all TS2/3/4 occupied by voice/SDS",
@@ -2488,13 +2488,13 @@ impl TetraEntityTrait for UmacBs {
                 tracing::info!("UMAC: PDCH idle-release issi={}", issi);
             }
             // If idle expiry removed all reservations, deactivate PDCH AACH.
-            // Do NOT re-arm pdch_timeslot here — it must only be set by
+            // Do NOT re-arm pdch_timeslots here — they must only be set by
             // emit_pdch_mac_resource (i.e., MS-initiated).  Re-arming in the
             // tick would cause ghost PDCH AACH to re-appear after voice ends
             // without a new TRANSMIT-REQUEST from the MS.
             if !released.is_empty() && self.pdch_allocator.reservations.is_empty() {
                 self.channel_scheduler.set_pdch_timeslot(None);
-                self.pdch_allocator.current_timeslot = None;
+                self.pdch_allocator.current_timeslots.clear();
             }
 
             // 2. Dynamic PDCH timeslot allocation.
@@ -2513,8 +2513,11 @@ impl TetraEntityTrait for UmacBs {
                 })
                 .copied();
 
-            // Update the allocator with the chosen slot for this hyperframe.
-            self.pdch_allocator.current_timeslot = pdch_ts_chosen;
+            // Update the allocator with the chosen slot for this hyperframe (single-slot path).
+            self.pdch_allocator.current_timeslots = match pdch_ts_chosen {
+                Some(t) => vec![t],
+                None => Vec::new(),
+            };
 
             match pdch_ts_chosen {
                 None => {

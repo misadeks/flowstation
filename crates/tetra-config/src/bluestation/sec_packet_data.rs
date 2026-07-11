@@ -138,6 +138,16 @@ pub struct CfgPacketDataPdch {
     /// Channel width code: 0 = 25 kHz (V1 default); 1 = 50 kHz TEDS;
     /// 2 = 100 kHz; 3 = 150 kHz.  Valid range: 0..=3.
     pub channel_width: u8,
+    /// Maximum number of DL timeslots the PDCH pool may occupy per frame
+    /// when `multi_slot = true`.  Ignored when `multi_slot = false`.
+    /// Valid range: 1..=3 (TS2/TS3/TS4 are the eligible DL slots; TS1
+    /// is always the control channel).  Default: 1.
+    pub dl_max_slots_per_frame: u8,
+    /// When `true` (default), an ISSI whose stored `multislot_phase_mod`
+    /// (ETSI TS 100 392-2 §6.5 bit 22) is not `Some(true)` is capped to
+    /// 1 slot per tick even while the global pool holds N slots.  Set to
+    /// `false` only for lab testing with known-capable hardware.
+    pub require_ms_capability: bool,
 }
 
 impl Default for CfgPacketDataPdch {
@@ -146,6 +156,8 @@ impl Default for CfgPacketDataPdch {
             idle_release_frames: default_idle_release_frames(),
             multi_slot: false,
             channel_width: 0,
+            dl_max_slots_per_frame: default_dl_max_slots_per_frame(),
+            require_ms_capability: default_require_ms_capability(),
         }
     }
 }
@@ -241,6 +253,10 @@ pub struct PacketDataPdchDto {
     pub multi_slot: bool,
     #[serde(default = "default_channel_width")]
     pub channel_width: u8,
+    #[serde(default = "default_dl_max_slots_per_frame")]
+    pub dl_max_slots_per_frame: u8,
+    #[serde(default = "default_require_ms_capability")]
+    pub require_ms_capability: bool,
 }
 
 impl Default for PacketDataPdchDto {
@@ -249,6 +265,8 @@ impl Default for PacketDataPdchDto {
             idle_release_frames: default_idle_release_frames(),
             multi_slot: false,
             channel_width: default_channel_width(),
+            dl_max_slots_per_frame: default_dl_max_slots_per_frame(),
+            require_ms_capability: default_require_ms_capability(),
         }
     }
 }
@@ -267,6 +285,8 @@ fn default_resp_wait_timer() -> u8 { 8 }
 fn default_pdu_priority_max() -> u8 { 4 }
 fn default_idle_release_frames() -> u32 { 300 }
 fn default_channel_width() -> u8 { 0 }
+fn default_dl_max_slots_per_frame() -> u8 { 1 }
+fn default_require_ms_capability() -> bool { true }
 
 // ─── Public helpers ───────────────────────────────────────────────────────────
 
@@ -444,6 +464,15 @@ pub fn validate_packet_data_config(dto: PacketDataDto) -> Result<CfgPacketData, 
             ),
         });
     }
+    if dto.pdch.dl_max_slots_per_frame < 1 || dto.pdch.dl_max_slots_per_frame > 3 {
+        return Err(ConfigError {
+            field: "packet_data.pdch.dl_max_slots_per_frame",
+            message: format!(
+                "must be 1..=3 (eligible DL timeslots TS2/TS3/TS4), got {}",
+                dto.pdch.dl_max_slots_per_frame
+            ),
+        });
+    }
 
     Ok(CfgPacketData {
         enabled: dto.enabled,
@@ -467,6 +496,8 @@ pub fn validate_packet_data_config(dto: PacketDataDto) -> Result<CfgPacketData, 
             idle_release_frames: dto.pdch.idle_release_frames,
             multi_slot: dto.pdch.multi_slot,
             channel_width: dto.pdch.channel_width,
+            dl_max_slots_per_frame: dto.pdch.dl_max_slots_per_frame,
+            require_ms_capability: dto.pdch.require_ms_capability,
         },
     })
 }
@@ -768,5 +799,58 @@ mod tests {
         let err = validate_packet_data_config(dto).unwrap_err();
         let s = err.to_string();
         assert!(s.contains("packet_data.pdch.channel_width"), "error display should contain field path: {s}");
+    }
+
+    // ── PD-5c-H52: dl_max_slots_per_frame / require_ms_capability ─────────────
+
+    #[test]
+    fn pdch_h52_defaults_accepted() {
+        let cfg = validate_packet_data_config(defaults()).expect("defaults must be valid");
+        assert_eq!(cfg.pdch.dl_max_slots_per_frame, 1);
+        assert!(cfg.pdch.require_ms_capability);
+    }
+
+    #[test]
+    fn pdch_h52_roundtrip_via_toml() {
+        let toml_str = r#"
+            idle_release_frames = 100
+            multi_slot = true
+            channel_width = 0
+            dl_max_slots_per_frame = 2
+            require_ms_capability = false
+        "#;
+        let dto: PacketDataPdchDto = toml::from_str(toml_str).expect("TOML must parse");
+        assert_eq!(dto.dl_max_slots_per_frame, 2);
+        assert!(!dto.require_ms_capability);
+        // Wrap into PacketDataDto to drive the full validator.
+        let full = PacketDataDto { pdch: dto, ..defaults() };
+        let cfg = validate_packet_data_config(full).expect("must validate");
+        assert_eq!(cfg.pdch.dl_max_slots_per_frame, 2);
+        assert!(!cfg.pdch.require_ms_capability);
+        assert!(cfg.pdch.multi_slot);
+    }
+
+    #[test]
+    fn pdch_h52_dl_max_slots_zero_rejected() {
+        let mut dto = defaults();
+        dto.pdch.dl_max_slots_per_frame = 0;
+        let err = validate_packet_data_config(dto).unwrap_err();
+        assert_eq!(err.field, "packet_data.pdch.dl_max_slots_per_frame");
+        assert!(err.message.contains("1..=3"), "expected range in: {}", err.message);
+    }
+
+    #[test]
+    fn pdch_h52_dl_max_slots_four_rejected() {
+        let mut dto = defaults();
+        dto.pdch.dl_max_slots_per_frame = 4;
+        let err = validate_packet_data_config(dto).unwrap_err();
+        assert_eq!(err.field, "packet_data.pdch.dl_max_slots_per_frame");
+    }
+
+    #[test]
+    fn pdch_h52_dl_max_slots_three_accepted() {
+        let mut dto = defaults();
+        dto.pdch.dl_max_slots_per_frame = 3;
+        assert!(validate_packet_data_config(dto).is_ok());
     }
 }

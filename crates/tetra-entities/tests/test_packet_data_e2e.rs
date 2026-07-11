@@ -732,7 +732,7 @@ fn activate_uplink_downlink_deactivate() {
         "P3: UMAC must have a PDCH reservation for ISSI {TEST_ISSI}"
     );
     assert!(
-        stack.umac.pdch_allocator().current_timeslot.is_some(),
+        stack.umac.pdch_allocator().primary_timeslot().is_some(),
         "P3: UMAC must have a current PDCH timeslot assigned"
     );
 
