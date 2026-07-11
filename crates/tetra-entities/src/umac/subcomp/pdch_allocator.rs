@@ -7,6 +7,23 @@ use tetra_core::TdmaTime;
 /// NOTE: spec ambiguous — chosen behaviour: 18 frames (~1 s idle release).
 pub const PDCH_IDLE_RELEASE_FRAMES: u32 = 300;
 
+/// Hard cap on the number of concurrent PDCH reservations.
+///
+/// PD-5c-H40: the traffic usage marker (UMt) field in the AACH is 6 bits
+/// but ETSI TS 100 392-2 §23.5.1 reserves values 0 (unallocated), 1–3, and
+/// 63, leaving only [4, 62] = 59 slots for live PDCH reservations. If we
+/// let `reserve()` insert unconditionally past that, the rotating cursor in
+/// `alloc_umt` would eventually hand the same UMt to two ISSIs → downlink
+/// packets delivered to the wrong subscriber ("UMt cross-talk").
+///
+/// We cap at 56 rather than 59 to keep 3 UMt values as headroom for
+/// concurrency corner cases (e.g. an old reservation about to expire on the
+/// next `expire_idle` sweep while a new one races to allocate). Motorola
+/// exposes the equivalent limit via the `M_MAXUSERSPERDYNPDCHAN` MIB
+/// parameter and rejects new `PDCH_RESOURCE_REQUEST`s over that threshold
+/// (see `Docs/audit/03-pdch-aach.md` §P5).
+pub const PDCH_MAX_RESERVATIONS: usize = 56;
+
 /// A single per-ISSI PDCH reservation.
 #[derive(Debug, Clone)]
 pub struct PdchReservation {
@@ -52,35 +69,79 @@ impl PdchAllocator {
         }
     }
 
-    /// Allocate the next traffic usage marker (UMt) from the rotating cursor.
-    /// Wraps in the range [4, 62]; 0 is "unallocated", 1–3 and 63 are reserved.
-    pub fn alloc_umt(&mut self) -> u8 {
-        let umt = self.next_umt;
-        self.next_umt = if umt >= 62 { 4 } else { umt + 1 };
-        umt
+    /// Allocate the next traffic usage marker (UMt) that is NOT currently
+    /// held by any live reservation.
+    ///
+    /// PD-5c-H40: the naive cursor increment could wrap into a UMt value
+    /// still held by an existing reservation, producing two ISSIs with the
+    /// same UMt → downlink cross-talk. We scan forward through the [4, 62]
+    /// range until we find an unheld slot. Returns `None` if every slot is
+    /// occupied (which is only reachable if the caller has already exceeded
+    /// PDCH_MAX_RESERVATIONS via a bypass path — reserve() guards against
+    /// that at the entry point).
+    fn alloc_umt(&mut self) -> Option<u8> {
+        let held: std::collections::HashSet<u8> =
+            self.reservations.values().map(|r| r.umt).collect();
+        // Scan up to 59 candidate values ([4, 62] inclusive is 59 slots).
+        for _ in 0..59 {
+            let candidate = self.next_umt;
+            self.next_umt = if candidate >= 62 { 4 } else { candidate + 1 };
+            if !held.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Create or refresh a reservation for `issi`.
-    /// If a reservation already exists it is refreshed (last_used_at updated).
-    /// Returns `true` if this was a NEW reservation (not a refresh).
-    pub fn reserve(&mut self, issi: u32, nsapi: u8, now: TdmaTime) -> bool {
+    ///
+    /// Returns:
+    /// - `Some(true)`  — this was a NEW reservation.
+    /// - `Some(false)` — the reservation already existed and was refreshed.
+    /// - `None`        — the reservation cap (`PDCH_MAX_RESERVATIONS`) is
+    ///   reached; the caller must not grant PDCH access to this MS on this
+    ///   transaction. The MS will retry via SN-DATA-TRANSMIT-REQUEST and can
+    ///   get admitted after another MS's reservation is released.
+    ///
+    /// PD-5c-H40: refresh paths are ALWAYS accepted even when the cap is
+    /// reached — refusing a refresh would drop a live subscriber for no
+    /// benefit; the cap only gates admission of NEW ISSIs.
+    pub fn reserve(&mut self, issi: u32, nsapi: u8, now: TdmaTime) -> Option<bool> {
         if self.reservations.contains_key(&issi) {
             self.reservations.get_mut(&issi).unwrap().last_used_at = now;
-            false
-        } else {
-            let umt = self.alloc_umt();
-            self.reservations.insert(
-                issi,
-                PdchReservation {
-                    issi,
-                    nsapi,
-                    reserved_at: now,
-                    last_used_at: now,
-                    umt,
-                },
-            );
-            true
+            return Some(false);
         }
+        if self.reservations.len() >= PDCH_MAX_RESERVATIONS {
+            tracing::warn!(
+                "PDCH reservation cap ({}) reached; rejecting new reservation for issi={}",
+                PDCH_MAX_RESERVATIONS,
+                issi,
+            );
+            return None;
+        }
+        let umt = match self.alloc_umt() {
+            Some(u) => u,
+            None => {
+                // Should be unreachable given the cap check above, but be
+                // defensive: if UMt space is exhausted, refuse admission.
+                tracing::warn!(
+                    "PDCH UMt space exhausted; rejecting new reservation for issi={}",
+                    issi
+                );
+                return None;
+            }
+        };
+        self.reservations.insert(
+            issi,
+            PdchReservation {
+                issi,
+                nsapi,
+                reserved_at: now,
+                last_used_at: now,
+                umt,
+            },
+        );
+        Some(true)
     }
 
     /// Update `last_used_at` for `issi` without creating a new reservation.
@@ -131,7 +192,7 @@ mod tests {
     fn reserve_creates_entry() {
         let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
         let is_new = alloc.reserve(1234, 0, t(0, 1, 1, 1));
-        assert!(is_new, "first reserve must return true");
+        assert_eq!(is_new, Some(true), "first reserve must return Some(true)");
         assert!(alloc.reservations.contains_key(&1234));
         assert_eq!(alloc.reservations[&1234].nsapi, 0);
         // UMt must be in the valid range [4, 62]
@@ -145,8 +206,8 @@ mod tests {
         let t1 = t(0, 1, 5, 1);
         let first = alloc.reserve(1234, 0, t0);
         let second = alloc.reserve(1234, 0, t1);
-        assert!(first, "first reserve must be new");
-        assert!(!second, "second reserve must be a refresh");
+        assert_eq!(first, Some(true), "first reserve must be new");
+        assert_eq!(second, Some(false), "second reserve must be a refresh");
         assert_eq!(alloc.reservations[&1234].last_used_at, t1);
         assert_eq!(alloc.reservations[&1234].reserved_at, t0);
     }
@@ -181,5 +242,93 @@ mod tests {
         let released = alloc.expire_idle(now);
         assert!(released.is_empty());
         assert!(alloc.reservations.contains_key(&1234));
+    }
+
+    // ─── PD-5c-H40: cap + UMt collision-avoidance tests ────────────────────
+
+    #[test]
+    fn reserve_up_to_cap_succeeds() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        let now = t(0, 1, 1, 1);
+        for i in 0..PDCH_MAX_RESERVATIONS as u32 {
+            let r = alloc.reserve(1_000_000 + i, 0, now);
+            assert_eq!(r, Some(true), "reserve #{i} must succeed");
+        }
+        assert_eq!(alloc.reservations.len(), PDCH_MAX_RESERVATIONS);
+    }
+
+    #[test]
+    fn reserve_beyond_cap_returns_none() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        let now = t(0, 1, 1, 1);
+        for i in 0..PDCH_MAX_RESERVATIONS as u32 {
+            assert_eq!(alloc.reserve(1_000_000 + i, 0, now), Some(true));
+        }
+        // The (cap+1)-th new ISSI must be rejected.
+        let over = alloc.reserve(9_999_999, 0, now);
+        assert_eq!(over, None, "reservation past cap must be rejected");
+        assert_eq!(alloc.reservations.len(), PDCH_MAX_RESERVATIONS);
+
+        // But a refresh on an existing ISSI must still succeed even at cap.
+        let refresh = alloc.reserve(1_000_000, 0, now);
+        assert_eq!(refresh, Some(false));
+    }
+
+    #[test]
+    fn release_then_reserve_at_cap_succeeds() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        let now = t(0, 1, 1, 1);
+        for i in 0..PDCH_MAX_RESERVATIONS as u32 {
+            assert_eq!(alloc.reserve(1_000_000 + i, 0, now), Some(true));
+        }
+        // At cap → new ISSI fails.
+        assert_eq!(alloc.reserve(7_777_777, 0, now), None);
+        // Release one, retry → succeeds.
+        alloc.release(1_000_000);
+        assert_eq!(alloc.reserve(7_777_777, 0, now), Some(true));
+        assert_eq!(alloc.reservations.len(), PDCH_MAX_RESERVATIONS);
+    }
+
+    #[test]
+    fn umt_never_collides_between_live_reservations() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        let now = t(0, 1, 1, 1);
+        for i in 0..PDCH_MAX_RESERVATIONS as u32 {
+            assert_eq!(alloc.reserve(1_000_000 + i, 0, now), Some(true));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in alloc.reservations.values() {
+            assert!(
+                (4..=62).contains(&r.umt),
+                "umt {} out of spec [4,62]",
+                r.umt
+            );
+            assert!(seen.insert(r.umt), "duplicate UMt {} across live reservations", r.umt);
+        }
+    }
+
+    #[test]
+    fn umt_reuse_after_release_does_not_collide_with_live() {
+        // Drive the cursor forward, release some slots, then keep reserving
+        // and confirm no two live reservations share a UMt.
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        let now = t(0, 1, 1, 1);
+        for i in 0..30 {
+            alloc.reserve(2_000_000 + i, 0, now);
+        }
+        // Release a scattered subset.
+        for i in [3, 7, 11, 19, 25] {
+            alloc.release(2_000_000 + i);
+        }
+        // Fill up to cap.
+        let existing = alloc.reservations.len();
+        for i in 0..(PDCH_MAX_RESERVATIONS - existing) as u32 {
+            let r = alloc.reserve(3_000_000 + i, 0, now);
+            assert_eq!(r, Some(true), "refill reserve #{i} must succeed");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in alloc.reservations.values() {
+            assert!(seen.insert(r.umt), "duplicate UMt {} across live reservations", r.umt);
+        }
     }
 }

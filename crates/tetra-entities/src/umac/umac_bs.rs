@@ -1658,13 +1658,26 @@ impl UmacBs {
                     .map(|i| (i + 1) as u8)
                 {
                     // nsapi is unknown at this layer; allocator only keys on ISSI.
-                    self.pdch_allocator.reserve(prim.main_address.ssi, 0, self.dltime);
-                    self.channel_scheduler.set_pdch_timeslot(Some(ts));
-                    self.pdch_allocator.current_timeslot = Some(ts);
-                    tracing::info!(
-                        "UMAC: piggyback PDCH grant issi={} ts={} carrier={} — armed AACH",
-                        prim.main_address.ssi, ts, carrier_num
-                    );
+                    // PD-5c-H40: reserve() may return None when the PDCH cap is
+                    // reached — in that case do NOT arm the AACH, since we have
+                    // no UMt to advertise; the MS will retry after another MS
+                    // releases its reservation.
+                    match self.pdch_allocator.reserve(prim.main_address.ssi, 0, self.dltime) {
+                        Some(_) => {
+                            self.channel_scheduler.set_pdch_timeslot(Some(ts));
+                            self.pdch_allocator.current_timeslot = Some(ts);
+                            tracing::info!(
+                                "UMAC: piggyback PDCH grant issi={} ts={} carrier={} — armed AACH",
+                                prim.main_address.ssi, ts, carrier_num
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                "UMAC: piggyback PDCH grant issi={} rejected — reservation cap reached, AACH not armed",
+                                prim.main_address.ssi
+                            );
+                        }
+                    }
                 }
             }
             (chan_alloc.usage, Some(mac_chan_alloc))
@@ -1788,8 +1801,23 @@ impl UmacBs {
     fn handle_pdch_unitdata_req(&mut self, prim: &tetra_saps::tma::TmaUnitdataReq) {
         let issi = prim.main_address.ssi;
 
-        // `reserve` returns true only for the very first PDU from this ISSI.
-        let is_new = self.pdch_allocator.reserve(issi, 0, self.dltime);
+        // PD-5c-H40: reserve() returns None when the PDCH reservation cap is
+        // reached. In that case we must NOT enqueue the PDU or arm the AACH:
+        // there is no UMt to hand to the MS, so any DL frame would collide
+        // with an existing subscriber. The MS will retry the SN-DATA path and
+        // can be admitted once another reservation is released.
+        let reserve_result = self.pdch_allocator.reserve(issi, 0, self.dltime);
+        let is_new = match reserve_result {
+            Some(new) => new,
+            None => {
+                tracing::warn!(
+                    "UMAC: PDCH SN-UNITDATA-first for issi={} rejected — reservation cap reached; dropping {} bits",
+                    issi,
+                    prim.pdu.get_len(),
+                );
+                return;
+            }
+        };
 
         tracing::debug!(
             "UMAC: PDCH reserve issi={} enqueuing {} bits (new={})",
