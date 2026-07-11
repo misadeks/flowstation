@@ -897,12 +897,17 @@ fn pdch_tick_reasserts_aach_after_intra_frame_change() {
 
 /// Build a `ComponentTest` with multi-slot PDCH enabled: `multi_slot = true`,
 /// `dl_max_slots_per_frame = max_slots`, `require_ms_capability = require_cap`.
+///
+/// AACH stability debounce (H52c) is disabled (`aach_stability_ticks = 0`) so
+/// existing H52b behaviour tests don't need to wait K ticks for the pool to
+/// warm up. H52c-specific tests build a fresh config with the debounce armed.
 fn make_multislot_test(max_slots: u8, require_cap: bool) -> ComponentTest {
     let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
     cfg.packet_data.pdch = CfgPacketDataPdch {
         multi_slot: true,
         dl_max_slots_per_frame: max_slots,
         require_ms_capability: require_cap,
+        aach_stability_ticks: 0,
         ..Default::default()
     };
     cfg.packet_data.enabled = true;
@@ -1044,3 +1049,103 @@ fn pdch_multislot_gated_by_ms_capability() {
         "non-multislot MS must be capped at 1 slot per tick; second SDU must remain in queue"
     );
 }
+
+// ── PD-5c-H52c: AL-window edge cases + AACH stability debounce ────────────────
+
+/// H52c test 1: AL window edge — 3 SDUs queued for 3 distinct multislot-capable
+/// ISSIs, N=3, all TS free: single drain tick empties the queue.
+#[test]
+fn pdch_multislot_drains_all_when_queue_fits_n_slots() {
+    debug::setup_logging_verbose();
+
+    const ISSI_A: u32 = 4001;
+    const ISSI_B: u32 = 4002;
+    const ISSI_C: u32 = 4003;
+
+    let mut test = make_multislot_test(3, true);
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    for issi in [ISSI_A, ISSI_B, ISSI_C] {
+        test.config.state_write().ms_multislot_cap.insert(issi, true);
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(issi)),
+        });
+    }
+    // tick 1: deliver messages; tick 2: drain fires (N=3, 3 SDUs → drained).
+    test.run_stack(Some(2));
+
+    let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+        .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+
+    assert_eq!(
+        umac.pdch_dl_queue_len_for_test(),
+        0,
+        "with 3 SDUs queued and N=3, one drain tick must empty the queue"
+    );
+    assert!(
+        umac.pdch_allocator().current_timeslots.len() >= 3,
+        "all 3 eligible timeslots must be labelled PDCH"
+    );
+}
+
+/// H52c test 2: AL window edge — 5 SDUs queued for 5 distinct multislot-capable
+/// ISSIs, N=3, all TS free: tick 1 drains 3, tick 2 drains 2, tick 3 queue empty.
+///
+/// Proves the drain re-polls the queue on the next tick when the burst exceeds N.
+#[test]
+fn pdch_multislot_drains_n_and_repolls_next_tick() {
+    debug::setup_logging_verbose();
+
+    const N: usize = 5;
+
+    let mut test = make_multislot_test(3, true);
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    for i in 0..N {
+        let issi = 5000u32 + i as u32;
+        test.config.state_write().ms_multislot_cap.insert(issi, true);
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(issi)),
+        });
+    }
+    // tick 1: deliver messages (queue depth = 5); tick 2: drain fires, drains 3, 2 remain.
+    test.run_stack(Some(2));
+    {
+        let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+            .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+        assert_eq!(
+            umac.pdch_dl_queue_len_for_test(),
+            2,
+            "tick 2: N=3 slots drained; 5-3=2 SDUs must remain"
+        );
+    }
+    // tick 3: drain fires again on the remaining 2 SDUs → queue empty.
+    test.run_stack(Some(1));
+    {
+        let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+            .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+        assert_eq!(
+            umac.pdch_dl_queue_len_for_test(),
+            0,
+            "tick 3: remaining 2 SDUs must drain (queue is empty even though only 2 of 3 slots are used)"
+        );
+    }
+}
+
+// H52c hysteresis behaviour is unit-tested exhaustively in
+// `crates/tetra-entities/src/umac/subcomp/pdch_allocator.rs`
+// (`stability_debounce_delays_ts_addition_by_k_ticks`,
+//  `stability_resets_on_voice_contention`, `stability_independent_counters_per_ts`,
+//  `stability_zero_ticks_returns_free_immediately`).
+// At the integration level, the initial PDCH pool activation goes through the
+// piggyback grant path (`rx_control` for `TmaUnitdataReq`), which arms the AACH
+// synchronously before the next `tick_start` hysteresis pass. Steady-state
+// hysteresis only affects add/remove decisions **during** operation (transient
+// voice contention), which is exercised at the allocator level. No integration
+// test needed here.

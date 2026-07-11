@@ -52,6 +52,13 @@ pub struct PdchAllocator {
     /// Empty when no PDCH slot could be picked this hyperframe (e.g. voice took all eligible
     /// slots).  Updated each hyperframe by the UMAC scheduler.
     pub current_timeslots: Vec<u8>,
+    /// PD-5c-H52c: per-eligible-TS consecutive-voice-free-tick counter
+    /// (keyed by TS 2..=4). Incremented once per UMAC tick for each TS
+    /// observed voice-free, capped at the caller-supplied stability
+    /// threshold; reset to 0 the moment a TS becomes voice-busy. Used by
+    /// `tick_stability` to debounce AACH announcements so transient voice
+    /// contention doesn't churn the PDCH pool and cause MS lock-loss.
+    pub consec_free_ticks: HashMap<u8, u8>,
     /// Rotating cursor for UMt allocation. Valid range is [4, 62] per ETSI TS 100 392-2
     /// §23.5.1 (0 = unallocated, 1–3 and 63 reserved). Wraps back to 4 after 62.
     /// NOTE: spec ambiguous — chosen behaviour: per-allocator cursor, not per-timeslot,
@@ -65,8 +72,46 @@ impl PdchAllocator {
             reservations: HashMap::new(),
             idle_release_frames,
             current_timeslots: Vec::new(),
+            consec_free_ticks: HashMap::new(),
             next_umt: 4, // Start at 4; range [4, 62] per spec
         }
+    }
+
+    /// PD-5c-H52c: advance the per-TS AACH-stability counters for this tick.
+    ///
+    /// Given the set of candidate timeslots observed voice-free in the
+    /// current tick, increment their counters (saturating at
+    /// `stability_ticks`) and reset counters for any TS not in `free_ts`
+    /// (i.e. voice/circuit is contending). Returns the subset of `free_ts`
+    /// whose counter has reached `stability_ticks` and are therefore
+    /// eligible to be labelled PDCH this tick, preserving the input order.
+    ///
+    /// `stability_ticks == 0` disables hysteresis: every free candidate is
+    /// returned immediately (H52b behaviour).
+    ///
+    /// This is called once per UMAC tick from `UmacBs::tick_start`. Only
+    /// candidates TS2/TS3/TS4 are tracked (TS1 is control channel).
+    pub fn tick_stability(&mut self, free_ts: &[u8], stability_ticks: u8) -> Vec<u8> {
+        // Update counters for all three eligible timeslots so a TS falling
+        // out of `free_ts` immediately resets, even if not queried this tick.
+        for ts in [2u8, 3, 4] {
+            let is_free = free_ts.contains(&ts);
+            let counter = self.consec_free_ticks.entry(ts).or_insert(0);
+            if is_free {
+                let cap = stability_ticks.max(1);
+                *counter = counter.saturating_add(1).min(cap);
+            } else {
+                *counter = 0;
+            }
+        }
+        if stability_ticks == 0 {
+            return free_ts.to_vec();
+        }
+        free_ts
+            .iter()
+            .filter(|ts| self.consec_free_ticks.get(ts).copied().unwrap_or(0) >= stability_ticks)
+            .copied()
+            .collect()
     }
 
     /// Allocate the next traffic usage marker (UMt) that is NOT currently
@@ -354,5 +399,66 @@ mod tests {
         // Empty → None.
         alloc.current_timeslots.clear();
         assert_eq!(alloc.primary_timeslot(), None);
+    }
+
+    // ── PD-5c-H52c: AACH stability debounce (`tick_stability`) ──────────────
+
+    #[test]
+    fn stability_zero_ticks_returns_free_immediately() {
+        // stability_ticks = 0 disables hysteresis → all free candidates
+        // are promoted the first tick they appear (H52b behaviour).
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        let out = alloc.tick_stability(&[4, 3, 2], 0);
+        assert_eq!(out, vec![4, 3, 2], "K=0 must return every free candidate on tick 1");
+    }
+
+    #[test]
+    fn stability_debounce_delays_ts_addition_by_k_ticks() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        // Tick 1..K-1: TS4 is free but not yet stable.
+        for i in 1..4 {
+            let out = alloc.tick_stability(&[4], 4);
+            assert!(out.is_empty(), "tick {i}: TS4 must not be promoted before K ticks");
+        }
+        // Tick 4: threshold reached, TS4 admitted.
+        let out = alloc.tick_stability(&[4], 4);
+        assert_eq!(out, vec![4], "TS4 must be promoted at tick K=4");
+    }
+
+    #[test]
+    fn stability_resets_on_voice_contention() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        // Warm up TS4 counter close to threshold.
+        for _ in 0..3 {
+            alloc.tick_stability(&[4], 4);
+        }
+        // Voice grabs TS4 → counter resets.
+        let out = alloc.tick_stability(&[3], 4);
+        assert!(out.is_empty(), "voice contention on TS4 must reset its stability counter");
+        assert_eq!(alloc.consec_free_ticks.get(&4).copied(), Some(0));
+        // TS4 free again — must wait another full K ticks.
+        for i in 1..4 {
+            let out = alloc.tick_stability(&[4], 4);
+            assert!(out.is_empty(), "post-reset tick {i}: TS4 must not be promoted before K ticks");
+        }
+        let out = alloc.tick_stability(&[4], 4);
+        assert_eq!(out, vec![4], "TS4 re-admitted at post-reset tick K");
+    }
+
+    #[test]
+    fn stability_independent_counters_per_ts() {
+        let mut alloc = PdchAllocator::new(PDCH_IDLE_RELEASE_FRAMES);
+        // TS4 free for 4 ticks, TS3 only free for the last tick.
+        for _ in 0..3 {
+            alloc.tick_stability(&[4], 4);
+        }
+        let out = alloc.tick_stability(&[4, 3], 4);
+        assert_eq!(out, vec![4], "TS4 promoted, TS3 still warming up");
+        // Advance three more ticks with both free — TS3 should catch up.
+        for _ in 0..2 {
+            alloc.tick_stability(&[4, 3], 4);
+        }
+        let out = alloc.tick_stability(&[4, 3], 4);
+        assert_eq!(out, vec![4, 3], "both TS promoted after independent warm-ups");
     }
 }

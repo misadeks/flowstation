@@ -2506,20 +2506,30 @@ impl TetraEntityTrait for UmacBs {
             //    scheduler's DL circuit occupancy; any non-active slot is eligible.
             let pdch_cfg = {
                 let c = self.config.config();
-                (c.packet_data.pdch.multi_slot, c.packet_data.pdch.dl_max_slots_per_frame, c.packet_data.pdch.require_ms_capability)
+                (c.packet_data.pdch.multi_slot, c.packet_data.pdch.dl_max_slots_per_frame, c.packet_data.pdch.require_ms_capability, c.packet_data.pdch.aach_stability_ticks)
             };
-            let (multi_slot, dl_max_slots, require_ms_cap) = pdch_cfg;
+            let (multi_slot, dl_max_slots, require_ms_cap, aach_stability_ticks) = pdch_cfg;
 
             if multi_slot {
                 // ── H52b: multi-slot drain ──────────────────────────────────
-                // Collect up to dl_max_slots free non-voice slots in preference order.
-                let chosen_slots: Vec<u8> = [4u8, 3, 2]
+                // Collect free non-voice slots in preference order, then apply
+                // H52c AACH stability debounce so a TS is only promoted after
+                // being observed voice-free for `aach_stability_ticks`
+                // consecutive ticks (prevents MS lock-loss from AACH churn
+                // under transient voice contention).
+                let free_candidates: Vec<u8> = [4u8, 3, 2]
                     .iter()
                     .filter(|&&ts_candidate| {
                         !self.channel_scheduler.circuit_is_active(Direction::Dl, ts_candidate)
                     })
-                    .take(dl_max_slots as usize)
                     .copied()
+                    .collect();
+                let stable_candidates = self
+                    .pdch_allocator
+                    .tick_stability(&free_candidates, aach_stability_ticks);
+                let chosen_slots: Vec<u8> = stable_candidates
+                    .into_iter()
+                    .take(dl_max_slots as usize)
                     .collect();
 
                 // Advertise all chosen slots as AssignedControl in the AACH.
@@ -2528,14 +2538,16 @@ impl TetraEntityTrait for UmacBs {
 
                 if chosen_slots.is_empty() {
                     tracing::info!(
-                        "UMAC: PDCH deferred this hyperframe — all TS2/3/4 in use by voice/circuit"
+                        "UMAC: PDCH deferred this hyperframe — all TS2/3/4 in use by voice/circuit or awaiting stability (free={:?}, K={})",
+                        free_candidates, aach_stability_ticks
                     );
                 } else {
                     // Per-MS capability gate: track ISSIs served this tick.
                     // An ISSI whose multislot_phase_mod is not Some(true) is limited to
                     // one slot per tick even when the pool has room for more.
                     let mut served_this_tick: HashSet<u32> = HashSet::new();
-                    for chosen_ts in chosen_slots {
+                    let mut served_order: Vec<u32> = Vec::new();
+                    for chosen_ts in &chosen_slots {
                         let maybe_entry = self.pdch_dl_queue.pop_front();
                         if let Some((issi, sdu)) = maybe_entry {
                             if require_ms_cap && served_this_tick.contains(&issi) {
@@ -2555,13 +2567,23 @@ impl TetraEntityTrait for UmacBs {
                             pdu.update_len_and_fill_ind(sdu.get_len());
                             tracing::debug!(
                                 "UMAC: PDCH multi-slot DL {} bits for issi={} umt={:?} → TS{}",
-                                sdu.get_len(), issi, umt, chosen_ts
+                                sdu.get_len(), issi, umt, *chosen_ts
                             );
                             self.pdch_allocator.touch(issi, self.dltime);
                             self.channel_scheduler
-                                .dl_enqueue_tma_for_link(chosen_ts as u32, pdu, sdu, None);
+                                .dl_enqueue_tma_for_link(*chosen_ts as u32, pdu, sdu, None);
                             served_this_tick.insert(issi);
+                            served_order.push(issi);
                         }
+                    }
+                    if !served_order.is_empty() {
+                        // PD-5c-H52c: forensic telemetry for first hardware bring-up.
+                        // Emit at INFO so the operator can see multi-slot behaviour
+                        // in production logs without RUST_LOG=debug.
+                        tracing::info!(
+                            "H52: draining {} slots this tick chosen={:?} issis_served={:?}",
+                            served_order.len(), chosen_slots, served_order
+                        );
                     }
                 }
             } else {

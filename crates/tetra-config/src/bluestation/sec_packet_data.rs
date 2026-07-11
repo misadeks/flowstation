@@ -148,6 +148,14 @@ pub struct CfgPacketDataPdch {
     /// 1 slot per tick even while the global pool holds N slots.  Set to
     /// `false` only for lab testing with known-capable hardware.
     pub require_ms_capability: bool,
+    /// PD-5c-H52c: AACH stability debounce. A TS is promoted into the PDCH
+    /// pool only after it has been observed voice-free for this many
+    /// consecutive UMAC ticks. Any voice contention on the TS resets the
+    /// counter to 0. Prevents MS lock-loss from AACH announcement churn under
+    /// transient voice contention. `0` disables hysteresis (immediate
+    /// promotion, today's H52b behaviour). Default 4 (~224 ms at 56 ms/frame).
+    /// Valid range 0..=32.
+    pub aach_stability_ticks: u8,
 }
 
 impl Default for CfgPacketDataPdch {
@@ -158,6 +166,7 @@ impl Default for CfgPacketDataPdch {
             channel_width: 0,
             dl_max_slots_per_frame: default_dl_max_slots_per_frame(),
             require_ms_capability: default_require_ms_capability(),
+            aach_stability_ticks: default_aach_stability_ticks(),
         }
     }
 }
@@ -257,6 +266,8 @@ pub struct PacketDataPdchDto {
     pub dl_max_slots_per_frame: u8,
     #[serde(default = "default_require_ms_capability")]
     pub require_ms_capability: bool,
+    #[serde(default = "default_aach_stability_ticks")]
+    pub aach_stability_ticks: u8,
 }
 
 impl Default for PacketDataPdchDto {
@@ -267,6 +278,7 @@ impl Default for PacketDataPdchDto {
             channel_width: default_channel_width(),
             dl_max_slots_per_frame: default_dl_max_slots_per_frame(),
             require_ms_capability: default_require_ms_capability(),
+            aach_stability_ticks: default_aach_stability_ticks(),
         }
     }
 }
@@ -287,6 +299,7 @@ fn default_idle_release_frames() -> u32 { 300 }
 fn default_channel_width() -> u8 { 0 }
 fn default_dl_max_slots_per_frame() -> u8 { 1 }
 fn default_require_ms_capability() -> bool { true }
+fn default_aach_stability_ticks() -> u8 { 4 }
 
 // ─── Public helpers ───────────────────────────────────────────────────────────
 
@@ -473,6 +486,15 @@ pub fn validate_packet_data_config(dto: PacketDataDto) -> Result<CfgPacketData, 
             ),
         });
     }
+    if dto.pdch.aach_stability_ticks > 32 {
+        return Err(ConfigError {
+            field: "packet_data.pdch.aach_stability_ticks",
+            message: format!(
+                "must be 0..=32 (0 disables hysteresis), got {}",
+                dto.pdch.aach_stability_ticks
+            ),
+        });
+    }
 
     Ok(CfgPacketData {
         enabled: dto.enabled,
@@ -498,6 +520,7 @@ pub fn validate_packet_data_config(dto: PacketDataDto) -> Result<CfgPacketData, 
             channel_width: dto.pdch.channel_width,
             dl_max_slots_per_frame: dto.pdch.dl_max_slots_per_frame,
             require_ms_capability: dto.pdch.require_ms_capability,
+            aach_stability_ticks: dto.pdch.aach_stability_ticks,
         },
     })
 }
@@ -852,5 +875,42 @@ mod tests {
         let mut dto = defaults();
         dto.pdch.dl_max_slots_per_frame = 3;
         assert!(validate_packet_data_config(dto).is_ok());
+    }
+
+    // ── PD-5c-H52c: aach_stability_ticks ──────────────────────────────────────
+
+    #[test]
+    fn pdch_h52c_aach_stability_default_is_four() {
+        let cfg = validate_packet_data_config(defaults()).expect("defaults must be valid");
+        assert_eq!(cfg.pdch.aach_stability_ticks, 4);
+    }
+
+    #[test]
+    fn pdch_h52c_aach_stability_roundtrip_via_toml() {
+        let toml_str = r#"
+            aach_stability_ticks = 8
+        "#;
+        let dto: PacketDataPdchDto = toml::from_str(toml_str).expect("TOML must parse");
+        assert_eq!(dto.aach_stability_ticks, 8);
+        let full = PacketDataDto { pdch: dto, ..defaults() };
+        let cfg = validate_packet_data_config(full).expect("must validate");
+        assert_eq!(cfg.pdch.aach_stability_ticks, 8);
+    }
+
+    #[test]
+    fn pdch_h52c_aach_stability_zero_accepted_disables_hysteresis() {
+        let mut dto = defaults();
+        dto.pdch.aach_stability_ticks = 0;
+        let cfg = validate_packet_data_config(dto).expect("0 must validate (disables hysteresis)");
+        assert_eq!(cfg.pdch.aach_stability_ticks, 0);
+    }
+
+    #[test]
+    fn pdch_h52c_aach_stability_over_max_rejected() {
+        let mut dto = defaults();
+        dto.pdch.aach_stability_ticks = 33;
+        let err = validate_packet_data_config(dto).unwrap_err();
+        assert_eq!(err.field, "packet_data.pdch.aach_stability_ticks");
+        assert!(err.message.contains("0..=32"), "expected range in: {}", err.message);
     }
 }
