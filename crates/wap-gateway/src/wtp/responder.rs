@@ -76,6 +76,15 @@ pub struct ResponderConfig {
     /// state machine. Set to just below the initiator's Invoke retx timer
     /// (WAP-201 §11 Awt ≈ 3 s).
     pub hold_on_ack_delay: Duration,
+    /// PD-10c-H45: safety ceiling for how long the sweeper defers the
+    /// WTP Result retx timer while an AL delivery is in flight. Bounds
+    /// the fix so a broken LLC feedback hook (or a peer that silently
+    /// disappears mid-AL-bring-up) cannot wedge us forever. Default is
+    /// 10 s — comfortably above the worst hardware AL bring-up latency
+    /// observed (MTP6550, ~5.7 s) but small enough that we still recover
+    /// on the next sweep tick if the LLC subscriber is misbehaving.
+    /// Ignored when no `peer_resolver` was resolved for the txn.
+    pub al_max_inflight: Duration,
 }
 
 impl Default for ResponderConfig {
@@ -106,6 +115,7 @@ impl Default for ResponderConfig {
             // resource use with negligible CPU overhead.
             sweep_interval: Duration::from_secs(5),
             hold_on_ack_delay: Duration::from_millis(2500),
+            al_max_inflight: Duration::from_secs(10),
         }
     }
 }
@@ -166,6 +176,26 @@ struct Transaction {
     /// by the H33 replay gate in `on_invoke` to suppress duplicate replays
     /// that would pile up on MS's AL RX window and cause link resets.
     al_delivered: bool,
+    /// PD-10c-H45: set to `true` in `complete_invoke` whenever the
+    /// peer_resolver successfully mapped this peer to an ISSI, i.e. we
+    /// have a live wiring to the LLC AL feedback subsystem for this
+    /// transaction. Cleared by the AL feedback subscriber on any outcome
+    /// (Delivered / DroppedFireAndForget / DroppedRetxExhausted) so the
+    /// retx timer can fire from that point onwards.
+    ///
+    /// Hardware trace (2026-07-11 MTP6550, 43:57.577 → 44:04.602) showed
+    /// the peer sometimes takes 5-6 s to bring up a fresh AL link for an
+    /// incoming Result. Our default t_ack=500 ms fired a wasted DL retx
+    /// at ~4.2 s before the peer had even acked the first send. While
+    /// `al_in_flight` is true the sweeper defers retx up to
+    /// `AL_MAX_INFLIGHT` — after that safety ceiling elapses we fall
+    /// through to normal retx so a broken LLC feedback hook can never
+    /// wedge us forever.
+    ///
+    /// Stays `false` when no `peer_resolver` is wired or when ISSI
+    /// resolution failed (fire-and-forget path, e.g. kannel-mode) —
+    /// preserving byte-identical behaviour for those configs.
+    al_in_flight: bool,
 }
 
 impl Transaction {
@@ -434,6 +464,7 @@ impl Responder {
                     peer_issi: None,
                     result_sent_at: None,
                     al_delivered: false,
+                    al_in_flight: false,
                 }))
             })
             .clone();
@@ -590,6 +621,11 @@ impl Responder {
             .and_then(|r| r.issi_for_peer(txn.peer));
         txn.result_sent_at = Some(Instant::now());
         txn.al_delivered = false;
+        // PD-10c-H45: only defer retx while AL is in flight when we have a
+        // usable peer_issi — otherwise no LLC delivery event can ever
+        // correlate back to this txn and we must fall back to the normal
+        // retx path (fire-and-forget / kannel-mode compat).
+        txn.al_in_flight = txn.peer_issi.is_some();
     }
 
     async fn retransmit_result(&self, key: TxnKey) {
@@ -647,6 +683,38 @@ async fn sweep_loop(resp: Responder) {
             let txn = txn.lock().await;
             if let Some(deadline) = txn.retx_at {
                 if now >= deadline {
+                    // PD-10c-H45: defer retx while AL delivery is still in
+                    // flight — hardware showed MTP6550 taking 5-6 s to
+                    // bring up a fresh AL link for an incoming Result, so
+                    // firing a retx at t_ack (default 500 ms) wasted a DL
+                    // send. Skip this tick without advancing retx_count or
+                    // retx_at so the next tick re-evaluates. Bounded by
+                    // AL_MAX_INFLIGHT so a broken feedback hook cannot
+                    // wedge us forever.
+                    if txn.al_in_flight {
+                        let ceiling = resp.cfg.al_max_inflight;
+                        let elapsed = txn
+                            .result_sent_at
+                            .map(|t| now.duration_since(t))
+                            .unwrap_or(ceiling);
+                        if elapsed < ceiling {
+                            info!(
+                                peer = %txn.peer,
+                                tid = txn.tid,
+                                elapsed_ms = elapsed.as_millis(),
+                                ceiling_ms = ceiling.as_millis(),
+                                "H45: deferring Result retx — AL delivery still in flight"
+                            );
+                            continue;
+                        }
+                        info!(
+                            peer = %txn.peer,
+                            tid = txn.tid,
+                            elapsed_ms = elapsed.as_millis(),
+                            ceiling_ms = ceiling.as_millis(),
+                            "H45: AL in-flight ceiling reached — falling through to normal retx"
+                        );
+                    }
                     to_retx.push(key);
                 }
             }
@@ -723,6 +791,9 @@ impl Responder {
             match ev.outcome {
                 AlDeliveryOutcome::Delivered => {
                     txn.al_delivered = true;
+                    // PD-10c-H45: LLC confirmed delivery — no more
+                    // deferral needed (and retx_at will be cleared below).
+                    txn.al_in_flight = false;
                     if txn.retx_at.is_some() {
                         txn.retx_at = None;
                         info!(
@@ -744,6 +815,10 @@ impl Responder {
                     }
                 }
                 AlDeliveryOutcome::DroppedFireAndForget => {
+                    // PD-10c-H45: LLC dropped the SDU without acking. Let
+                    // the WTP retx path fire on its next sweep — the AL
+                    // is no longer in flight from the LLC's perspective.
+                    txn.al_in_flight = false;
                     debug!(
                         peer = %txn.peer,
                         tid = txn.tid,
@@ -753,6 +828,10 @@ impl Responder {
                     );
                 }
                 AlDeliveryOutcome::DroppedRetxExhausted => {
+                    // PD-10c-H45: same as above — LLC gave up, so WTP
+                    // retx must take over immediately without further H45
+                    // deferral.
+                    txn.al_in_flight = false;
                     debug!(
                         peer = %txn.peer,
                         tid = txn.tid,
@@ -1210,5 +1289,157 @@ mod tests {
         };
         client_wdp.send(server_addr, &re_invoke.encode()).await.unwrap();
         let (_tid, _bytes) = recv_result(&client_wdp).await;
+    }
+
+    // ── PD-10c-H45: defer WTP Result retx while AL delivery in flight ────
+
+    /// H45 core: with peer_resolver wired (so `al_in_flight` is set at
+    /// Result-send time) and NO Delivered event fired, the sweep loop
+    /// must defer the retx timer while we are still inside the
+    /// `al_max_inflight` ceiling. Prior to H45 the retx fired at
+    /// `t_ack`, wasting a DL send while the peer was still bringing up
+    /// its AL link.
+    #[tokio::test]
+    async fn h45_retx_suppressed_while_al_in_flight() {
+        let server_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let client_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let server_addr = server_wdp.local_addr();
+
+        // Tight t_ack + fast sweep so multiple sweep ticks would fire a
+        // retx under pre-H45 behaviour. Generous ceiling so nothing
+        // times out during the observation window.
+        let mut cfg = ResponderConfig::default();
+        cfg.t_ack = Duration::from_millis(80);
+        cfg.sweep_interval = Duration::from_millis(40);
+        cfg.max_retx = 3;
+        cfg.al_max_inflight = Duration::from_secs(5);
+
+        let _tx = spawn_feedback_responder(server_wdp, 4242, cfg).await;
+
+        let invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: false },
+            tid: 0x0041,
+            version: 0,
+            tid_new: true,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"h45-a".to_vec(),
+        };
+        client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
+
+        // Drain the first (non-retx) Result.
+        let (_, _) = recv_result(&client_wdp).await;
+
+        // Wait long enough for several sweep ticks past t_ack. No retx
+        // must arrive — H45 defers because al_in_flight=true and we are
+        // well below al_max_inflight.
+        let quiet = tokio::time::timeout(Duration::from_millis(600), client_wdp.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "H45 must defer Result retx while AL is in flight, but a PDU arrived: {:?}",
+            quiet,
+        );
+    }
+
+    /// H45 safety ceiling: if the LLC feedback subsystem never fires a
+    /// Delivered event (e.g. broken hook, MS silently gone) the retx
+    /// timer must eventually take over so we don't wedge forever.
+    #[tokio::test]
+    async fn h45_retx_fires_after_al_in_flight_ceiling() {
+        let server_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let client_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let server_addr = server_wdp.local_addr();
+
+        // Short ceiling so the test completes in <1 s. Tight t_ack +
+        // fast sweep so the retx fires promptly once the ceiling is
+        // reached.
+        let mut cfg = ResponderConfig::default();
+        cfg.t_ack = Duration::from_millis(50);
+        cfg.sweep_interval = Duration::from_millis(40);
+        cfg.max_retx = 3;
+        cfg.al_max_inflight = Duration::from_millis(300);
+
+        let _tx = spawn_feedback_responder(server_wdp, 4243, cfg).await;
+
+        let invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: false },
+            tid: 0x0042,
+            version: 0,
+            tid_new: true,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"h45-b".to_vec(),
+        };
+        client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
+
+        // Drain the first Result.
+        let (tid0, bytes0) = recv_result(&client_wdp).await;
+        assert_eq!(tid0 & 0x7FFF, 0x0042);
+        // First send has RID cleared (fresh Result, not a retry).
+        assert_eq!(bytes0[0] & 0b0000_0001, 0, "first Result must have RID=0");
+
+        // Wait past al_max_inflight + a couple of sweep ticks; the retx
+        // must now fire because the ceiling has elapsed.
+        let (tid1, bytes1) = tokio::time::timeout(Duration::from_millis(800), async {
+            recv_result(&client_wdp).await
+        })
+        .await
+        .expect("H45 ceiling must let retx fire, but no Result arrived within budget");
+        assert_eq!(tid1 & 0x7FFF, 0x0042, "retx must carry the same TID");
+        assert_eq!(bytes1[0] & 0b0000_0001, 1, "H45 fall-through retx must have RID=1");
+    }
+
+    /// H45 regression guard: with NO peer_resolver wired (kannel-mode
+    /// compat, or standalone unit tests) `al_in_flight` must stay false
+    /// and the pre-H45 retx path must fire exactly as before.
+    #[tokio::test]
+    async fn h45_retx_fires_normally_without_peer_resolver() {
+        let server_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let client_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let server_addr = server_wdp.local_addr();
+
+        // Tight t_ack + fast sweep. Do NOT wire peer_resolver.
+        let mut cfg = ResponderConfig::default();
+        cfg.t_ack = Duration::from_millis(60);
+        cfg.sweep_interval = Duration::from_millis(40);
+        cfg.max_retx = 3;
+        // al_max_inflight is generous — must be irrelevant when
+        // al_in_flight is never set.
+        cfg.al_max_inflight = Duration::from_secs(5);
+
+        let handler = handler_fn(|_peer, req| async move {
+            let mut resp = b"echo:".to_vec();
+            resp.extend_from_slice(&req);
+            resp
+        });
+        let responder = Responder::new(server_wdp, handler, cfg);
+        tokio::spawn(async move {
+            let _ = responder.run().await;
+        });
+
+        let invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: false },
+            tid: 0x0043,
+            version: 0,
+            tid_new: true,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"h45-c".to_vec(),
+        };
+        client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
+
+        // First Result.
+        let (tid0, _) = recv_result(&client_wdp).await;
+        assert_eq!(tid0 & 0x7FFF, 0x0043);
+
+        // Retx must fire well before al_max_inflight — the H45 guard
+        // must be inert when peer_resolver is absent.
+        let (tid1, bytes1) = tokio::time::timeout(Duration::from_millis(500), async {
+            recv_result(&client_wdp).await
+        })
+        .await
+        .expect("without peer_resolver, retx must fire on schedule");
+        assert_eq!(tid1 & 0x7FFF, 0x0043);
+        assert_eq!(bytes1[0] & 0b0000_0001, 1, "retx must have RID=1");
     }
 }
