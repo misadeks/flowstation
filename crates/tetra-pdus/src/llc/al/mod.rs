@@ -5,3 +5,6 @@ pub mod error;
 pub mod fcs;
 pub mod reassembler;
 pub mod segmenter;
+
+#[cfg(test)]
+mod tests_h51;
