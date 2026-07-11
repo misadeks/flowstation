@@ -304,3 +304,150 @@ fn test_bl_tldata_req_at_n251_boundary_is_accepted() {
         "exact N.251-bit SDU must still be forwarded (boundary is inclusive)"
     );
 }
+
+// PD-5c-H43 (audit LLC-02): outbound BL-UDATA must propagate the caller's
+// fcs_flag instead of hard-coding `has_fcs = false`. Decode the emitted PDU
+// and confirm the header bit round-trips.
+
+use tetra_pdus::llc::pdus::bl_udata::BlUdata;
+
+#[test]
+fn test_bl_udata_tx_propagates_fcs_flag_true() {
+    debug::setup_logging_verbose();
+
+    let mut tl_sdu = BitBuffer::new_autoexpand(8);
+    tl_sdu.write_bits(0b1010_1100, 8);
+    tl_sdu.seek(0);
+
+    let req = TlaTlUnitdataReqBl {
+        main_address: TetraAddress::new(2200699, SsiType::Issi),
+        link_id: 3,
+        endpoint_id: 0,
+        tl_sdu,
+        stealing_permission: true,
+        subscriber_class: 0,
+        fcs_flag: true, // <-- the actual assertion under test
+        air_interface_encryption: None,
+        packet_data_flag: false,
+        n_tlsdu_repeats: 0,
+        data_class_info: None,
+        req_handle: 0,
+        chan_alloc: None,
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac]);
+    test.submit_message(SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlUnitdataReqBl(req),
+    });
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::TmaUnitdataReq(TmaUnitdataReq { pdu, .. }) = &sink_msgs[0].msg else {
+        panic!("expected TMA-UNITDATA request");
+    };
+    let mut pdu_buf = pdu.clone();
+    pdu_buf.seek(0);
+    let parsed = BlUdata::from_bitbuf(&mut pdu_buf).expect("BL-UDATA parses");
+    assert!(
+        parsed.has_fcs,
+        "BL-UDATA TX must propagate fcs_flag=true from the TLA request"
+    );
+}
+
+#[test]
+fn test_bl_udata_tx_propagates_fcs_flag_false() {
+    debug::setup_logging_verbose();
+
+    let mut tl_sdu = BitBuffer::new_autoexpand(8);
+    tl_sdu.write_bits(0b1010_1100, 8);
+    tl_sdu.seek(0);
+
+    let req = TlaTlUnitdataReqBl {
+        main_address: TetraAddress::new(2200699, SsiType::Issi),
+        link_id: 3,
+        endpoint_id: 0,
+        tl_sdu,
+        stealing_permission: true,
+        subscriber_class: 0,
+        fcs_flag: false,
+        air_interface_encryption: None,
+        packet_data_flag: false,
+        n_tlsdu_repeats: 0,
+        data_class_info: None,
+        req_handle: 0,
+        chan_alloc: None,
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac]);
+    test.submit_message(SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlUnitdataReqBl(req),
+    });
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::TmaUnitdataReq(TmaUnitdataReq { pdu, .. }) = &sink_msgs[0].msg else {
+        panic!("expected TMA-UNITDATA request");
+    };
+    let mut pdu_buf = pdu.clone();
+    pdu_buf.seek(0);
+    let parsed = BlUdata::from_bitbuf(&mut pdu_buf).expect("BL-UDATA parses");
+    assert!(!parsed.has_fcs, "fcs_flag=false must round-trip too");
+}
+
+// PD-5c-H43 (audit LLC-01): PDU types 13 (SuppLlcPdu) and 14 (L2SigPdu) are
+// valid ETSI PDU types that we don't implement — they must be dropped
+// cleanly (no panic, no error-level log). We can't easily assert on log
+// output here, so this test just confirms the frame is silently dropped
+// (no downstream sink activity, no panic).
+
+#[test]
+fn test_unsupported_llc_pdu_type_dropped_without_panic() {
+    debug::setup_logging_verbose();
+    // PDU type 13 = SuppLlcPdu = 0b1101. Encode 4 bits then pad to satisfy
+    // MAC framing. The higher-layer decode must fall to the unsupported arm.
+    let test_vec = "1101000000000000";
+    let test_prim = TmaUnitdataInd {
+        carrier_num: MAIN_CARRIER,
+        pdu: Some(BitBuffer::from_bitstr(test_vec)),
+        main_address: TetraAddress {
+            ssi: 2065022,
+            ssi_type: SsiType::Issi,
+        },
+        scrambling_code: 864282631,
+        link_id: 0,
+        endpoint_id: 0,
+        new_endpoint_id: None,
+        css_endpoint_id: None,
+        air_interface_encryption: 0,
+        chan_change_response_req: false,
+        chan_change_handle: None,
+        chan_info: None,
+    };
+    let test_sapmsg = SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(test_prim),
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Mle]);
+    test.submit_message(test_sapmsg);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        sink_msgs.is_empty(),
+        "unsupported LLC PDU type must be dropped, not forwarded (got {} msgs)",
+        sink_msgs.len()
+    );
+}

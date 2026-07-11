@@ -481,7 +481,10 @@ impl Llc {
         };
 
         let mut pdu_buf = BitBuffer::new_autoexpand(32);
-        let pdu = BlUdata { has_fcs: false };
+        // PD-5c-H43 (audit LLC-02): propagate the caller's fcs_flag instead
+        // of hard-coding `false`. BL-DATA/BL-ADATA already honour prim.fcs_flag
+        // (see rx_tla_tldata_req_bl); BL-UDATA silently stripped it.
+        let pdu = BlUdata { has_fcs: prim.fcs_flag };
         pdu.to_bitbuf(&mut pdu_buf);
         let sdu_len = prim.tl_sdu.get_len_remaining();
         // PD-5c-H42 (audit LLC-04): enforce ETSI N.251 BL TL-SDU max length
@@ -616,7 +619,10 @@ impl Llc {
         // go out as BL-UDATA instead of being dropped.
         if prim.stealing_permission || prim.main_address.ssi_type == SsiType::Gssi {
             let mut pdu_buf = BitBuffer::new_autoexpand(32);
-            let pdu = BlUdata { has_fcs: false };
+            // PD-5c-H43 (audit LLC-02): propagate the caller's fcs_flag
+            // instead of hard-coding `false`. Consistent with the BL-DATA /
+            // BL-ADATA branches above which already use prim.fcs_flag.
+            let pdu = BlUdata { has_fcs: prim.fcs_flag };
             pdu.to_bitbuf(&mut pdu_buf);
             let sdu_len = prim.tl_sdu.get_len_remaining();
             pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
@@ -930,7 +936,17 @@ impl Llc {
             }
 
             _ => {
-                tracing::error!("BUG: unexpected message or state -- routing error");
+                // PD-5c-H43 (audit LLC-01): PDU types 13 (SuppLlcPdu) and 14
+                // (L2SigPdu) are valid ETSI PDU types that flowstation does
+                // not implement. Log as `warn!` (non-fatal, unsupported)
+                // rather than `error!("BUG:...")` to avoid false alarm-level
+                // entries when a conforming peer emits them. TSC's
+                // `ula_get_common_llc_pdu_type` returns a NOT_HANDLED status
+                // code for these — no crash log there either.
+                tracing::warn!(
+                    "LLC: unsupported PDU type {:?} (SuppLlcPdu/L2SigPdu not implemented), dropping",
+                    pdu_type
+                );
                 return;
             }
         }
