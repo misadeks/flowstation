@@ -1495,7 +1495,10 @@ impl Llc {
     /// NOTE: spec ambiguous — V1 only accepts Ack service with original AL
     /// (non-augmented or Original-type augmented window).  Extended-AL windows
     /// are rejected with `SetupReport::Reset`.  Any `setup_report` other than
-    /// `Success` on an inbound PDU is treated as a new proposal from the peer.
+    /// `Success` on an inbound PDU is treated as a new proposal from the peer;
+    /// `Reset` is the explicit teardown request. The H47 duplicate-SETUP
+    /// fast-path (below) accepts any non-`Reset` incoming report as a
+    /// candidate duplicate (see PD-5c-H48).
     fn on_al_setup(
         &mut self,
         queue: &mut MessageQueue,
@@ -1531,6 +1534,17 @@ impl Llc {
         // still live). AlSetup derives PartialEq, so we compare what our
         // echo *would* be for this incoming proposal to the cached echo:
         // if the proposals match, the echoes match too.
+        //
+        // PD-5c-H48: the guard here MUST be `!= Reset`, not `== Success`.
+        // MTP3550 / MTP6550 hardware sends `setup_report: ServiceDefinition`
+        // on both the initial proposal and the duplicate retransmit; the
+        // original H47 guard `== Success` never fired for real peer
+        // proposals (Success is the code we emit on our own CON echo).
+        // Any inbound value that is not `Reset` is a proposal from the
+        // peer; `Reset` is the explicit teardown request (H38/H39 territory)
+        // and must continue to fall through to the full re-setup + purge
+        // path below. The `build_setup_echo(..., Success) == cached`
+        // payload-identity check still gates whether we actually re-emit.
         let cache_setup_echo_enabled = {
             let cfg = self.config.config();
             cfg.llc.advanced_link.cache_setup_echo
@@ -1538,7 +1552,7 @@ impl Llc {
         if cache_setup_echo_enabled {
             if let Some(link) = self.al_links.get(&key) {
                 if link.phase == AlPhase::Established
-                    && pdu.setup_report == SetupReport::Success
+                    && pdu.setup_report != SetupReport::Reset
                 {
                     if let Some(cached) = &link.last_setup_echo {
                         let would_be_echo = Self::build_setup_echo(&pdu, SetupReport::Success);

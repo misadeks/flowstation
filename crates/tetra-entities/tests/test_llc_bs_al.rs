@@ -2271,9 +2271,76 @@ fn h47_duplicate_setup_with_changed_payload_runs_full_accept() {
     );
 }
 
-/// PD-5c-H47: after a peer-initiated DISC removes the link, a fresh
-/// AL-SETUP with the same payload as before must still run the full
-/// accept flow because the cache is discarded together with the link.
+/// PD-5c-H48: an inbound duplicate SETUP with `setup_report: ServiceDefinition`
+/// (the value real Motorola MTP3550/MTP6550 firmware sends on both initial and
+/// duplicate proposals) must hit the H47 cached-echo fast path — not the H38
+/// re-setup + purge path. Prior to H48 the guard was `== SetupReport::Success`
+/// which never matched real hardware traffic; the fix is `!= SetupReport::Reset`.
+///
+/// Hardware evidence: `~/.copilot/workspaces/.../attachments/f21ce088-...-flowstation-run.log`
+/// lines 456, 476, 705, 727 (all `report: ServiceDefinition`).
+#[test]
+fn h48_duplicate_setup_service_definition_reuses_cached_echo() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    // Initial proposal from MS uses ServiceDefinition (matches hardware).
+    let first = send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+    assert!(!first.is_empty(), "H48: first SETUP must emit CON");
+    assert_eq!(llc.al_links.get(&test_key()).unwrap().phase, AlPhase::Established);
+    assert!(llc.al_links.get(&test_key()).unwrap().last_setup_echo.is_some(),
+        "H48: initial accept must populate the H47 cache");
+
+    // Enqueue an SDU so we can observe TX state is preserved by the fast path.
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"h48 dup keep".to_vec()));
+    drain_queue(&mut queue);
+    assert_eq!(llc.al_links.get(&test_key()).unwrap().outstanding_sdus.len(), 1);
+
+    // Duplicate proposal from MS — again with ServiceDefinition. Must hit H47.
+    let second = send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+
+    assert!(
+        second.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "H48: duplicate ServiceDefinition SETUP must produce a re-echoed CON"
+    );
+    assert_eq!(
+        llc.al_links.get(&test_key()).unwrap().outstanding_sdus.len(), 1,
+        "H48: cached-echo fast path must not clear outstanding TX SDUs"
+    );
+    assert!(
+        !second.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaPurgeByAddressReq { .. })),
+        "H48: duplicate ServiceDefinition SETUP must not emit a TmaPurgeByAddressReq \
+         (H38 re-setup path must NOT fire)"
+    );
+}
+
+/// PD-5c-H48 negative: an inbound SETUP with `setup_report: Reset` on an
+/// already-Established link is an explicit peer teardown request. It must
+/// bypass the H47 cache and run the full H38/H39 re-setup + purge path so
+/// TX/RX state is genuinely reset.
+#[test]
+fn h48_duplicate_setup_reset_still_runs_full_re_setup() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"h48 reset".to_vec()));
+    drain_queue(&mut queue);
+    assert_eq!(llc.al_links.get(&test_key()).unwrap().outstanding_sdus.len(), 1);
+
+    // Peer sends Reset — must fall through to full re-setup.
+    let second = send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::Reset));
+
+    assert_eq!(
+        llc.al_links.get(&test_key()).unwrap().outstanding_sdus.len(), 0,
+        "H48: Reset SETUP must run the full accept flow (state reset)"
+    );
+    assert!(
+        second.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaPurgeByAddressReq { .. })),
+        "H48: Reset SETUP must emit the H38/H39 re-setup purge"
+    );
+}
+
+
 #[test]
 fn h47_cached_setup_echo_cleared_on_disc() {
     debug::setup_logging_verbose();
