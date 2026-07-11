@@ -1063,47 +1063,14 @@ impl Sndcp {
                 }
             }
         }
-
-        // PD-5c-H37 (2026-07-11 hardware fix): after processing an SN-RECONNECT
-        // (both NSAPI-tagged and general), emit a piggyback chan_alloc to
-        // proactively arm PDCH for this ISSI. Hardware log 02:07 showed every
-        // RECONNECT was followed by a 11-12 s gap before MS sent its
-        // SN-DATA-TRANSMIT-REQUEST — MS was waiting for BS to signal PDCH
-        // available, timing out, then falling back to random-access on MCCH
-        // which triggered our existing piggyback-on-response path.
+        // PD-5c-H37 REVERTED (2026-07-11): the empty-SDU+chan_alloc trick
+        // stopped MS from AL-acking subsequent downlinks. Hardware log 12:29
+        // showed zero AL-ACKs after H37 fired. The empty AL-DATA frame likely
+        // pollutes MS's AL RX N(S) tracking, or MS's MAC doesn't accept a
+        // chan_alloc piggybacked on a zero-length payload. Reverting.
         //
-        // Skipping this 12 s wait is a massive win for reload latency.
-        //
-        // The SDU is empty; MS's LLC discards the zero-length AL-DATA, but
-        // MS's MAC processes the chan_alloc_element attached to the
-        // MacResource and arms PDCH TS4 for this ISSI. Piggyback logic in
-        // umac_bs.rs:1622 requires `chan_alloc.usage.is_none()` (matches
-        // real PDCH grants; voice grants set usage=Some(4)) and
-        // `alloc_type ∈ {Replace, Additional}` — both satisfied below.
-        let main_carrier = self.config.config().cell.main_carrier;
-        let chan_alloc = CmceChanAllocReq {
-            usage: None,
-            carrier: Some(main_carrier),
-            timeslots: [false, false, false, true],
-            alloc_type: ChanAllocType::Additional,
-            ul_dl_assigned: UlDlAssignment::Both,
-        };
-        let empty_sdu = BitBuffer::new_autoexpand(0);
-        send_downlink_with_chan_alloc(
-            queue,
-            main_address,
-            ind.link_id,
-            ind.endpoint_id,
-            empty_sdu,
-            Layer2Service::Unacknowledged,
-            true,
-            Some(chan_alloc),
-            None,
-        );
-        tracing::info!(
-            "SNDCP: H37 proactive PDCH arm on RECONNECT for {:?}",
-            main_address
-        );
+        // Real fix will need H36 (LLC delivery feedback to WSP gateway) or a
+        // dedicated non-SDU PDCH arm SAP primitive.
     }
 
     // -- Downlink injection (gateway / tests) ----------------------------------
