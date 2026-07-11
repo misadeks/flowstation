@@ -2302,9 +2302,39 @@ impl Llc {
                         // Time-based retx (T.252 expired, no ACK at all)
                         // still honors max_sdu_retx.
                         let peer_requested_retx = sdu.force_retx;
+                        // PD-5c-H44 (audit 01-al §P12): distinguish "initial
+                        // send from buffered state" (sent_at == None) from a
+                        // real retransmission. Only real retx should be
+                        // budget-gated by max_sdu_retx and should increment
+                        // retx_count — otherwise a deferred initial send
+                        // burns a retry attempt, giving one fewer retx than
+                        // N.273 permits.
+                        let is_initial_send = sdu.sent_at.is_none();
+                        // PD-5c-H44 (audit 01-al §P7): N.274 (max_segment_retx)
+                        // must be honoured alongside N.273 (max_sdu_retx).
+                        // Because our TX path retransmits all still-unacked
+                        // segments together on each pass, retx_count at the
+                        // SDU level equals the per-segment retransmit count
+                        // for every unacked segment — so a combined min-cap
+                        // enforces the tighter of the two negotiated bounds.
+                        // Treat max_segment_retx = 0 as "unlimited" only when
+                        // the SDU-level cap is already binding; otherwise
+                        // honour it as a hard "no per-segment retx" limit.
+                        let effective_max_retx = if link.max_segment_retx == 0 {
+                            // Per audit §P7: N.274 = 0 means the peer opted
+                            // out of per-segment retx entirely. Any retx of
+                            // any segment violates the contract, so treat as
+                            // no retx budget at all.
+                            0
+                        } else {
+                            std::cmp::min(link.max_sdu_retx, link.max_segment_retx)
+                        };
                         // Use the link's per-negotiated max_sdu_retx (from SETUP PDU or config
                         // default for reconnect-fallback links) rather than the global constant.
-                        if sdu.retx_count >= link.max_sdu_retx && !peer_requested_retx {
+                        if !is_initial_send
+                            && sdu.retx_count >= effective_max_retx
+                            && !peer_requested_retx
+                        {
                             // PD-5c-H19: with max_sdu_retx=0 (MS-negotiated for Original AL /
                             // Motorola MTP3550), we've already transmitted the SDU once and by
                             // spec have no retry budget. Prior behaviour dropped with a WARN
@@ -2316,16 +2346,16 @@ impl Llc {
                             // one. Log at DEBUG (fire-and-forget completion) instead of WARN
                             // (protocol failure) — this stops the alarm-log storm on every
                             // downlink SDU when the peer doesn't AL-ACK.
-                            if link.max_sdu_retx == 0 {
+                            if effective_max_retx == 0 {
                                 tracing::debug!(
-                                    "AL link {:?} N(S)={} fire-and-forget SDU released (max_sdu_retx=0)",
+                                    "AL link {:?} N(S)={} fire-and-forget SDU released (effective_max_retx=0)",
                                     key, sdu.n_s
                                 );
                                 drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedFireAndForget));
                             } else {
                                 tracing::warn!(
-                                    "AL link {:?} N(S)={} exhausted retransmissions, dropping SDU",
-                                    key, sdu.n_s
+                                    "AL link {:?} N(S)={} exhausted retransmissions (retx_count={}, effective_max={}), dropping SDU",
+                                    key, sdu.n_s, sdu.retx_count, effective_max_retx
                                 );
                                 drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
                             }
@@ -2355,10 +2385,11 @@ impl Llc {
                         // previous stamp; it will be re-set once every fresh
                         // reporter reports `Transmitted`.
                         sdu.last_segment_tx_at = None;
-                        if sdu.retx_count > 0 {
+                        // PD-5c-H44 (audit 01-al §P12): only real retransmissions
+                        // burn budget. A deferred initial send (is_initial_send)
+                        // must not increment retx_count.
+                        if !is_initial_send {
                             sdu.retx_count += 1;
-                        } else {
-                            // First send (not a retransmission).
                         }
                         // (Re)send only the unacknowledged segments. Hand a
                         // fresh `TxReporter` to UMAC per segment so we can
@@ -2396,13 +2427,11 @@ impl Llc {
                                 });
                             }
                         }
-                        if sdu.retx_count > 0 {
+                        if !is_initial_send {
                             tracing::info!(
-                                "AL link {:?} N(S)={} retransmitting (attempt {})",
-                                key, sdu.n_s, sdu.retx_count
+                                "AL link {:?} N(S)={} retransmitting (attempt {}/{})",
+                                key, sdu.n_s, sdu.retx_count, effective_max_retx
                             );
-                        } else {
-                            sdu.retx_count = 1; // mark as sent once
                         }
                     }
                 }

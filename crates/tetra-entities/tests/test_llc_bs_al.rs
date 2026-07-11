@@ -1893,3 +1893,133 @@ fn h36_ack_path_works_without_hook() {
     let link = llc.al_links.get(&test_key()).unwrap();
     assert_eq!(link.outstanding_sdus.len(), 0);
 }
+
+// ---- PD-5c-H44: AL retx tightening (audit 01-al §P7 + §P12) ----------------
+//
+// P12: The pre-H44 retx loop treated the first pass through the loop as
+// a real retransmission for budget purposes, so an SDU with max_sdu_retx=N
+// would receive only N-1 real retransmissions after its initial send —
+// one attempt short of ETSI clause 23.5. Post-H44 the loop distinguishes
+// "initial send from buffered state" (sent_at.is_none()) from a real
+// retransmission and only increments retx_count on the latter.
+//
+// P7: N.274 (max_segment_retx) was negotiated but never enforced. Post-H44
+// the effective cap is min(max_sdu_retx, max_segment_retx), with
+// max_segment_retx=0 meaning "no per-segment retx at all".
+
+fn make_setup_pdu_with_both_retx(report: SetupReport, max_sdu_retx: u8, max_seg_retx: u8) -> AlSetup {
+    AlSetup {
+        max_retx_n273_or_repetition_n282: max_sdu_retx,
+        max_segment_retx_n274: max_seg_retx,
+        ..make_setup_pdu(report)
+    }
+}
+
+/// Establishes an AL link like `establish_and_tx_one_sdu` but with an
+/// explicit N.273 / N.274 pair. Returns the initial-send timestamp.
+fn establish_and_tx_one_sdu_full(
+    llc: &mut Llc,
+    queue: &mut MessageQueue,
+    max_sdu_retx: u8,
+    max_seg_retx: u8,
+    sdu: Vec<u8>,
+) -> TdmaTime {
+    send_setup_to_llc(llc, queue,
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, max_sdu_retx, max_seg_retx));
+    drain_queue(queue);
+    llc.rx_prim(queue, make_tla_data_req_al_sap(sdu));
+    drain_queue(queue);
+    mark_all_segments_transmitted_at(llc, TdmaTime::default());
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(link.outstanding_sdus.len(), 1, "one SDU outstanding");
+    assert_eq!(link.max_sdu_retx, max_sdu_retx);
+    assert_eq!(link.max_segment_retx, max_seg_retx);
+    TdmaTime::default()
+}
+
+/// P12: with N.273=3, ETSI permits up to 3 retransmissions (4 total). Prior
+/// to H44 the loop delivered only 2. Post-H44 we must see 3 retx before drop.
+#[test]
+fn al_tx_retx_count_matches_n273_no_off_by_one() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
+        /* max_sdu_retx */ 3, /* max_segment_retx */ 15, b"h44 p12".to_vec());
+
+    // Tick past T.252 enough times to force 4 retx attempts; the last should
+    // drop the SDU. Between retxes we must re-mark segments as transmitted
+    // so the T.252 clock keeps opening/closing.
+    let mut t = t0;
+    for expected_retx in 1..=3u8 {
+        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+        tick_at(&mut llc, &mut queue, t);
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert_eq!(
+            link.outstanding_sdus.len(), 1,
+            "SDU must survive retx #{}", expected_retx
+        );
+        assert_eq!(
+            link.outstanding_sdus[0].retx_count, expected_retx,
+            "retx_count must equal number of retx performed so far"
+        );
+        // Re-mark segments transmitted so the next T.252 window can open.
+        mark_all_segments_transmitted_at(&mut llc, t);
+    }
+
+    // One more tick past T.252 must now drop the SDU (retx_count == 3 == N.273).
+    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(
+        link.outstanding_sdus.len(), 0,
+        "SDU must be dropped once N.273 retransmissions have been performed"
+    );
+}
+
+/// P7: N.274 caps the per-segment retx count. With our combined-cap
+/// implementation, setting max_segment_retx=1 while max_sdu_retx=5 must
+/// limit us to exactly 1 retransmission before drop.
+#[test]
+fn al_tx_max_segment_retx_caps_retransmissions() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
+        /* max_sdu_retx */ 5, /* max_segment_retx */ 1, b"h44 p7".to_vec());
+
+    // First retx allowed (N.274=1 permits 1 retx per segment).
+    let t1 = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t1);
+    {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert_eq!(link.outstanding_sdus.len(), 1, "SDU must survive retx #1");
+        assert_eq!(link.outstanding_sdus[0].retx_count, 1);
+    }
+    mark_all_segments_transmitted_at(&mut llc, t1);
+
+    // Second retx attempt must drop (retx_count == 1 == max_segment_retx).
+    let t2 = t1.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t2);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(
+        link.outstanding_sdus.len(), 0,
+        "SDU must drop once N.274 (max_segment_retx) is reached, even if N.273 permits more"
+    );
+}
+
+/// P7: N.274 = 0 means the peer opted out of per-segment retransmission
+/// entirely. Behaves like fire-and-forget (no retx after initial send).
+#[test]
+fn al_tx_max_segment_retx_zero_is_fire_and_forget() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
+        /* max_sdu_retx */ 5, /* max_segment_retx */ 0, b"h44 p7 nrx".to_vec());
+
+    let t1 = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t1);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(
+        link.outstanding_sdus.len(), 0,
+        "with max_segment_retx=0 the SDU must be released without retransmission"
+    );
+}
