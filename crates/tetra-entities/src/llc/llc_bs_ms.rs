@@ -2320,12 +2320,44 @@ impl Llc {
                         // Treat max_segment_retx = 0 as "unlimited" only when
                         // the SDU-level cap is already binding; otherwise
                         // honour it as a hard "no per-segment retx" limit.
+                        //
+                        // PD-5c-H46 (MTP6550 field regression, hardware trace
+                        // 53:51.898–54:17.058): Motorola MTP6550 negotiates
+                        // AL-SETUP with `N.273 = 0, N.274 = 3, service = Ack`.
+                        // Taken literally (min(0, 3) = 0) that yields
+                        // fire-and-forget DL SDUs on a *reliable* service —
+                        // any air loss then wedges WSP because H45 defers
+                        // WTP Result retx while AL delivery is in flight,
+                        // and AL delivery never confirms. The MS's own
+                        // `N.274 = 3` shows it *expects* 3 attempts.
+                        // ETSI clause 23.5 is ambiguous on `N.273 = 0`:
+                        // one reading is "no retx", the other is
+                        // "no explicit SDU-level cap; use N.274 as the
+                        // effective bound". For `service = Ack` (reliable),
+                        // the second reading is the only one that keeps the
+                        // service its name. Adopt it as a targeted quirk:
+                        // when `service = Ack`, `N.273 = 0`, `N.274 > 0`,
+                        // use `N.274` as the effective cap.
+                        //
+                        // - Genuine "no retx" negotiations (both zero, or
+                        //   non-Ack service) still route to fire-and-forget
+                        //   via `effective_max_retx == 0` below.
+                        // - Honestly low N.274 (e.g. N.273=3, N.274=1) is
+                        //   still capped by the H44 `min()` — this quirk
+                        //   only fires when N.273 itself is zero.
+                        // - H26 peer-requested (SduFcsFailure) retx path
+                        //   remains independent with its own cap of 3.
                         let effective_max_retx = if link.max_segment_retx == 0 {
                             // Per audit §P7: N.274 = 0 means the peer opted
                             // out of per-segment retx entirely. Any retx of
                             // any segment violates the contract, so treat as
                             // no retx budget at all.
                             0
+                        } else if link.max_sdu_retx == 0
+                            && link.service == AdvancedLinkService::Ack
+                        {
+                            // PD-5c-H46: MTP6550 quirk (see above).
+                            link.max_segment_retx
                         } else {
                             std::cmp::min(link.max_sdu_retx, link.max_segment_retx)
                         };

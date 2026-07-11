@@ -1453,14 +1453,22 @@ fn al_tx_retransmits_after_t252() {
         "a TmaUnitdataReq retransmission must be emitted after T.252 elapses");
 }
 
-/// With `max_sdu_retx = 0` (peer negotiated "no retransmissions"), the SDU is
-/// given one full T.252 ACK window and only then dropped. This is the
-/// hardware-observed configuration on Motorola MTP3550.
+/// With `max_sdu_retx = 0` **and** `max_segment_retx = 0` (peer negotiated
+/// "no retransmissions at all"), the SDU is given one full T.252 ACK window
+/// and only then dropped as fire-and-forget. This is the hardware-observed
+/// configuration on Motorola MTP3550 that offers *both* zeros.
+///
+/// PD-5c-H46: prior to H46 this test used only `max_sdu_retx = 0` and relied
+/// on the implicit `max_segment_retx = 3` default. H46 now interprets
+/// `N.273 = 0, N.274 > 0, service = Ack` as "use N.274 as the effective cap"
+/// (see `al_tx_h46_mtp6550_n273_zero_ack_uses_seg_cap`). To keep this test
+/// exercising the genuine fire-and-forget release path, both are zero.
 #[test]
 fn al_tx_sdu_dropped_after_t252_when_max_retx_zero() {
     debug::setup_logging_verbose();
     let (mut llc, mut queue) = make_llc();
-    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, /* max_retx */ 0, b"h16 drop".to_vec());
+    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
+        /* max_sdu_retx */ 0, /* max_segment_retx */ 0, b"h16 drop".to_vec());
 
     // Ticking before T.252 must not drop.
     let t_pre = t0.add_timeslots(T251_SENDER_RETRY_TIMER as i32 + 1);
@@ -1468,12 +1476,12 @@ fn al_tx_sdu_dropped_after_t252_when_max_retx_zero() {
     let link = llc.al_links.get(&test_key()).expect("link exists");
     assert_eq!(link.outstanding_sdus.len(), 1, "SDU must survive until T.252 has elapsed");
 
-    // Ticking past T.252 fires the drop (retx_count=0 >= max_sdu_retx=0).
+    // Ticking past T.252 fires the drop (effective_max_retx = 0).
     let t_post = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t_post);
     let link = llc.al_links.get(&test_key()).expect("link exists");
     assert_eq!(link.outstanding_sdus.len(), 0,
-        "SDU must be dropped once T.252 elapsed and max_sdu_retx is exhausted");
+        "SDU must be dropped once T.252 elapsed and effective_max_retx is 0");
 }
 
 /// An AL-ACK that arrives within the T.252 window (e.g. ~ 300 ms after emit,
@@ -1685,10 +1693,13 @@ fn al_tx_multifrag_no_drop_when_ack_arrives_after_last_frag_h17() {
 }
 
 /// H17 exhaustion still fires — just later. A multi-fragment SDU that is
-/// never ACKed must still be dropped (with `max_sdu_retx=0`) or
-/// retransmitted (with `max_sdu_retx≥1`), but only after T.252 has
+/// never ACKed must still be dropped (with `effective_max_retx=0`) or
+/// retransmitted (with `effective_max_retx≥1`), but only after T.252 has
 /// elapsed *from the last fragment's air transmission*, not from
 /// initial enqueue.
+///
+/// PD-5c-H46: uses `N.273 = 0, N.274 = 0` for genuine fire-and-forget; see
+/// `al_tx_sdu_dropped_after_t252_when_max_retx_zero` for rationale.
 #[test]
 fn al_tx_multifrag_exhausts_after_t252_past_last_frag_h17() {
     debug::setup_logging_verbose();
@@ -1697,7 +1708,8 @@ fn al_tx_multifrag_exhausts_after_t252_past_last_frag_h17() {
     set_small_segment_size(&mut llc);
     let sdu = multifrag_payload();
     send_setup_to_llc(&mut llc, &mut queue,
-        make_setup_pdu_with_retx(SetupReport::ServiceDefinition, /* max_retx */ 0));
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition,
+            /* max_sdu_retx */ 0, /* max_segment_retx */ 0));
     drain_queue(&mut queue);
     llc.rx_prim(&mut queue, make_tla_data_req_al_sap(sdu));
     drain_queue(&mut queue);
@@ -1846,8 +1858,12 @@ fn h36_delivery_hook_fires_on_entire_sdu_ack() {
     assert_eq!(ev.n261, N261);
 }
 
-/// PD-10c-H36: fire-and-forget release (max_sdu_retx=0, T.252 expires
-/// with no ACK) must emit a DroppedFireAndForget event.
+/// PD-10c-H36: fire-and-forget release (both N.273 and N.274 = 0, T.252
+/// expires with no ACK) must emit a DroppedFireAndForget event.
+///
+/// PD-5c-H46: switched from `establish_and_tx_one_sdu(0)` (which under H46
+/// now retries using N.274 = 3) to the both-zero helper to keep exercising
+/// the fire-and-forget path this hook is about.
 #[test]
 fn h36_delivery_hook_fires_on_fire_and_forget_drop() {
     debug::setup_logging_verbose();
@@ -1856,7 +1872,8 @@ fn h36_delivery_hook_fires_on_fire_and_forget_drop() {
     let sink = Arc::clone(&events);
     llc.set_delivery_hook(Arc::new(move |ev| sink.lock().unwrap().push(ev)));
 
-    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, 0, b"drop".to_vec());
+    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
+        /* max_sdu_retx */ 0, /* max_segment_retx */ 0, b"drop".to_vec());
     let t_post = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t_post);
 
@@ -2021,5 +2038,48 @@ fn al_tx_max_segment_retx_zero_is_fire_and_forget() {
     assert_eq!(
         link.outstanding_sdus.len(), 0,
         "with max_segment_retx=0 the SDU must be released without retransmission"
+    );
+}
+
+/// PD-5c-H46: MTP6550 hardware regression trace 53:51.898-54:17.058 shows the
+/// radio negotiates AL-SETUP with `N.273 = 0, N.274 = 3, service = Ack`.
+/// Interpreted literally (`min(0, 3) = 0`), our DL SDUs go fire-and-forget on
+/// a *reliable* AL, and H45's WTP defer wedges WSP-Connect for ~23 s. The MS
+/// clearly expects 3 attempts (its own N.274 says so), so for `service = Ack`
+/// we treat `N.273 = 0` as "no explicit SDU-level cap; use N.274." The MS
+/// then sees the same 3 attempts a non-broken negotiation would give.
+#[test]
+fn al_tx_h46_mtp6550_n273_zero_ack_uses_seg_cap() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    // MTP6550-style proposal: N.273 = 0, N.274 = 3, service = Ack.
+    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
+        /* max_sdu_retx */ 0, /* max_segment_retx */ 3, b"h46 mtp6550".to_vec());
+
+    // We must see exactly 3 real retransmissions before drop (N.274 = 3).
+    let mut t = t0;
+    for expected_retx in 1..=3u8 {
+        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+        tick_at(&mut llc, &mut queue, t);
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert_eq!(
+            link.outstanding_sdus.len(), 1,
+            "H46: SDU must survive retx #{} under N.273=0+Ack coercion",
+            expected_retx
+        );
+        assert_eq!(
+            link.outstanding_sdus[0].retx_count, expected_retx,
+            "H46: retx_count must equal N.274-bounded attempts so far"
+        );
+        mark_all_segments_transmitted_at(&mut llc, t);
+    }
+
+    // Fourth T.252 expiry must now drop (retx_count == 3 == N.274).
+    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t);
+    let link = llc.al_links.get(&test_key()).expect("link exists");
+    assert_eq!(
+        link.outstanding_sdus.len(), 0,
+        "H46: SDU must drop once N.274 attempts are exhausted"
     );
 }
