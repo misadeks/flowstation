@@ -80,9 +80,27 @@ impl BsFragger {
             );
 
             // Write MAC-RESOURCE header, followed by TM-SDU, to MAC block
+            let mac_block_write_start = mac_block.get_len_written();
             self.resource.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_len_bits);
             fillbits::addition::write(mac_block, Some(num_fill_bits));
+
+            // PD-5c-H51 diagnostic (RUST_LOG=h51=info): dump the mac_block
+            // bytes just placed on air by this single MAC-RESOURCE so we can
+            // bit-diff against the LLC→UMAC PDU that fed us.
+            let mac_block_write_end = mac_block.get_len_written();
+            tracing::info!(
+                target: "h51",
+                "umac frag mac-resource single hdr_bits={} sdu_bits={} fill_bits={} total_bits={} slot_cap={} mac_bytes[{}..{}]={}",
+                hdr_len_bits,
+                sdu_len_bits,
+                num_fill_bits,
+                total_len_bits,
+                slot_cap_bits,
+                mac_block_write_start,
+                mac_block_write_end,
+                mac_block.raw_dump_bin(false, false, mac_block_write_start, mac_block_write_end),
+            );
 
             // We're done with this packet
             self.mac_hdr_is_written = true;
@@ -111,9 +129,26 @@ impl BsFragger {
                     .raw_dump_bin(false, false, self.sdu.get_pos(), self.sdu.get_pos() + sdu_bits)
             );
 
+            let mac_block_write_start = mac_block.get_len_written();
             self.resource.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_bits);
             fillbits::addition::write(mac_block, None);
+
+            // PD-5c-H51 diagnostic (RUST_LOG=h51=info): dump the MAC-RESOURCE
+            // bytes at the start of a fragmented PDU (rest continues in later
+            // MAC-FRAG/MAC-END frames — see the h51 lines from get_frag_or_end_chunk).
+            let mac_block_write_end = mac_block.get_len_written();
+            tracing::info!(
+                target: "h51",
+                "umac frag mac-resource start-of-frag hdr_bits={} sdu_bits_here={} sdu_bits_remaining={} slot_cap={} mac_bytes[{}..{}]={}",
+                hdr_len_bits,
+                sdu_bits,
+                self.sdu.get_len_remaining(),
+                slot_cap_bits,
+                mac_block_write_start,
+                mac_block_write_end,
+                mac_block.raw_dump_bin(false, false, mac_block_write_start, mac_block_write_end),
+            );
 
             // More fragments follow
             self.mac_hdr_is_written = true;
@@ -157,6 +192,7 @@ impl BsFragger {
             );
 
             // Write MAC-END header followed by TM-SDU
+            let mac_block_write_start = mac_block.get_len_written();
             pdu.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_bits);
 
@@ -165,6 +201,22 @@ impl BsFragger {
                 mac_block.write_bit(1);
                 mac_block.write_zeroes(num_fill_bits - 1);
             }
+
+            // PD-5c-H51 diagnostic (RUST_LOG=h51=info): dump the MAC-END bytes
+            // that carry the tail of a fragmented PDU. Combine with the earlier
+            // MAC-RESOURCE (start-of-frag) log to reconstruct the full SDU
+            // that leaves the air.
+            let mac_block_write_end = mac_block.get_len_written();
+            tracing::info!(
+                target: "h51",
+                "umac frag mac-end sdu_bits={} fill_bits={} slot_cap={} mac_bytes[{}..{}]={}",
+                sdu_bits,
+                num_fill_bits,
+                slot_cap_bits,
+                mac_block_write_start,
+                mac_block_write_end,
+                mac_block.raw_dump_bin(false, false, mac_block_write_start, mac_block_write_end),
+            );
             // We're done with this packet
             true
         } else if slot_cap_bits < MIN_SLOT_CAP_FOR_FRAG {
@@ -196,6 +248,17 @@ impl BsFragger {
                 mac_block.write_bit(1);
                 mac_block.write_zeroes(num_fill_bits - 1);
             }
+
+            // PD-5c-H51 diagnostic (RUST_LOG=h51=info): dump the MAC-FRAG
+            // bytes for a middle chunk of a fragmented PDU.
+            tracing::info!(
+                target: "h51",
+                "umac frag mac-frag sdu_bits_in_frag={} sdu_bits_remaining_after={} fill_bits={} slot_cap={}",
+                sdu_bits_in_frag,
+                self.sdu.get_len_remaining(),
+                num_fill_bits,
+                slot_cap_bits,
+            );
 
             false
         }

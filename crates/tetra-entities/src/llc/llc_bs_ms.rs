@@ -3091,6 +3091,22 @@ impl Llc {
                 let mut buf = BitBuffer::new_autoexpand(256);
                 pdu.to_bitbuf(&mut buf);
                 buf.seek(0);
+                // PD-5c-H51 diagnostic (RUST_LOG=h51=info): dump the bit-exact
+                // AL PDU handed to UMAC so it can be diffed against the MAC
+                // block bytes that actually leave the fragmenter.
+                tracing::info!(
+                    target: "h51",
+                    "llc->umac AL seg ssi={} lid={} eid={} n_s={} s_s={} variant={} tl_sdu_bits={} pdu_bits={} pdu={}",
+                    addr.ssi,
+                    l_id,
+                    e_id,
+                    pdu.n_s,
+                    pdu.s_s,
+                    pdu.variant,
+                    pdu.tl_sdu_segment.get_len(),
+                    buf.get_len(),
+                    buf.dump_bin(),
+                );
                 queue.push_back(SapMsg {
                     sap: Sap::TmaSap,
                     src: TetraEntity::Llc,

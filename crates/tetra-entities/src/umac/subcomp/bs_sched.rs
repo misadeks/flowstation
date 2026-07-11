@@ -1320,6 +1320,16 @@ impl BsChannelScheduler {
                         DlSchedElem::Resource(pdu, sdu, tx_reporter) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
+                            // PD-5c-H51 diagnostic (RUST_LOG=h51=info): note
+                            // the TDMA frame/slot each fragger chunk lands in
+                            // so we can see if a 2-segment AL SDU spans frames.
+                            tracing::info!(
+                                target: "h51",
+                                "umac sched res ts={} sdu_bits={} pdu={:?}",
+                                ts,
+                                sdu.get_len(),
+                                pdu,
+                            );
                             // Create fragger, either to send the whole PDU or to start fragmentation
                             let mut fragger = BsFragger::new(pdu, sdu, tx_reporter);
                             if !fragger.get_next_chunk(&mut buf) {
@@ -1333,6 +1343,11 @@ impl BsChannelScheduler {
                         DlSchedElem::FragBuf(mut fragger) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
+                            tracing::info!(
+                                target: "h51",
+                                "umac sched frag-cont ts={}",
+                                ts,
+                            );
                             if !fragger.get_next_chunk(&mut buf) {
                                 // Fragmentation was continued and we still have more chunks to send
                                 // Re-enqueue fragger with remaining data for retrieval next frame
