@@ -50,6 +50,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::error::{WapError, WapResult};
+use crate::portal::WapPortal;
 use crate::wsp::pdu::{
     ContentType, HeaderBlock, STATUS_BAD_GATEWAY, STATUS_BAD_REQUEST, STATUS_INTERNAL_ERROR, STATUS_METHOD_NOT_ALLOWED, STATUS_NOT_FOUND,
     STATUS_NOT_IMPLEMENTED, STATUS_OK, WspPdu, build_connect_reply, build_get_reply, build_status_reply, pdu_type,
@@ -104,6 +105,10 @@ pub struct WspGatewayState {
     /// URI (rare — real MSs always send absolute). Kept as a plain string
     /// to avoid parsing until we actually need it.
     upstream_base: Arc<String>,
+    /// Optional built-in portal. When set, [`WspHandler::handle_get`]
+    /// intercepts URIs whose path starts with the portal's `path_prefix`
+    /// and serves WMLC locally, bypassing `upstream_base` entirely.
+    portal: Option<WapPortal>,
 }
 
 impl Default for WspGatewayState {
@@ -126,6 +131,12 @@ impl WspGatewayState {
     /// transparent-proxy behaviour and matches what UP.Browser 6.3 sends
     /// on the wire (an absolute URL every time).
     pub fn with_upstream(upstream_base: String) -> Self {
+        Self::with_upstream_and_portal(upstream_base, None)
+    }
+
+    /// Same as [`Self::with_upstream`] but also attaches an optional
+    /// [`WapPortal`] that intercepts GETs to its configured path prefix.
+    pub fn with_upstream_and_portal(upstream_base: String, portal: Option<WapPortal>) -> Self {
         // Build the client with conservative timeouts. Redirect following
         // is disabled so we return 3xx status codes straight to the MS —
         // WSP browsers re-issue a fresh Get on 3xx (WAP-230 §7.2), and
@@ -148,6 +159,7 @@ impl WspGatewayState {
             next_session_id: Arc::new(AtomicU32::new(1)),
             http,
             upstream_base: Arc::new(upstream_base),
+            portal,
         }
     }
 
@@ -335,6 +347,21 @@ impl WspHandler {
                 .encode();
             }
         };
+
+        // Portal intercept: if configured and the resolved path matches the
+        // portal's prefix, serve WMLC locally without touching upstream.
+        if let Some(portal) = &self.state.portal
+            && let Some(resp) = portal.route(resolved.path())
+        {
+            info!(
+                peer = %peer,
+                path = resolved.path(),
+                bytes = resp.body.len(),
+                "wsp: portal GET",
+            );
+            return build_get_reply(resp.status, resp.content_type, resp.body).encode();
+        }
+
         info!(peer = %peer, uri = %resolved, "wsp: GET upstream");
 
         match self.state.http.get(resolved.clone()).send().await {
@@ -620,5 +647,80 @@ mod tests {
         };
         // No upstream_url + relative → 400.
         assert_eq!(status, STATUS_BAD_REQUEST);
+    }
+
+    // ── Portal dispatch tests ────────────────────────────────────────────
+
+    use crate::portal::{MetarCache, PortalConfig, PortalDataSource, RadioSnapshot, SystemSnapshot, WapPortal};
+
+    #[derive(Debug, Default)]
+    struct PortalStub;
+
+    impl PortalDataSource for PortalStub {
+        fn radios(&self, _max: usize) -> Vec<RadioSnapshot> {
+            Vec::new()
+        }
+        fn system(&self) -> SystemSnapshot {
+            SystemSnapshot {
+                uptime: std::time::Duration::from_secs(1),
+                version: "test".into(),
+                pdp_contexts: 0,
+                cell_load_pct: None,
+            }
+        }
+    }
+
+    fn portal_state() -> WspGatewayState {
+        let portal = WapPortal::new(
+            PortalConfig {
+                path_prefix: "/portal".into(),
+                metar_icao: String::new(),
+                metar_refresh_seconds: 1800,
+                radios_max: 3,
+            },
+            Arc::new(PortalStub),
+            MetarCache::new(),
+        );
+        // upstream_base is deliberately unreachable so we can prove portal URIs
+        // *don't* hit it.
+        WspGatewayState::with_upstream_and_portal("http://127.0.0.1:1/".to_owned(), Some(portal))
+    }
+
+    #[tokio::test]
+    async fn portal_get_returns_wmlc_locally() {
+        let h = WspHandler::new(portal_state());
+        let get = WspPdu::MethodInvoke {
+            method_code: pdu_type::GET,
+            uri: "http://10.0.0.1/portal/system".to_owned(),
+            headers: HeaderBlock::empty(),
+        }
+        .encode();
+        let reply_bytes = h.handle(loopback_peer(), get).await;
+        let WspPdu::Reply { status, headers, body } = WspPdu::decode(&reply_bytes).unwrap() else {
+            panic!("expected Reply");
+        };
+        assert_eq!(status, STATUS_OK);
+        // Content-Type is encoded as the first header byte (WSP short-form
+        // well-known): 0x80 | 0x14 = 0x94 for application/vnd.wap.wmlc.
+        assert_eq!(headers.raw.first().copied(), Some(0x94));
+        assert_eq!(&body[..4], &[0x01, 0x04, 0x6a, 0x00], "WBXML v1.1 header");
+    }
+
+    #[tokio::test]
+    async fn non_portal_get_still_hits_upstream_and_502s() {
+        // Same portal state as above, but hit a non-portal path → should try
+        // upstream on 127.0.0.1:1 and 502.
+        let h = WspHandler::new(portal_state());
+        let get = WspPdu::MethodInvoke {
+            method_code: pdu_type::GET,
+            uri: "http://10.0.0.1/index.wml".to_owned(),
+            headers: HeaderBlock::empty(),
+        }
+        .encode();
+        let reply_bytes = h.handle(loopback_peer(), get).await;
+        let WspPdu::Reply { status, .. } = WspPdu::decode(&reply_bytes).unwrap() else {
+            panic!("expected Reply");
+        };
+        assert_eq!(status, STATUS_BAD_GATEWAY);
     }
 }

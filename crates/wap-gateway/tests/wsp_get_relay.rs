@@ -180,6 +180,7 @@ async fn end_to_end_get_relays_to_http_upstream_and_carries_body() {
         listen_addr: Ipv4Addr::LOCALHOST,
         listen_port: listen.port(),
         upstream_url: upstream_url.clone(),
+        portal: None,
     };
     let shutdown = CancellationToken::new();
     let gw_task = tokio::spawn({

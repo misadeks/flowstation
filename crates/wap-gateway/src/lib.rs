@@ -41,16 +41,19 @@
 //! * [`error`]  — `WapError` / `WapResult`.
 
 pub mod error;
+pub mod portal;
 pub mod wdp;
 pub mod wsp;
 pub mod wtp;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 pub use error::{WapError, WapResult};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::portal::{MetarCache, PortalConfig, PortalDataSource, WapPortal, metar::spawn_metar_poller};
 use crate::wdp::Wdp;
 use crate::wsp::session::{WspGatewayState, WspHandler};
 use crate::wtp::{Responder, ResponderConfig, handler_fn};
@@ -68,6 +71,22 @@ pub struct RunConfig {
     pub listen_port: u16,
     /// Upstream HTTP backend base URL (used by PD-10c).
     pub upstream_url: String,
+    /// Optional built-in portal configuration. When `None`, `run` behaves
+    /// exactly like PD-10c (upstream-only). When `Some`, GETs whose URI
+    /// path matches [`PortalConfig::path_prefix`] are served locally from
+    /// [`portal::pages`] instead of proxied.
+    pub portal: Option<PortalRunConfig>,
+}
+
+/// Runtime portal wiring, passed alongside [`RunConfig`].
+///
+/// Bundles the portal config (mirrored from `[wap_gateway.portal]`) with the
+/// [`PortalDataSource`] adapter that supplies live flowstation state. Passed
+/// as a separate struct so `RunConfig` stays `Clone` and pure data.
+#[derive(Debug, Clone)]
+pub struct PortalRunConfig {
+    pub config: PortalConfig,
+    pub data: Arc<dyn PortalDataSource>,
 }
 
 /// Run the WAP gateway until [`CancellationToken::cancel`] is called on
@@ -92,10 +111,19 @@ pub async fn run(cfg: RunConfig, shutdown: CancellationToken) -> WapResult<()> {
     info!(
         local = %wdp.local_addr(),
         upstream = %cfg.upstream_url,
+        portal = cfg.portal.is_some(),
         "wap-gateway listening",
     );
 
-    let wsp_state = WspGatewayState::with_upstream(cfg.upstream_url.clone());
+    // Build the optional portal + spawn its METAR poller (background task,
+    // shares the shutdown token so it exits with us).
+    let portal = cfg.portal.map(|p| {
+        let cache = MetarCache::new();
+        spawn_metar_poller(cache.clone(), p.config.metar_icao.clone(), p.config.metar_refresh_interval(), shutdown.clone());
+        WapPortal::new(p.config, p.data, cache)
+    });
+
+    let wsp_state = WspGatewayState::with_upstream_and_portal(cfg.upstream_url.clone(), portal);
     let handler = {
         let wsp = WspHandler::new(wsp_state);
         handler_fn(move |peer, payload| {

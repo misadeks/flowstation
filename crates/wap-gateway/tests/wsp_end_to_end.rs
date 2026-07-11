@@ -30,6 +30,7 @@ async fn end_to_end_mtp3550_connect_gets_openwave_connect_reply() {
         listen_addr: Ipv4Addr::LOCALHOST,
         listen_port: listen.port(),
         upstream_url: "http://127.0.0.1:8081".to_owned(),
+        portal: None,
     };
     let shutdown = CancellationToken::new();
     let task = tokio::spawn({
