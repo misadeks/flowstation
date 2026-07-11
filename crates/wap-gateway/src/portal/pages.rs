@@ -16,14 +16,17 @@ use super::{MetarCache, PortalConfig, PortalDataSource};
 pub fn render_index(cfg: &PortalConfig) -> Vec<u8> {
     let prefix = cfg.path_prefix.as_str();
     wmlc::wrap_card("FlowStation", |out| {
+        // Each menu item lives in its own <p> paragraph so MTP UP.Browser
+        // renders them on separate lines. `<br/>` inside a single `<p>` is
+        // rendered inconsistently on Motorola firmware — sometimes as a
+        // soft space rather than a hard line break.
         push_str_i(out, "FlowStation");
-        push_text_element(out, tag::BR, "");
+        wmlc::push_paragraph_break(out);
         push_anchor(out, &format!("{prefix}/radios"), "1 Radios");
-        push_text_element(out, tag::BR, "");
+        wmlc::push_paragraph_break(out);
         push_anchor(out, &format!("{prefix}/weather"), "2 Weather");
-        push_text_element(out, tag::BR, "");
+        wmlc::push_paragraph_break(out);
         push_anchor(out, &format!("{prefix}/system"), "3 System");
-        push_text_element(out, tag::BR, "");
     })
 }
 

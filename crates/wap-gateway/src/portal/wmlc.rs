@@ -99,6 +99,18 @@ pub fn push_anchor(out: &mut Vec<u8>, href: &str, label: &str) {
     out.push(END); // end of element.
 }
 
+/// Emit a paragraph break: closes the currently-open `<p>` and opens a
+/// new one. Use this instead of a `<br/>` element when you need MTP
+/// UP.Browser (Motorola firmware) to reliably render a hard line break —
+/// `<br/>` inside a single `<p>` can be rendered as a soft space.
+///
+/// Must only be called from inside a [`wrap_card`] fill closure, and
+/// only after emitting at least one child of the current `<p>`.
+pub fn push_paragraph_break(out: &mut Vec<u8>) {
+    out.push(END); // </p>
+    out.push(tag::P | CONTENT_MASK); // <p>
+}
+
 /// Wrap a body producer with the standard `<wml><card><p>…</p></card></wml>`
 /// chrome. Returns the fully-encoded WMLC bytes.
 pub fn wrap_card<F: FnOnce(&mut Vec<u8>)>(title: &str, fill: F) -> Vec<u8> {
