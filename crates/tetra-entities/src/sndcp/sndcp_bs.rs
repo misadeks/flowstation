@@ -307,7 +307,7 @@ impl Sndcp {
             SnPdu::DataTransmitRequest(r) => self.on_data_transmit_request(queue, ind, r),
             SnPdu::PageResponse(pr) => self.on_page_response(queue, ind, pr),
             SnPdu::EndOfData(eod) => self.on_end_of_data(ind, eod),
-            SnPdu::Reconnect(rc) => self.on_reconnect(ind, rc),
+            SnPdu::Reconnect(rc) => self.on_reconnect(queue, ind, rc),
             other => {
                 tracing::warn!(
                     "SNDCP: unhandled uplink SN-PDU from {:?}: {other:?}",
@@ -956,6 +956,7 @@ impl Sndcp {
 
     fn on_reconnect(
         &mut self,
+        queue: &mut MessageQueue,
         ind: &LtpdMleUnitdataInd,
         rc: tetra_pdus::sndcp::pdus::Reconnect,
     ) {
@@ -1062,6 +1063,47 @@ impl Sndcp {
                 }
             }
         }
+
+        // PD-5c-H37 (2026-07-11 hardware fix): after processing an SN-RECONNECT
+        // (both NSAPI-tagged and general), emit a piggyback chan_alloc to
+        // proactively arm PDCH for this ISSI. Hardware log 02:07 showed every
+        // RECONNECT was followed by a 11-12 s gap before MS sent its
+        // SN-DATA-TRANSMIT-REQUEST — MS was waiting for BS to signal PDCH
+        // available, timing out, then falling back to random-access on MCCH
+        // which triggered our existing piggyback-on-response path.
+        //
+        // Skipping this 12 s wait is a massive win for reload latency.
+        //
+        // The SDU is empty; MS's LLC discards the zero-length AL-DATA, but
+        // MS's MAC processes the chan_alloc_element attached to the
+        // MacResource and arms PDCH TS4 for this ISSI. Piggyback logic in
+        // umac_bs.rs:1622 requires `chan_alloc.usage.is_none()` (matches
+        // real PDCH grants; voice grants set usage=Some(4)) and
+        // `alloc_type ∈ {Replace, Additional}` — both satisfied below.
+        let main_carrier = self.config.config().cell.main_carrier;
+        let chan_alloc = CmceChanAllocReq {
+            usage: None,
+            carrier: Some(main_carrier),
+            timeslots: [false, false, false, true],
+            alloc_type: ChanAllocType::Additional,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+        let empty_sdu = BitBuffer::new_autoexpand(0);
+        send_downlink_with_chan_alloc(
+            queue,
+            main_address,
+            ind.link_id,
+            ind.endpoint_id,
+            empty_sdu,
+            Layer2Service::Unacknowledged,
+            true,
+            Some(chan_alloc),
+            None,
+        );
+        tracing::info!(
+            "SNDCP: H37 proactive PDCH arm on RECONNECT for {:?}",
+            main_address
+        );
     }
 
     // -- Downlink injection (gateway / tests) ----------------------------------
