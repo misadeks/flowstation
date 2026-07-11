@@ -1569,6 +1569,10 @@ impl Llc {
             let cfg = self.config.config();
             cfg.llc.advanced_link.cache_setup_echo
         };
+        let h50_clear_rx = {
+            let cfg = self.config.config();
+            cfg.llc.advanced_link.h47_cached_echo_clears_rx
+        };
         if cache_setup_echo_enabled {
             if let Some(link) = self.al_links.get(&key) {
                 if link.phase == AlPhase::Established
@@ -1585,6 +1589,41 @@ impl Llc {
                                 key.endpoint_id,
                             );
                             queue.push_back(msg);
+                            // PD-5c-H50: partial reset — drop RX-side
+                            // transfer state so a peer that has actually
+                            // re-established after an idle (MTP3550
+                            // behaviour: fresh s_s = 0 / N(S) = 0) does
+                            // not collide with our stale reassemblers
+                            // and dedupe-ring entries, producing a
+                            // Frankenstein SDU that fails FCS.
+                            // Preserves all TX state and the cached echo
+                            // itself, so the "our CON was air-lost"
+                            // duplicate case still works with no visible
+                            // impact (peer is not streaming during the
+                            // CON round-trip).
+                            if h50_clear_rx {
+                                if let Some(link_mut) = self.al_links.get_mut(&key) {
+                                    let reassemblers_dropped =
+                                        link_mut.reassemblers.len()
+                                        + link_mut.unack_reassemblers.len();
+                                    let dedup_entries_dropped =
+                                        link_mut.recently_delivered_ns.len();
+                                    link_mut.reassemblers.clear();
+                                    link_mut.unack_reassemblers.clear();
+                                    link_mut.unack_started_at.clear();
+                                    link_mut.recently_delivered_ns.clear();
+                                    tracing::info!(
+                                        "H50: H47 cached-echo hit — cleared stale RX transfer state \
+                                         ssi={} link_id={} n261={} reassemblers_dropped={} \
+                                         dedup_entries_dropped={}",
+                                        key.ssi,
+                                        key.link_id,
+                                        pdu.advanced_link_number_n261,
+                                        reassemblers_dropped,
+                                        dedup_entries_dropped,
+                                    );
+                                }
+                            }
                             tracing::info!(
                                 "AL link {:?} duplicate SETUP — re-echoed cached AL-SETUP-CON (H47)",
                                 key

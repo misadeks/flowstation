@@ -2588,3 +2588,238 @@ fn h49_dedupe_disabled_reverts_to_pre_h49_behaviour() {
         "H49-off: duplicate must re-deliver upward (pre-H49 behaviour)"
     );
 }
+
+// ─── PD-5c-H50: H47 cached-echo hit must clear stale RX transfer state ──────
+
+/// Build a multi-segment AL PDU stream for `sdu` starting at `starting_n_s`.
+/// Returns individual `TmaUnitdataInd` SapMsgs, one per segment, in transmit
+/// order (initial + intermediates + AL-FINAL-AR).
+fn make_multi_segment_al_data(sdu: &[u8], starting_n_s: u8) -> Vec<SapMsg> {
+    let cfg = SegmenterConfig {
+        segment_payload_bits: 50,
+        starting_n_s,
+        request_ack_on_final: true,
+        request_ack_on_data: false,
+    };
+    let out = segment_sdu(sdu, &cfg).expect("segmentation should succeed");
+    assert!(out.pdus.len() >= 3, "test SDU must produce multi-segment stream");
+    out.pdus
+        .into_iter()
+        .map(|pdu| {
+            let mut buf = BitBuffer::new_autoexpand(128);
+            pdu.to_bitbuf(&mut buf);
+            buf.seek(0);
+            make_tma_ind(buf)
+        })
+        .collect()
+}
+
+/// Build an LLC with a specific value for the H50 `h47_cached_echo_clears_rx`
+/// toggle, all other flags at default.
+fn make_llc_with_h50_flag(clears_rx: bool) -> (Llc, MessageQueue) {
+    let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
+    cfg.llc.advanced_link.h47_cached_echo_clears_rx = clears_rx;
+    let sc = tetra_config::bluestation::SharedConfig::from_parts(cfg, None);
+    (Llc::new(sc), MessageQueue::new())
+}
+
+/// PD-5c-H50: primary bug repro — partial AL-DATA reassembly for one SDU is
+/// interrupted by a duplicate SETUP (which hits the H47 cached-echo fast
+/// path); a genuinely-new SDU on the same N(S) after that must reassemble +
+/// deliver cleanly rather than collide with the stale reassembler and
+/// produce a Frankenstein FCS failure.
+#[test]
+fn h50_h47_cached_echo_clears_stale_reassemblers() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc(); // H50 default = on
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+    let ts = TdmaTime::default();
+
+    // Feed the first two segments of a multi-segment SDU at N(S)=0 —
+    // reassembly is deliberately left incomplete.
+    let first_sdu: Vec<u8> = (0u8..200).collect();
+    let first_pdus = make_multi_segment_al_data(&first_sdu, 0);
+    for seg in first_pdus.iter().take(2) {
+        one_tick(&mut llc, &mut queue, ts, seg.clone());
+    }
+    drain_queue(&mut queue);
+    // Confirm the stale reassembler slot exists.
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .contains_key(&0),
+        "H50 precondition: partial reassembler for N(S)=0 must be present"
+    );
+
+    // Duplicate SETUP hits the H47 cached-echo fast path; H50 clears RX
+    // transfer state.
+    let dup = send_setup_to_llc(
+        &mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+    assert!(
+        dup.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "H50: duplicate SETUP must re-emit the cached CON"
+    );
+    assert!(
+        !dup.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaPurgeByAddressReq { .. })),
+        "H50: duplicate SETUP must NOT emit the H38 re-setup purge (H47 fast path)"
+    );
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .is_empty(),
+        "H50: H47 cached-echo hit must clear stale in-flight reassemblers"
+    );
+
+    // Feed a genuinely-new SDU at N(S)=0 in full. It must reassemble
+    // cleanly (FCS OK) and deliver upward, matching the *fresh* content
+    // rather than a Frankenstein mix of first+second.
+    let second_sdu: Vec<u8> = (100u8..255).collect(); // different content
+    let second_pdus = make_multi_segment_al_data(&second_sdu, 0);
+    for seg in second_pdus {
+        one_tick(&mut llc, &mut queue, ts, seg);
+    }
+    let ind = take_data_ind_al(&mut queue)
+        .expect("H50: fresh SDU on cleared reassembler must deliver");
+    assert!(ind.fcs_ok, "H50: fresh SDU must pass FCS (no Frankenstein reassembly)");
+    assert_eq!(
+        ind.tl_sdu.into_bytes(),
+        second_sdu,
+        "H50: delivered SDU must be the fresh content, not stale+fresh mix"
+    );
+}
+
+/// PD-5c-H50: the RX-clear must PRESERVE TX-side bookkeeping — outstanding
+/// SDUs, next_n_s, phase, and the cached echo itself all survive so we can
+/// still retransmit our own in-flight data after the duplicate SETUP.
+#[test]
+fn h50_h47_cached_echo_preserves_tx_state() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc(); // H50 default = on
+    send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+    drain_queue(&mut queue);
+
+    // Enqueue a TX SDU — populates outstanding_sdus and advances next_n_s.
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"h50 tx preserve".to_vec()));
+    drain_queue(&mut queue);
+    let (outstanding_before, next_n_s_before, echo_before) = {
+        let link = llc.al_links.get(&test_key()).unwrap();
+        (link.outstanding_sdus.len(), link.next_n_s, link.last_setup_echo.clone())
+    };
+    assert_eq!(outstanding_before, 1, "TX SDU must be tracked before duplicate SETUP");
+    assert!(echo_before.is_some(), "cached echo must be present before duplicate SETUP");
+
+    // Duplicate SETUP → H47 cached-echo hit → H50 clears RX but preserves TX.
+    send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(
+        link.outstanding_sdus.len(), outstanding_before,
+        "H50: outstanding_sdus must survive H47 cached-echo hit"
+    );
+    assert_eq!(
+        link.next_n_s, next_n_s_before,
+        "H50: next_n_s must survive H47 cached-echo hit"
+    );
+    assert_eq!(
+        link.phase, AlPhase::Established,
+        "H50: phase must remain Established"
+    );
+    assert_eq!(
+        link.last_setup_echo, echo_before,
+        "H50: cached echo itself must survive so subsequent dupes still hit fast path"
+    );
+}
+
+/// PD-5c-H50: the H49 duplicate-N(S) dedupe ring is RX transfer state; the
+/// H47 cached-echo hit must clear it too, so a peer that re-establishes
+/// from a clean N(S)=0 does not have its fresh SDU spuriously suppressed as
+/// a duplicate of an entry left over from before.
+#[test]
+fn h50_h47_cached_echo_clears_dedupe_ring() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc(); // H50 default = on
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+    let ts = TdmaTime::default();
+
+    // Deliver a single-segment SDU so N(S)=0 lands in the dedupe ring.
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(b"pre-dup", 0));
+    take_data_ind_al(&mut queue).expect("first delivery");
+    drain_queue(&mut queue);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .recently_delivered_ns
+            .contains(&0),
+        "H50 precondition: N(S)=0 must be in the dedupe ring"
+    );
+
+    // Duplicate SETUP → H47 cached-echo hit → H50 clears the ring.
+    send_setup_to_llc(
+        &mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+    drain_queue(&mut queue);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .recently_delivered_ns
+            .is_empty(),
+        "H50: H47 cached-echo hit must clear the H49 dedupe ring"
+    );
+
+    // A fresh SDU on the same N(S)=0 must go through full reassembly + upward
+    // delivery, NOT be suppressed as a duplicate.
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(b"post-dup", 0));
+    let ind = take_data_ind_al(&mut queue)
+        .expect("H50: post-cached-echo fresh N(S)=0 must deliver (ring was cleared)");
+    assert_eq!(ind.tl_sdu.into_bytes(), b"post-dup");
+}
+
+/// PD-5c-H50: escape hatch — flipping `h47_cached_echo_clears_rx = false`
+/// restores the pre-H50 policy of preserving stale RX state across the
+/// cached-echo fast path. Regression guard so we can roll back at a site
+/// if H50 misbehaves against a non-standard peer.
+#[test]
+fn h50_disabled_config_preserves_stale_rx_behaviour() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc_with_h50_flag(false);
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+    let ts = TdmaTime::default();
+
+    // Partial reassembly for N(S)=0.
+    let first_sdu: Vec<u8> = (0u8..200).collect();
+    let first_pdus = make_multi_segment_al_data(&first_sdu, 0);
+    for seg in first_pdus.iter().take(2) {
+        one_tick(&mut llc, &mut queue, ts, seg.clone());
+    }
+    drain_queue(&mut queue);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .contains_key(&0)
+    );
+
+    // Duplicate SETUP → H47 cached-echo hit — but with H50 off, RX state
+    // is preserved (the pre-H50 escape-hatch behaviour).
+    send_setup_to_llc(
+        &mut llc, &mut queue, make_setup_pdu(SetupReport::ServiceDefinition));
+    drain_queue(&mut queue);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .contains_key(&0),
+        "H50-off: stale reassembler for N(S)=0 must survive (pre-H50 behaviour)"
+    );
+}
+

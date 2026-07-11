@@ -88,6 +88,20 @@ pub struct CfgAdvancedLink {
     /// duplicate-SDU suppression + DIMETRA rlj_app
     /// `dlai_rx_duplicate_sdu_ack`. Default `true`.
     pub dedupe_completed_ns: bool,
+
+    /// PD-5c-H50: when the H47 duplicate-SETUP fast path re-emits a cached
+    /// `AL-SETUP-CON`, also drop RX-side transfer state (in-flight
+    /// reassemblers + duplicate-N(S) dedupe ring) while preserving all TX
+    /// state and the cached echo itself. Fixes a stale-reassembler
+    /// collision when the peer's duplicate SETUP is actually a fresh
+    /// re-establishment after an idle (MTP3550 behaviour: peer's TX/RX
+    /// resets to `s_s = 0` / `N(S) = 0`, so our stale reassemblers merge
+    /// old + new segments into a Frankenstein SDU that fails FCS). The
+    /// original H47 "preserve everything" policy is only safe when the
+    /// duplicate arrives because our CON was air-lost (peer state
+    /// unchanged); H50 covers the other case without regressing that one.
+    /// Default `true`; flip to `false` as a rollback escape hatch.
+    pub h47_cached_echo_clears_rx: bool,
 }
 
 impl Default for CfgAdvancedLink {
@@ -104,6 +118,7 @@ impl Default for CfgAdvancedLink {
             proactive_disc_on_retx_exhaust: true,
             cache_setup_echo: true,
             dedupe_completed_ns: true,
+            h47_cached_echo_clears_rx: true,
         }
     }
 }
@@ -142,6 +157,8 @@ pub struct AdvancedLinkDto {
     pub cache_setup_echo: bool,
     #[serde(default = "default_dedupe_completed_ns")]
     pub dedupe_completed_ns: bool,
+    #[serde(default = "default_h47_cached_echo_clears_rx")]
+    pub h47_cached_echo_clears_rx: bool,
 
     /// Unknown-field detector — parsing.rs rejects any entry present here.
     #[serde(flatten)]
@@ -162,6 +179,7 @@ impl Default for AdvancedLinkDto {
             proactive_disc_on_retx_exhaust: default_proactive_disc_on_retx_exhaust(),
             cache_setup_echo: default_cache_setup_echo(),
             dedupe_completed_ns: default_dedupe_completed_ns(),
+            h47_cached_echo_clears_rx: default_h47_cached_echo_clears_rx(),
             extra: HashMap::new(),
         }
     }
@@ -178,6 +196,7 @@ fn default_max_tl_sdu_octets() -> u16 { 4096 }
 fn default_proactive_disc_on_retx_exhaust() -> bool { true }
 fn default_cache_setup_echo() -> bool { true }
 fn default_dedupe_completed_ns() -> bool { true }
+fn default_h47_cached_echo_clears_rx() -> bool { true }
 
 /// Serde DTO for `[llc]`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -296,6 +315,7 @@ pub fn validate_advanced_link_config(dto: AdvancedLinkDto) -> Result<CfgAdvanced
         proactive_disc_on_retx_exhaust: dto.proactive_disc_on_retx_exhaust,
         cache_setup_echo: dto.cache_setup_echo,
         dedupe_completed_ns: dto.dedupe_completed_ns,
+        h47_cached_echo_clears_rx: dto.h47_cached_echo_clears_rx,
     })
 }
 
@@ -336,6 +356,8 @@ mod tests {
         assert!(cfg.cache_setup_echo);
         // PD-5c-H49: duplicate-N(S) suppression defaults on.
         assert!(cfg.dedupe_completed_ns);
+        // PD-5c-H50: H47 cached-echo RX-clear defaults on.
+        assert!(cfg.h47_cached_echo_clears_rx);
     }
 
     #[test]
@@ -371,6 +393,7 @@ mod tests {
             proactive_disc_on_retx_exhaust = false
             cache_setup_echo = false
             dedupe_completed_ns = false
+            h47_cached_echo_clears_rx = false
         "#;
         let dto: AdvancedLinkDto = toml::from_str(toml_str).expect("TOML must parse");
         let cfg = validate_advanced_link_config(dto).expect("must validate");
@@ -382,6 +405,8 @@ mod tests {
         assert!(!cfg.cache_setup_echo);
         // PD-5c-H49: override plumbs through.
         assert!(!cfg.dedupe_completed_ns);
+        // PD-5c-H50: override plumbs through.
+        assert!(!cfg.h47_cached_echo_clears_rx);
     }
 
     #[test]
