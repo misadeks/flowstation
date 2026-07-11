@@ -73,6 +73,7 @@ No crashable path (both branches `return`), but operator diagnostics are incorre
 
 **Verdict: ⚠️ Deviation** — SuppLlcPdu/L2SigPdu labelled as routing BUG; should be `warn!("unsupported PDU type")`.  
 **Draft issue**: `LLC-01`.
+**Resolved: ✅ MATCH (via H43)** — 2026-07-11: dispatcher now logs `warn!` with the pdu_type.
 
 ---
 
@@ -175,6 +176,7 @@ ulai_unpack_bl_ack_fcs      0x0022a2a8  140 bytes
 
 **Verdict: ⚠️ Deviation** — BL-UDATA TX unconditionally clears `has_fcs`.  
 **Draft issue**: `LLC-02`.
+**Resolved: ✅ MATCH (via H43)** — 2026-07-11: both BL-UDATA TX sites now propagate `prim.fcs_flag`.
 
 ---
 
@@ -225,6 +227,7 @@ The test vector (`fcs.rs:57`) is consistent with this behaviour: `compute_fcs(&b
 **Verdict: ✅ Compliant** on polynomial/initial value.  
 **⚠️ Deviation** on FCS coverage: header bits not protected; verify against ETSI 21.4.3 (spec text ambiguous in available sources).  
 **Draft issue**: `LLC-03`.
+**Resolved: ✅ MATCH (via H41)** — 2026-07-11: TL-SDU-only coverage confirmed against Motorola TSC's `_append_fcs_to_l3_pdu` (also operates post header-strip) and a real-frame capture; behaviour pinned by `fcs_covers_tl_sdu_only_hw_deviation` and `fcs_covers_tl_sdu_payload_bit_flip_caught` unit tests.
 
 ---
 
@@ -309,6 +312,7 @@ No length guard against N.251. If `sdu_len > 2595`, the oversized SDU goes on th
 
 **Verdict: ⚠️ Deviation** — missing N.251 TX-side size gate.  
 **Draft issue**: `LLC-04`.
+**Resolved: ✅ MATCH (via H42)** — 2026-07-11: hard cap enforced in `rx_tla_tlunitdata_req_bl` and at the entry of `rx_tla_tldata_req_bl` (covers BL-UDATA + BL-DATA/ADATA/BL-ACK-piggyback). Over-sized SDUs are dropped with a `warn!`.
 
 ---
 
@@ -492,20 +496,20 @@ SNDCP receives SDUs in the order they are delivered upward via `TlaTlDataIndBl` 
 
 | # | Property | Verdict | Draft Issue |
 |---|---|---|---|
-| P1 | BL vs. AL demux on PDU-type field | ⚠️ SuppLlcPdu/L2SigPdu miscategorised as BUG | LLC-01 |
+| P1 | BL vs. AL demux on PDU-type field | ✅ MATCH via H43 (was ⚠️ SuppLlcPdu/L2SigPdu miscategorised as BUG) | LLC-01 |
 | P2 | N(S)/N(R) 1-bit width for BL | ✅ Compliant | — |
-| P3 | FCS presence gate | ⚠️ BL-UDATA TX always clears has_fcs | LLC-02 |
-| P4 | FCS polynomial / init / coverage | ✅ Poly+init correct; ⚠️ header bits not protected by FCS | LLC-03 |
+| P3 | FCS presence gate | ✅ MATCH via H43 (was ⚠️ BL-UDATA TX always clears has_fcs) | LLC-02 |
+| P4 | FCS polynomial / init / coverage | ✅ MATCH via H41 (poly+init correct; TL-SDU-only coverage confirmed against HW) | LLC-03 |
 | P5 | BL-ACK generation cadence | ✅ / ⚠️ multi-same-tick ACK accumulation | — |
-| P6 | Fragmentation slot count (BL) | ⚠️ N.251 TX-size limit not enforced | LLC-04 |
+| P6 | Fragmentation slot count (BL) | ✅ MATCH via H42 (was ⚠️ N.251 TX-size limit not enforced) | LLC-04 |
 | P7 | Reassembly buffer bound | ✅ Compliant (no BL reassembly); ℹ️ TX queue unbounded | — |
-| P8 | Unknown PDU type handling | ⚠️ Same as P1 — log severity + message misleading | LLC-01 |
+| P8 | Unknown PDU type handling | ✅ MATCH via H43 (was ⚠️ Same as P1) | LLC-01 |
 | P9 | Sequence-number modulo-2 wraparound | ✅ Compliant | — |
 | P10 | PDU length field (8/12-bit) | ✅ N/A — no BL length field per ETSI | — |
 | P11 | Ordering guarantees BL → SNDCP | ✅ Compliant | — |
 
-**Totals**: 11 properties · 6 ✅ Compliant · 5 ⚠️ Deviation · 0 ❌ Bug · 0 ℹ️ N/A-or-AL  
-**Draft issues opened**: 4 (LLC-01, LLC-02, LLC-03, LLC-04)
+**Totals**: 11 properties · 10 ✅ Compliant/Resolved · 1 ⚠️ Minor (P5 multi-tick ACK accumulation, non-blocking) · 0 ❌ Bug · 0 ℹ️ N/A-or-AL  
+**Draft issues opened**: 4 (LLC-01, LLC-02, LLC-03, LLC-04) — **all 4 resolved (H41–H43)**
 
 ---
 

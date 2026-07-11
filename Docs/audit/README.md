@@ -53,12 +53,15 @@ Priority buckets defined in `session-state/…/plan.md`:
 
 | Report | Item | Verdict |
 | ------ | ---- | ------- |
-| `01-al` §P7 | **N.274 (`max_segment_retx`) negotiated but never enforced** | MISSING |
-| `01-al` §P12 | `retx_count` off-by-one vs N.273 | DIVERGENT-LOW (retx budget off by 1) |
-| `02-umac` §P4+P9 | **MAC-RESOURCE address type and event-label lifecycle** (combined) — flowstation always uses SSI addressing; never emits event-labels, so label reuse race is theoretical but the wire format diverges from Motorola BRC | MISSING |
-| `03-pdch-aach` §P4 | **On-demand PDCH allocation vs Motorola's pre-reservation** — first user pays an extra 4-frame setup latency | DIVERGE-HIGH |
-| `03-pdch-aach` §P6 | PDCH announcement hold-off during AL-SETUP | PARTIAL |
-| `05-llc` §LLC-01..04 | 4 BL-sublayer bugs: FCS coverage window (LLC-03), N.251 max TL-SDU not enforced on TX (LLC-04), plus 2 minor | mixed |
+| `01-al` §P7 | **N.274 (`max_segment_retx`) negotiated but never enforced** | ✅ MATCH (via H44) |
+| `01-al` §P12 | `retx_count` off-by-one vs N.273 | ✅ MATCH (via H44) |
+| `02-umac` §P4+P9 | **MAC-RESOURCE address type and event-label lifecycle** (combined) — flowstation always uses SSI addressing; never emits event-labels, so label reuse race is theoretical but the wire format diverges from Motorola BRC | MISSING (deferred) |
+| `03-pdch-aach` §P4 | **On-demand PDCH allocation vs Motorola's pre-reservation** — first user pays an extra 4-frame setup latency | DIVERGE-HIGH (deferred) |
+| `03-pdch-aach` §P6 | PDCH announcement hold-off during AL-SETUP | PARTIAL (deferred) |
+| `05-llc` §LLC-01 | SuppLlcPdu / L2SigPdu mislabelled as routing BUG | ✅ MATCH (via H43) |
+| `05-llc` §LLC-02 | BL-UDATA TX unconditionally clears has_fcs | ✅ MATCH (via H43) |
+| `05-llc` §LLC-03 | FCS coverage window (TL-SDU only) | ✅ MATCH (via H41) — TL-SDU-only coverage confirmed against real HW; pinned by unit tests |
+| `05-llc` §LLC-04 | N.251 max TL-SDU not enforced on TX | ✅ MATCH (via H42) |
 
 ### P2 — SPEC / MISSING but not currently wire-visible
 
@@ -111,5 +114,19 @@ Both P0 items in `01-al` §P5 and `03-pdch-aach` §P5 have been resolved:
   `PDCH_MAX_RESERVATIONS = 56` and `alloc_umt()` guarantees UMt uniqueness
   across live reservations.
 
-Remaining P1 items are unchanged; a separate follow-up session should
-triage them. See individual reports for details.
+The tractable P1 items in `01-al` and `05-llc` were addressed in a
+follow-up session:
+
+- **H41** (commit `PD-5c-H41`) — LLC-03 FCS coverage window verified as
+  intentional TL-SDU-only against real hardware; pinned by tests.
+- **H42** (commit `PD-5c-H42`) — LLC-04 N.251 max TL-SDU length enforced
+  on every BL TX path (BL-UDATA and BL-DATA/ADATA/BL-ACK-piggyback).
+- **H43** (commit `PD-5c-H43`) — LLC-01 unsupported PDU type log
+  downgraded from `error!("BUG:...")` to `warn!`; LLC-02 BL-UDATA now
+  propagates the caller's `fcs_flag`.
+- **H44** (commit `PD-5c-H44`) — AL retx tightening: N.273 off-by-one
+  fixed for buffered/deferred SDUs; N.274 (`max_segment_retx`) now
+  enforced as a combined `min(N.273, N.274)` cap.
+
+Remaining P1 items (`02-umac §P4+P9`, `03-pdch-aach §P4/§P6`) are
+larger architectural changes deferred to a future session.
