@@ -307,7 +307,7 @@ impl Sndcp {
             SnPdu::DataTransmitRequest(r) => self.on_data_transmit_request(queue, ind, r),
             SnPdu::PageResponse(pr) => self.on_page_response(queue, ind, pr),
             SnPdu::EndOfData(eod) => self.on_end_of_data(ind, eod),
-            SnPdu::Reconnect(rc) => self.on_reconnect(queue, ind, rc),
+            SnPdu::Reconnect(rc) => self.on_reconnect(ind, rc),
             other => {
                 tracing::warn!(
                     "SNDCP: unhandled uplink SN-PDU from {:?}: {other:?}",
@@ -956,7 +956,6 @@ impl Sndcp {
 
     fn on_reconnect(
         &mut self,
-        queue: &mut MessageQueue,
         ind: &LtpdMleUnitdataInd,
         rc: tetra_pdus::sndcp::pdus::Reconnect,
     ) {
