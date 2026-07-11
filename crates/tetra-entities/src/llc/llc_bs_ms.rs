@@ -249,6 +249,21 @@ pub struct AlLink {
     /// re-emit this cached echo verbatim without re-running the accept
     /// flow. Invalidated on every transition out of `Established`.
     pub last_setup_echo: Option<AlSetup>,
+
+    // ── PD-5c-H49: recently-delivered N(S) ring ───────────────────────────────
+    /// Bounded ring of N(S) values whose SDUs have been reassembled and
+    /// handed to the upper layer via `TlaTlDataIndAl` but whose peer AL-ACK
+    /// may have been lost in DL air. When a subsequent AL-DATA / AL-FINAL
+    /// arrives with an N(S) already in the ring, we re-emit the AL-ACK
+    /// (spec-mandated on AR — see ETSI TS 100 392-2 v3.10.1 clause 21.4.3)
+    /// but skip reassembly + skip re-delivery upward, breaking the
+    /// H33 WSP-Result-replay cascade that would otherwise saturate the
+    /// peer's PDCH and starve future AL-ACKs.
+    ///
+    /// Bounded by the peer's `tx_window` (N.272; ≤ 3 for original AL,
+    /// ≤ 7 for extended): entries older than one window rollover cannot
+    /// be duplicates by definition.
+    pub recently_delivered_ns: VecDeque<u8>,
 }
 
 impl AlLink {
@@ -289,6 +304,11 @@ impl AlLink {
         // Any transfer-state reset means the negotiation is being replayed,
         // so drop the cache.
         self.last_setup_echo = None;
+        // PD-5c-H49: duplicate-N(S) ring is transfer-scoped; a re-SETUP
+        // means the peer will start a new SDU stream from N(S) = 0 and
+        // stale entries could either false-positive or false-negative
+        // against the fresh stream.
+        self.recently_delivered_ns.clear();
     }
 }
 
@@ -1671,6 +1691,7 @@ impl Llc {
             needs_deferred_ack: false,
             pending_sdus: VecDeque::new(),
             last_setup_echo: None,
+            recently_delivered_ns: VecDeque::new(),
         });
         // Reset any transfer state carried over from a prior session on
         // this same link key.  On a freshly-inserted link this is a
@@ -1826,6 +1847,52 @@ impl Llc {
         let ar_flag = matches!(pdu.variant, AlDataVariant::DataAr | AlDataVariant::FinalAr);
         let n_s = pdu.n_s;
 
+        // PD-5c-H49: duplicate-N(S) fast path. If we've already reassembled
+        // and delivered the SDU for this N(S) and the peer is retransmitting
+        // (because our AL-ACK was lost in DL air), re-emit AL-ACK on AR
+        // *without* re-reassembling and *without* re-delivering the SDU
+        // upward. Prevents the re-delivered SDU from triggering the H33
+        // WSP-Result-replay path, which would enqueue large DL fragments
+        // ahead of our tiny AL-ACK and starve the peer of the ACK it needs,
+        // cascading into an AL-SETUP-Reset.  See ETSI TS 100 392-2 v3.10.1
+        // clause 21.4.3 + DIMETRA rlj_app `dlai_rx_duplicate_sdu_ack`.
+        let dedupe_enabled = self.config.config().llc.advanced_link.dedupe_completed_ns;
+        if dedupe_enabled {
+            let hit = self
+                .al_links
+                .get(&key)
+                .map(|l| l.recently_delivered_ns.contains(&n_s))
+                .unwrap_or(false);
+            if hit {
+                let (carrier, addr) = match self.al_links.get(&key) {
+                    Some(l) => (l.carrier_num, l.main_address),
+                    None => return,
+                };
+                tracing::debug!(
+                    "AL link {:?} N(S)={} duplicate AL-DATA/FINAL (already delivered) — {}",
+                    key, n_s,
+                    if ar_flag { "re-ACKing without redelivery" } else { "silently ignoring (non-AR)" }
+                );
+                if ar_flag {
+                    let ack_pdu = AlAckAlRnr {
+                        kind: AlAckAlRnrKind::Ack,
+                        first_block: AcknowledgementBlock {
+                            n_r: n_s,
+                            ack_length: AckLength::EntireSduReceived,
+                            s_r: None,
+                            ack_bitmap: None,
+                        },
+                        other_blocks: vec![],
+                    };
+                    let msg = Self::make_al_sap_msg_ack(
+                        ack_pdu, carrier, addr, key.link_id, key.endpoint_id,
+                    );
+                    queue.push_back(msg);
+                }
+                return;
+            }
+        }
+
         let (ack_block_opt, completed_sdu, carrier, addr, link_id, endpoint_id) = {
             let Some(link) = self.al_links.get_mut(&key) else {
                 tracing::warn!("on_al_data: link {:?} not found", key);
@@ -1853,6 +1920,21 @@ impl Llc {
                     );
                     completed_sdu = Some(sdu);
                     link.reassemblers.remove(&n_s);
+                    // PD-5c-H49: record this N(S) in the recently-delivered
+                    // ring so a peer retransmit (its retry timer fired
+                    // before our AL-ACK reached it) re-ACKs without
+                    // re-delivering. Bound by `tx_window` because the peer
+                    // cannot have more outstanding SDUs than its own N.272
+                    // window, so an entry older than one window-worth of
+                    // deliveries is guaranteed stale.
+                    if dedupe_enabled {
+                        link.recently_delivered_ns.retain(|&x| x != n_s);
+                        link.recently_delivered_ns.push_back(n_s);
+                        let cap = link.tx_window.max(1) as usize;
+                        while link.recently_delivered_ns.len() > cap {
+                            link.recently_delivered_ns.pop_front();
+                        }
+                    }
                     Some(AcknowledgementBlock {
                         n_r: n_s,
                         ack_length: AckLength::EntireSduReceived,
@@ -2226,6 +2308,7 @@ impl Llc {
                         needs_deferred_ack: false,
                         pending_sdus: VecDeque::new(),
                         last_setup_echo: None,
+                        recently_delivered_ns: VecDeque::new(),
                     });
                 }
                 let msg = Self::make_al_sap_msg_reconnect(

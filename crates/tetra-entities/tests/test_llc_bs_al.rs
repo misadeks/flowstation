@@ -1153,9 +1153,23 @@ fn feed_fresh_single_pdu_sdu(
     ts: TdmaTime,
     sdu: &[u8],
 ) -> (TlaTlDataIndAl, Vec<SapMsg>) {
+    feed_fresh_single_pdu_sdu_at_n_s(llc, queue, ts, sdu, 0)
+}
+
+/// Like `feed_fresh_single_pdu_sdu` but the caller picks the peer's `N(S)`.
+/// Real MS peers advance `N(S)` mod (tx_window+1) for consecutive SDUs;
+/// tests that push more than one SDU through the same link must vary this
+/// to avoid tripping PD-5c-H49 duplicate-N(S) suppression.
+fn feed_fresh_single_pdu_sdu_at_n_s(
+    llc: &mut Llc,
+    queue: &mut MessageQueue,
+    ts: TdmaTime,
+    sdu: &[u8],
+    n_s: u8,
+) -> (TlaTlDataIndAl, Vec<SapMsg>) {
     let cfg = SegmenterConfig {
         segment_payload_bits: 400,
-        starting_n_s: 0,
+        starting_n_s: n_s,
         request_ack_on_final: true,
         request_ack_on_data: false,
     };
@@ -1298,11 +1312,10 @@ fn al_data_after_completed_sdu_still_works_via_natural_advancement() {
         "completed SDU must remove its reassembler slot",
     );
 
-    // Second SDU, again from s_s=0 (peer's next N(S) after ack, which in
-    // practice would advance mod tx_window+1 but the test focuses on the
-    // simplest same-slot repeat; a real MS would send different N(S)).
+    // Second SDU, with the peer advancing N(S) as a real MS would
+    // (PD-5c-H49 now suppresses same-N(S) as a duplicate).
     let sdu2 = b"second".to_vec();
-    let (ind2, _) = feed_fresh_single_pdu_sdu(&mut llc, &mut queue, ts, &sdu2);
+    let (ind2, _) = feed_fresh_single_pdu_sdu_at_n_s(&mut llc, &mut queue, ts, &sdu2, 1);
     assert_eq!(ind2.tl_sdu.into_bytes(), sdu2);
 }
 
@@ -2370,5 +2383,208 @@ fn h47_cached_setup_echo_cleared_on_disc() {
     assert!(
         msgs.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_))),
         "H47: fresh SETUP must emit a CON"
+    );
+}
+
+// ─── PD-5c-H49: duplicate-N(S) suppression on RX ────────────────────────────
+
+/// Build a single AL-DATA/FINAL PDU segment for `sdu` at the given `n_s`,
+/// return the encoded PDU wrapped in a TmaUnitdataInd SapMsg.
+fn make_al_data_ind(sdu: &[u8], n_s: u8) -> SapMsg {
+    let cfg = SegmenterConfig {
+        segment_payload_bits: 400,
+        starting_n_s: n_s,
+        request_ack_on_final: true,
+        request_ack_on_data: false,
+    };
+    let out = segment_sdu(sdu, &cfg).expect("segmentation should succeed");
+    assert_eq!(out.pdus.len(), 1, "test SDU should fit in one segment");
+    let mut buf = BitBuffer::new_autoexpand(128);
+    out.pdus[0].to_bitbuf(&mut buf);
+    buf.seek(0);
+    make_tma_ind(buf)
+}
+
+/// Count outbound AL-ACK PDUs (LLC type 11) in a drained-queue slice.
+fn count_al_acks(msgs: &[SapMsg]) -> usize {
+    msgs.iter()
+        .filter(|m| {
+            if let SapMsgInner::TmaUnitdataReq(req) = &m.msg {
+                let mut b = req.pdu.clone();
+                matches!(b.read_bits(4), Some(11))
+            } else {
+                false
+            }
+        })
+        .count()
+}
+
+/// PD-5c-H49: duplicate AL-FINAL-AR for an already-delivered N(S) must
+/// re-emit AL-ACK (spec-mandated on AR — otherwise the peer never sees
+/// its ACK) but must NOT re-enqueue `TlaTlDataIndAl` (that duplicate
+/// SDU is exactly what triggers the H33 WSP-Result-replay cascade in
+/// the MTP6550 hardware log at 17:17:22.303-28).
+#[test]
+fn h49_duplicate_al_final_ar_re_acks_without_redelivery() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    let ts = TdmaTime::default();
+    let sdu = b"h49-first".to_vec();
+
+    // First delivery: normal reassembly + upward TlaTlDataIndAl + AL-ACK.
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(&sdu, 0));
+    let ind1 = take_data_ind_al(&mut queue)
+        .expect("first delivery must emit TlaTlDataIndAl");
+    assert_eq!(ind1.tl_sdu.into_bytes(), sdu);
+    let msgs1 = drain_queue(&mut queue);
+    assert_eq!(count_al_acks(&msgs1), 1, "first delivery must emit one AL-ACK");
+
+    // The link now records N(S)=0 as recently-delivered.
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .recently_delivered_ns
+            .contains(&0),
+        "H49: completed N(S) must be in the ring"
+    );
+
+    // Duplicate: MS retransmits AL-FINAL-AR N(S)=0 (its retx timer fired
+    // before our AL-ACK reached it).
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(&sdu, 0));
+    // Drain the queue in one shot; assert both properties (no re-delivery,
+    // re-emitted ACK) on the snapshot. `take_data_ind_al` would otherwise
+    // also consume the ACK.
+    let msgs2 = drain_queue(&mut queue);
+    let re_delivered = msgs2
+        .iter()
+        .any(|m| matches!(&m.msg, SapMsgInner::TlaTlDataIndAl(_)));
+    assert!(
+        !re_delivered,
+        "H49: duplicate N(S) must NOT trigger a second TlaTlDataIndAl \
+         (that would drive the H33 Result-replay cascade)"
+    );
+    assert_eq!(count_al_acks(&msgs2), 1, "H49: duplicate AL-FINAL-AR must re-emit AL-ACK");
+    // And no reassembler resurrected.
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .reassemblers
+            .is_empty(),
+        "H49: duplicate must NOT create a fresh reassembler slot"
+    );
+}
+
+/// PD-5c-H49: after the peer's N(S) window rolls over (i.e. the peer sends
+/// a genuinely-new SDU whose N(S) coincides with an entry already in the
+/// ring), that new SDU must reassemble + deliver normally — the ring is
+/// bounded by `tx_window` and old entries age out on rollover.
+#[test]
+fn h49_new_sdu_after_window_wrap_delivers_normally() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    // Default tx_window = 3 → ring holds 3 entries max.
+    drain_queue(&mut queue);
+    let ts = TdmaTime::default();
+
+    // Deliver 4 fresh SDUs at N(S) = 0, 1, 2, 3. The 4th push evicts the
+    // oldest ring entry (N(S)=0).
+    for (i, n_s) in [(0, 0u8), (1, 1u8), (2, 2u8), (3, 3u8)].iter() {
+        let sdu = format!("sdu-{}", i).into_bytes();
+        one_tick(&mut llc, &mut queue, ts, make_al_data_ind(&sdu, *n_s));
+        take_data_ind_al(&mut queue).unwrap_or_else(|| panic!("SDU {} must deliver", i));
+        drain_queue(&mut queue);
+    }
+    let ring = &llc.al_links.get(&test_key()).unwrap().recently_delivered_ns;
+    assert_eq!(ring.len(), 3, "H49: ring must be bounded by tx_window (=3)");
+    assert!(!ring.contains(&0), "H49: N(S)=0 must have aged out after 3 more deliveries");
+
+    // A fresh SDU arriving on N(S)=0 (peer's window has genuinely wrapped)
+    // must reassemble + deliver normally, not be suppressed.
+    let sdu5 = b"post-wrap".to_vec();
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(&sdu5, 0));
+    let ind = take_data_ind_al(&mut queue)
+        .expect("H49: post-wrap SDU on same N(S)=0 must deliver (not be suppressed)");
+    assert_eq!(ind.tl_sdu.into_bytes(), sdu5);
+    let msgs = drain_queue(&mut queue);
+    assert_eq!(count_al_acks(&msgs), 1, "H49: post-wrap must ACK exactly once");
+}
+
+/// PD-5c-H49: `reset_transfer_state` must clear the recently-delivered ring
+/// alongside the reassemblers, so a fresh session's N(S)=0 does not hit
+/// stale dedupe state from the prior session.
+#[test]
+fn h49_reset_transfer_state_clears_ring() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+    let ts = TdmaTime::default();
+
+    // Deliver an SDU so N(S)=0 is in the ring.
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(b"pre-reset", 0));
+    take_data_ind_al(&mut queue).unwrap();
+    drain_queue(&mut queue);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .recently_delivered_ns
+            .contains(&0)
+    );
+
+    // Peer re-establishes with Reset (existing reset_transfer_state trigger).
+    send_setup_to_llc(&mut llc, &mut queue, make_setup_pdu(SetupReport::Reset));
+    drain_queue(&mut queue);
+    let link = llc.al_links.get(&test_key()).expect("link stays after Reset");
+    assert!(
+        link.recently_delivered_ns.is_empty(),
+        "H49: recently_delivered_ns must be cleared by reset_transfer_state"
+    );
+
+    // And the fresh session's N(S)=0 delivers normally (not suppressed).
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(b"post-reset", 0));
+    let ind = take_data_ind_al(&mut queue)
+        .expect("H49: fresh N(S)=0 after Reset must deliver");
+    assert_eq!(ind.tl_sdu.into_bytes(), b"post-reset");
+}
+
+/// PD-5c-H49: with the dedupe config knob off, we fall back to the pre-H49
+/// behaviour (re-reassemble, re-deliver, re-ACK). Regression guard that the
+/// escape hatch works.
+#[test]
+fn h49_dedupe_disabled_reverts_to_pre_h49_behaviour() {
+    debug::setup_logging_verbose();
+    let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
+    cfg.llc.advanced_link.dedupe_completed_ns = false;
+    let sc = tetra_config::bluestation::SharedConfig::from_parts(cfg, None);
+    let (mut llc, mut queue) = (Llc::new(sc), MessageQueue::new());
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+    let ts = TdmaTime::default();
+
+    let sdu = b"h49-off".to_vec();
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(&sdu, 0));
+    take_data_ind_al(&mut queue).expect("first delivery");
+    drain_queue(&mut queue);
+    assert!(
+        llc.al_links
+            .get(&test_key())
+            .unwrap()
+            .recently_delivered_ns
+            .is_empty(),
+        "H49-off: ring must stay empty"
+    );
+
+    // Duplicate now re-delivers (pre-H49 behaviour).
+    one_tick(&mut llc, &mut queue, ts, make_al_data_ind(&sdu, 0));
+    assert!(
+        take_data_ind_al(&mut queue).is_some(),
+        "H49-off: duplicate must re-deliver upward (pre-H49 behaviour)"
     );
 }

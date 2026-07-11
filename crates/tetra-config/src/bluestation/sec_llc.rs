@@ -76,6 +76,18 @@ pub struct CfgAdvancedLink {
     /// accept flow (purge + `reset_transfer_state`) on the duplicate.
     /// Default `true`.
     pub cache_setup_echo: bool,
+
+    /// PD-5c-H49: on receipt of an inbound AL-DATA/AL-FINAL whose `N(S)` was
+    /// already reassembled + delivered upward (i.e. our AL-ACK was lost in
+    /// DL air and the peer is retransmitting), re-emit AL-ACK
+    /// `EntireSduReceived` for that `N(S)` but skip re-reassembly and skip
+    /// re-delivery to the higher layer. Prevents duplicate SDUs from
+    /// re-invoking WSP (which would otherwise trigger the H33 Result-replay
+    /// path and pile DL congestion, itself starving further AL-ACKs → link
+    /// reset). Matches ETSI TS 100 392-2 v3.10.1 clause 21.4.3
+    /// duplicate-SDU suppression + DIMETRA rlj_app
+    /// `dlai_rx_duplicate_sdu_ack`. Default `true`.
+    pub dedupe_completed_ns: bool,
 }
 
 impl Default for CfgAdvancedLink {
@@ -91,6 +103,7 @@ impl Default for CfgAdvancedLink {
             max_tl_sdu_octets: 4096,
             proactive_disc_on_retx_exhaust: true,
             cache_setup_echo: true,
+            dedupe_completed_ns: true,
         }
     }
 }
@@ -127,6 +140,8 @@ pub struct AdvancedLinkDto {
     pub proactive_disc_on_retx_exhaust: bool,
     #[serde(default = "default_cache_setup_echo")]
     pub cache_setup_echo: bool,
+    #[serde(default = "default_dedupe_completed_ns")]
+    pub dedupe_completed_ns: bool,
 
     /// Unknown-field detector — parsing.rs rejects any entry present here.
     #[serde(flatten)]
@@ -146,6 +161,7 @@ impl Default for AdvancedLinkDto {
             max_tl_sdu_octets: default_max_tl_sdu_octets(),
             proactive_disc_on_retx_exhaust: default_proactive_disc_on_retx_exhaust(),
             cache_setup_echo: default_cache_setup_echo(),
+            dedupe_completed_ns: default_dedupe_completed_ns(),
             extra: HashMap::new(),
         }
     }
@@ -161,6 +177,7 @@ fn default_max_reconnect_retries() -> u8 { 3 }
 fn default_max_tl_sdu_octets() -> u16 { 4096 }
 fn default_proactive_disc_on_retx_exhaust() -> bool { true }
 fn default_cache_setup_echo() -> bool { true }
+fn default_dedupe_completed_ns() -> bool { true }
 
 /// Serde DTO for `[llc]`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -278,6 +295,7 @@ pub fn validate_advanced_link_config(dto: AdvancedLinkDto) -> Result<CfgAdvanced
         max_tl_sdu_octets: dto.max_tl_sdu_octets,
         proactive_disc_on_retx_exhaust: dto.proactive_disc_on_retx_exhaust,
         cache_setup_echo: dto.cache_setup_echo,
+        dedupe_completed_ns: dto.dedupe_completed_ns,
     })
 }
 
@@ -316,6 +334,8 @@ mod tests {
         // PD-5c-H47: both new AL reliability toggles default on.
         assert!(cfg.proactive_disc_on_retx_exhaust);
         assert!(cfg.cache_setup_echo);
+        // PD-5c-H49: duplicate-N(S) suppression defaults on.
+        assert!(cfg.dedupe_completed_ns);
     }
 
     #[test]
@@ -350,6 +370,7 @@ mod tests {
             max_tl_sdu_octets = 512
             proactive_disc_on_retx_exhaust = false
             cache_setup_echo = false
+            dedupe_completed_ns = false
         "#;
         let dto: AdvancedLinkDto = toml::from_str(toml_str).expect("TOML must parse");
         let cfg = validate_advanced_link_config(dto).expect("must validate");
@@ -359,6 +380,8 @@ mod tests {
         // PD-5c-H47: overrides plumb through.
         assert!(!cfg.proactive_disc_on_retx_exhaust);
         assert!(!cfg.cache_setup_echo);
+        // PD-5c-H49: override plumbs through.
+        assert!(!cfg.dedupe_completed_ns);
     }
 
     #[test]
