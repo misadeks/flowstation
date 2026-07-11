@@ -16,12 +16,14 @@ use super::{MetarCache, PortalConfig, PortalDataSource};
 pub fn render_index(cfg: &PortalConfig) -> Vec<u8> {
     let prefix = cfg.path_prefix.as_str();
     wmlc::wrap_card("FlowStation", |out| {
-        push_str_i(out, "FlowStation\n");
+        push_str_i(out, "FlowStation");
+        push_text_element(out, tag::BR, "");
         push_anchor(out, &format!("{prefix}/radios"), "1 Radios");
         push_text_element(out, tag::BR, "");
         push_anchor(out, &format!("{prefix}/weather"), "2 Weather");
         push_text_element(out, tag::BR, "");
         push_anchor(out, &format!("{prefix}/system"), "3 System");
+        push_text_element(out, tag::BR, "");
     })
 }
 
