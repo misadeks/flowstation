@@ -5,7 +5,7 @@
 /// the production default (false) is not disturbed.
 mod common;
 
-use tetra_config::bluestation::StackMode;
+use tetra_config::bluestation::{CfgPacketDataPdch, StackMode};
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_entities::umac::umac_bs::UmacBs;
@@ -890,5 +890,157 @@ fn pdch_tick_reasserts_aach_after_intra_frame_change() {
         None,
         "PDCH must not ghost-reappear after voice releases the preempted slot; \
          re-activation requires an MS-initiated TRANSMIT-REQUEST"
+    );
+}
+
+// ── PD-5c-H52b: multi-slot drain tests ────────────────────────────────────────
+
+/// Build a `ComponentTest` with multi-slot PDCH enabled: `multi_slot = true`,
+/// `dl_max_slots_per_frame = max_slots`, `require_ms_capability = require_cap`.
+fn make_multislot_test(max_slots: u8, require_cap: bool) -> ComponentTest {
+    let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
+    cfg.packet_data.pdch = CfgPacketDataPdch {
+        multi_slot: true,
+        dl_max_slots_per_frame: max_slots,
+        require_ms_capability: require_cap,
+        ..Default::default()
+    };
+    cfg.packet_data.enabled = true;
+    ComponentTest::from_config(cfg, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }))
+}
+
+/// H52b test 1: when `dl_max_slots_per_frame = 2` and both TS3 and TS4 are free,
+/// two SDUs for two different multislot-capable ISSIs are each drained onto
+/// separate timeslots in one tick.
+#[test]
+fn pdch_multislot_drain_uses_two_ts_when_both_free() {
+    debug::setup_logging_verbose();
+
+    const ISSI_A: u32 = 1001;
+    const ISSI_B: u32 = 1002;
+
+    let mut test = make_multislot_test(2, true);
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Mark both ISSIs as multislot-capable in the shared state.
+    test.config.state_write().ms_multislot_cap.insert(ISSI_A, true);
+    test.config.state_write().ms_multislot_cap.insert(ISSI_B, true);
+
+    // Submit two packet-data PDUs for two different ISSIs (arms PDCH).
+    for issi in [ISSI_A, ISSI_B] {
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(issi)),
+        });
+    }
+    // tick 1: deliver messages (SDUs enqueued); tick 2: drain fires.
+    test.run_stack(Some(2));
+
+    let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+        .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+
+    // After two ticks both SDUs must have been drained (queue length drops from 2 to 0).
+    assert_eq!(
+        umac.pdch_dl_queue_len_for_test(),
+        0,
+        "multi-slot drain must consume both SDUs in one drain tick when TS3 and TS4 are free"
+    );
+    // Both TS3 and TS4 should be in the current_timeslots.
+    assert!(
+        umac.pdch_allocator().current_timeslots.len() >= 2,
+        "current_timeslots must hold at least 2 entries when N=2 slots are chosen"
+    );
+}
+
+/// H52b test 2: when `dl_max_slots_per_frame = 2` but TS3 and TS4 are both
+/// occupied by voice, only TS2 is chosen and only one SDU is drained per tick.
+#[test]
+fn pdch_multislot_falls_back_to_one_ts_when_ts3_busy() {
+    debug::setup_logging_verbose();
+
+    const ISSI_A: u32 = 2001;
+
+    let mut test = make_multislot_test(2, false);
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Occupy TS3 and TS4 with voice circuits.
+    for ts in [3u8, 4u8] {
+        test.submit_message(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+                direction: Direction::Dl,
+                carrier_num: 1521,
+                peer_carrier_num: None,
+                ts,
+                peer_ts: None,
+                usage: 4,
+                circuit_mode: CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+                dl_media_source: CircuitDlMediaSource::LocalLoopback,
+            })),
+        });
+    }
+    test.run_stack(Some(2));
+
+    // Queue two SDUs for the same ISSI.
+    for _ in 0..2 {
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(ISSI_A)),
+        });
+    }
+    test.run_stack(Some(2));
+
+    let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+        .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+
+    // With TS3 and TS4 busy, only TS2 is available: at most 1 slot chosen.
+    assert!(
+        umac.pdch_allocator().current_timeslots.len() <= 1,
+        "only one slot (TS2) should be chosen when TS3 and TS4 are both occupied by voice"
+    );
+}
+
+/// H52b test 3: an ISSI whose `multislot_phase_mod` is `false` must be capped
+/// to at most 1 slot per tick, even when N=2 is configured.
+#[test]
+fn pdch_multislot_gated_by_ms_capability() {
+    debug::setup_logging_verbose();
+
+    const ISSI_SINGLE: u32 = 3001;
+
+    let mut test = make_multislot_test(2, true);
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    // Mark ISSI as non-multislot-capable.
+    test.config.state_write().ms_multislot_cap.insert(ISSI_SINGLE, false);
+
+    // Queue two SDUs for the same ISSI.
+    for _ in 0..2 {
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(make_pdch_unitdata_req(ISSI_SINGLE)),
+        });
+    }
+    // tick 1: deliver messages (SDUs enqueued); tick 2: drain fires.
+    test.run_stack(Some(2));
+
+    let umac = test.router.get_entity(TetraEntity::Umac).expect("UMAC")
+        .as_any_mut().downcast_mut::<UmacBs>().expect("downcast");
+
+    // The non-multislot MS must have only 1 SDU drained: 1 remains.
+    assert_eq!(
+        umac.pdch_dl_queue_len_for_test(),
+        1,
+        "non-multislot MS must be capped at 1 slot per tick; second SDU must remain in queue"
     );
 }

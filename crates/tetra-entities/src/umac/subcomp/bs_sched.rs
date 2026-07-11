@@ -2999,4 +2999,109 @@ mod tests {
         let g2 = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req1Slot);
         assert!(g2.is_some(), "second Req1Slot must also grant (guard is gated on requested_cap >= 2)");
     }
+
+    // ── PD-5c-H52b: multi-slot PDCH scheduler tests ───────────────────────────
+
+    /// Confirm that `set_pdch_timeslots` with multiple entries labels each slot
+    /// as AssignedControl in the AACH, and that `pdch_timeslots_ref` contains all.
+    #[test]
+    fn pdch_multislot_set_labels_multiple_aach_slots() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch_timeslots(&[4, 3]);
+
+        assert!(
+            sched.pdch_timeslots_ref().contains(&3),
+            "set_pdch_timeslots must include TS3"
+        );
+        assert!(
+            sched.pdch_timeslots_ref().contains(&4),
+            "set_pdch_timeslots must include TS4"
+        );
+
+        assert_eq!(
+            aach_for_ts(&mut sched, 4).dl_usage,
+            AccessAssignDlUsage::AssignedControl,
+            "TS4 AACH must be AssignedControl when in PDCH set"
+        );
+        assert_eq!(
+            aach_for_ts(&mut sched, 3).dl_usage,
+            AccessAssignDlUsage::AssignedControl,
+            "TS3 AACH must be AssignedControl when in PDCH set"
+        );
+    }
+
+    /// Verify that voice preemption removes only the preempted TS from a multi-slot
+    /// PDCH set, leaving the remaining slot(s) intact.
+    #[test]
+    fn voice_preempts_single_pdch_ts_leaves_others_intact() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch_timeslots(&[3, 4]);
+
+        // Pre-condition: both TS3 and TS4 are AssignedControl.
+        assert!(sched.pdch_timeslots_ref().contains(&3));
+        assert!(sched.pdch_timeslots_ref().contains(&4));
+
+        // Voice takes TS3 only.
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 3));
+
+        // TS3 removed from PDCH set.
+        assert!(
+            !sched.pdch_timeslots_ref().contains(&3),
+            "TS3 must be removed from PDCH set after voice preemption"
+        );
+        // TS4 stays in the PDCH set.
+        assert!(
+            sched.pdch_timeslots_ref().contains(&4),
+            "TS4 must remain in PDCH set after TS3 voice preemption"
+        );
+        // TS3 AACH must now show Traffic.
+        let aach3 = aach_for_ts(&mut sched, 3);
+        assert!(
+            matches!(aach3.dl_usage, AccessAssignDlUsage::Traffic(_)),
+            "TS3 AACH must be Traffic after voice preemption, got {:?}",
+            aach3.dl_usage
+        );
+        // TS4 AACH must still show AssignedControl.
+        assert_eq!(
+            aach_for_ts(&mut sched, 4).dl_usage,
+            AccessAssignDlUsage::AssignedControl,
+            "TS4 AACH must remain AssignedControl after TS3 voice preemption"
+        );
+    }
+
+    /// `pdch_multislot_falls_back_to_one_ts_when_ts3_busy`: when TS3 and TS4 are
+    /// both occupied and N=2 is requested, only TS2 gets an AssignedControl label
+    /// (one slot instead of two).
+    #[test]
+    fn pdch_multislot_falls_back_to_one_ts_when_ts3_busy() {
+        let mut sched = get_testing_slotter();
+        // Occupy both TS3 and TS4 with voice circuits.
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 3));
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 4));
+
+        // Simulate the tick-drain choosing up to 2 slots — only TS2 is free.
+        let chosen: Vec<u8> = [4u8, 3, 2]
+            .iter()
+            .filter(|&&ts| !sched.circuit_is_active(Direction::Dl, ts))
+            .take(2)
+            .copied()
+            .collect();
+        sched.set_pdch_timeslots(&chosen);
+
+        // Only TS2 should be chosen (TS3 and TS4 are both busy).
+        assert_eq!(chosen, vec![2u8], "when TS3 and TS4 are busy, only TS2 should be chosen");
+        assert_eq!(
+            aach_for_ts(&mut sched, 2).dl_usage,
+            AccessAssignDlUsage::AssignedControl,
+            "TS2 must be AssignedControl"
+        );
+        assert!(
+            !sched.pdch_timeslots_ref().contains(&3),
+            "TS3 must NOT be in PDCH set (it is occupied by voice)"
+        );
+        assert!(
+            !sched.pdch_timeslots_ref().contains(&4),
+            "TS4 must NOT be in PDCH set (it is occupied by voice)"
+        );
+    }
 }

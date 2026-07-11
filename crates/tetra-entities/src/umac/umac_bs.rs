@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::freqs::FreqInfo;
@@ -2504,54 +2504,117 @@ impl TetraEntityTrait for UmacBs {
             //    yields for this hyperframe and no broadcast is emitted.
             //    NOTE: spec ambiguous — chosen behaviour: query the main-carrier
             //    scheduler's DL circuit occupancy; any non-active slot is eligible.
-            let pdch_ts_chosen: Option<u8> = [4u8, 3, 2]
-                .iter()
-                .find(|&&ts_candidate| {
-                    !self
-                        .channel_scheduler
-                        .circuit_is_active(Direction::Dl, ts_candidate)
-                })
-                .copied();
-
-            // Update the allocator with the chosen slot for this hyperframe (single-slot path).
-            self.pdch_allocator.current_timeslots = match pdch_ts_chosen {
-                Some(t) => vec![t],
-                None => Vec::new(),
+            let pdch_cfg = {
+                let c = self.config.config();
+                (c.packet_data.pdch.multi_slot, c.packet_data.pdch.dl_max_slots_per_frame, c.packet_data.pdch.require_ms_capability)
             };
+            let (multi_slot, dl_max_slots, require_ms_cap) = pdch_cfg;
 
-            match pdch_ts_chosen {
-                None => {
-                    // All eligible timeslots are occupied by voice/SDS — yield.
+            if multi_slot {
+                // ── H52b: multi-slot drain ──────────────────────────────────
+                // Collect up to dl_max_slots free non-voice slots in preference order.
+                let chosen_slots: Vec<u8> = [4u8, 3, 2]
+                    .iter()
+                    .filter(|&&ts_candidate| {
+                        !self.channel_scheduler.circuit_is_active(Direction::Dl, ts_candidate)
+                    })
+                    .take(dl_max_slots as usize)
+                    .copied()
+                    .collect();
+
+                // Advertise all chosen slots as AssignedControl in the AACH.
+                self.channel_scheduler.set_pdch_timeslots(&chosen_slots);
+                self.pdch_allocator.current_timeslots = chosen_slots.clone();
+
+                if chosen_slots.is_empty() {
                     tracing::info!(
                         "UMAC: PDCH deferred this hyperframe — all TS2/3/4 in use by voice/circuit"
                     );
-                }
-                Some(chosen_ts) => {
-                    // Drain one queued SNDCP PDU per tick onto the PDCH timeslot.
-                    // The PDU is wrapped in a MAC-RESOURCE addressed to the originating
-                    // ISSI and routed directly to `chosen_ts` via dl_enqueue_tma_for_link.
-                    if let Some((issi, sdu)) = self.pdch_dl_queue.pop_front() {
-                        let umt = self.pdch_allocator.reservations.get(&issi).map(|r| r.umt);
-                        let mut pdu = MacResource {
-                            addr: Some(TetraAddress { ssi: issi, ssi_type: SsiType::Issi }),
-                            usage_marker: umt,
-                            ..Default::default()
-                        };
-                        pdu.update_len_and_fill_ind(sdu.get_len());
-                        tracing::debug!(
-                            "UMAC: PDCH DL {} bits for issi={} umt={:?} → TS{}",
-                            sdu.get_len(), issi, umt, chosen_ts
-                        );
-                        self.pdch_allocator.touch(issi, self.dltime);
-                        self.channel_scheduler
-                            .dl_enqueue_tma_for_link(chosen_ts as u32, pdu, sdu, None);
+                } else {
+                    // Per-MS capability gate: track ISSIs served this tick.
+                    // An ISSI whose multislot_phase_mod is not Some(true) is limited to
+                    // one slot per tick even when the pool has room for more.
+                    let mut served_this_tick: HashSet<u32> = HashSet::new();
+                    for chosen_ts in chosen_slots {
+                        let maybe_entry = self.pdch_dl_queue.pop_front();
+                        if let Some((issi, sdu)) = maybe_entry {
+                            if require_ms_cap && served_this_tick.contains(&issi) {
+                                let is_multislot = self.config.state_read().ms_multislot_cap.get(&issi).copied();
+                                if is_multislot != Some(true) {
+                                    // Non-multislot MS: allow at most 1 slot per tick.
+                                    self.pdch_dl_queue.push_front((issi, sdu));
+                                    continue;
+                                }
+                            }
+                            let umt = self.pdch_allocator.reservations.get(&issi).map(|r| r.umt);
+                            let mut pdu = MacResource {
+                                addr: Some(TetraAddress { ssi: issi, ssi_type: SsiType::Issi }),
+                                usage_marker: umt,
+                                ..Default::default()
+                            };
+                            pdu.update_len_and_fill_ind(sdu.get_len());
+                            tracing::debug!(
+                                "UMAC: PDCH multi-slot DL {} bits for issi={} umt={:?} → TS{}",
+                                sdu.get_len(), issi, umt, chosen_ts
+                            );
+                            self.pdch_allocator.touch(issi, self.dltime);
+                            self.channel_scheduler
+                                .dl_enqueue_tma_for_link(chosen_ts as u32, pdu, sdu, None);
+                            served_this_tick.insert(issi);
+                        }
                     }
-                    // ACCESS-DEFINE is NOT emitted here. Per rlj_app symbol trace,
-                    // DIMETRA embeds access-code-A parameters in SYSINFO's optional
-                    // field and only emits ACCESS-DEFINE when a non-default access-code
-                    // (B/C/D) or assigned-channel parameter differs from SYSINFO defaults.
-                    // Use `build_pdch_access_define_for_override` directly when that
-                    // override emission is needed.
+                }
+            } else {
+                // ── Single-slot path (existing behaviour, multi_slot = false) ─
+                let pdch_ts_chosen: Option<u8> = [4u8, 3, 2]
+                    .iter()
+                    .find(|&&ts_candidate| {
+                        !self
+                            .channel_scheduler
+                            .circuit_is_active(Direction::Dl, ts_candidate)
+                    })
+                    .copied();
+
+                // Update the allocator with the chosen slot for this hyperframe (single-slot path).
+                self.pdch_allocator.current_timeslots = match pdch_ts_chosen {
+                    Some(t) => vec![t],
+                    None => Vec::new(),
+                };
+
+                match pdch_ts_chosen {
+                    None => {
+                        // All eligible timeslots are occupied by voice/SDS — yield.
+                        tracing::info!(
+                            "UMAC: PDCH deferred this hyperframe — all TS2/3/4 in use by voice/circuit"
+                        );
+                    }
+                    Some(chosen_ts) => {
+                        // Drain one queued SNDCP PDU per tick onto the PDCH timeslot.
+                        // The PDU is wrapped in a MAC-RESOURCE addressed to the originating
+                        // ISSI and routed directly to `chosen_ts` via dl_enqueue_tma_for_link.
+                        if let Some((issi, sdu)) = self.pdch_dl_queue.pop_front() {
+                            let umt = self.pdch_allocator.reservations.get(&issi).map(|r| r.umt);
+                            let mut pdu = MacResource {
+                                addr: Some(TetraAddress { ssi: issi, ssi_type: SsiType::Issi }),
+                                usage_marker: umt,
+                                ..Default::default()
+                            };
+                            pdu.update_len_and_fill_ind(sdu.get_len());
+                            tracing::debug!(
+                                "UMAC: PDCH DL {} bits for issi={} umt={:?} → TS{}",
+                                sdu.get_len(), issi, umt, chosen_ts
+                            );
+                            self.pdch_allocator.touch(issi, self.dltime);
+                            self.channel_scheduler
+                                .dl_enqueue_tma_for_link(chosen_ts as u32, pdu, sdu, None);
+                        }
+                        // ACCESS-DEFINE is NOT emitted here. Per rlj_app symbol trace,
+                        // DIMETRA embeds access-code-A parameters in SYSINFO's optional
+                        // field and only emits ACCESS-DEFINE when a non-default access-code
+                        // (B/C/D) or assigned-channel parameter differs from SYSINFO defaults.
+                        // Use `build_pdch_access_define_for_override` directly when that
+                        // override emission is needed.
+                    }
                 }
             }
         }
