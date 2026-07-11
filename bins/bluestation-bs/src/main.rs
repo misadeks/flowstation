@@ -264,15 +264,17 @@ fn wire_pd_gateway(sndcp: &mut Sndcp, pd: &tetra_config::bluestation::CfgPacketD
 /// Errors from `wap_gateway::run` (socket bind failure, fatal I/O) are
 /// logged via `tracing::error!` — the surrounding stack continues to run
 /// so operators can diagnose via journalctl without losing the BS.
-fn wire_wap_gateway(wg: &tetra_config::bluestation::CfgWapGateway) {
+fn wire_wap_gateway(
+    wg: &tetra_config::bluestation::CfgWapGateway,
+    dashboard_state: tetra_entities::net_dashboard::DashboardState,
+    pdp_count_observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     let rt = shared_gateway_runtime();
 
-    // Optional built-in portal. When enabled we build a minimal
-    // `PortalDataSource` implementation right here. Wiring live radios /
-    // SDS state from `DashboardState` and PDP-context counts from `Sndcp`
-    // is a separate follow-up refactor (both are constructed later in
-    // `build_bs_stack` / `main`, and re-plumbing them for portal access
-    // is intentionally out of scope for the MVP branch).
+    // Optional built-in portal. Live state is fed in via a `PortalDataSource`
+    // adapter that reads the shared `DashboardState` (built once in
+    // `build_bs_stack` and shared with the dashboard HTTP server) plus the
+    // atomic PDP-context counter published by SNDCP.
     let portal = if wg.portal.enabled {
         let pcfg = wap_gateway::portal::PortalConfig {
             path_prefix: wg.portal.path_prefix.clone(),
@@ -282,7 +284,7 @@ fn wire_wap_gateway(wg: &tetra_config::bluestation::CfgWapGateway) {
         };
         Some(wap_gateway::PortalRunConfig {
             config: pcfg,
-            data: std::sync::Arc::new(BluestationPortalData::new()),
+            data: std::sync::Arc::new(BluestationPortalData::new(dashboard_state, pdp_count_observer)),
         })
     } else {
         None
@@ -318,53 +320,93 @@ fn wire_wap_gateway(wg: &tetra_config::bluestation::CfgWapGateway) {
     );
 }
 
-/// Minimal `PortalDataSource` adapter used by the built-in WAP portal.
+/// `PortalDataSource` adapter over the live FlowStation state.
 ///
-/// **MVP scope:** returns the FlowStation version + process uptime for the
-/// system page and an empty radios list. The prompt calls out full
-/// live-state wiring (via `DashboardState` and `Sndcp`) as a Phase 3
-/// deliverable; that requires re-plumbing dashboard construction to accept
-/// an externally-built `DashboardState`, which is intentionally deferred to
-/// a follow-up so the WSP + WMLC framework can be validated on hardware
-/// first.
+/// Reads the shared [`DashboardState`](tetra_entities::net_dashboard::DashboardState)
+/// for the radios page and the atomic counter published by
+/// [`Sndcp::pdp_count_observer`](tetra_entities::sndcp::sndcp_bs::Sndcp::pdp_count_observer)
+/// for the system page. Both handles are `Arc` clones, so this adapter is
+/// cheap to construct and hold behind an `Arc<dyn PortalDataSource>`.
 #[derive(Debug)]
 struct BluestationPortalData {
     started_at: std::time::Instant,
+    dashboard_state: tetra_entities::net_dashboard::DashboardState,
+    pdp_count_observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl BluestationPortalData {
-    fn new() -> Self {
+    fn new(
+        dashboard_state: tetra_entities::net_dashboard::DashboardState,
+        pdp_count_observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         Self {
             started_at: std::time::Instant::now(),
+            dashboard_state,
+            pdp_count_observer,
         }
     }
 }
 
 impl wap_gateway::portal::PortalDataSource for BluestationPortalData {
-    fn radios(&self, _max: usize) -> Vec<wap_gateway::portal::RadioSnapshot> {
-        Vec::new()
+    fn radios(&self, max: usize) -> Vec<wap_gateway::portal::RadioSnapshot> {
+        // Read-lock the dashboard state briefly, snapshot the top-N MS
+        // entries ranked by most-recent `last_seen`, and drop the lock
+        // before returning owned data to the WSP hot path.
+        let Ok(guard) = self.dashboard_state.read() else {
+            return Vec::new();
+        };
+        let now = std::time::Instant::now();
+        let mut rows: Vec<_> = guard
+            .ms_map
+            .values()
+            .map(|ms| {
+                let last_seen_secs = now.saturating_duration_since(ms.last_seen).as_secs();
+                (ms.issi, ms.rssi_dbfs, last_seen_secs)
+            })
+            .collect();
+        // Sort by ascending last_seen_secs (most-recently-heard first).
+        rows.sort_by_key(|(_, _, secs)| *secs);
+        rows.truncate(max);
+        rows.into_iter()
+            .map(|(issi, rssi, last_seen_secs)| wap_gateway::portal::RadioSnapshot {
+                issi,
+                // Callsign resolution lives inside DashboardServer's radioid
+                // cache — plumbing it into the portal is a follow-up. Show
+                // "-" until then.
+                callsign: None,
+                last_seen_secs,
+                rssi_dbfs: rssi,
+            })
+            .collect()
     }
 
     fn system(&self) -> wap_gateway::portal::SystemSnapshot {
         wap_gateway::portal::SystemSnapshot {
             uptime: self.started_at.elapsed(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            pdp_contexts: 0,
+            pdp_contexts: self.pdp_count_observer.load(std::sync::atomic::Ordering::Relaxed),
+            // Cell-load metric doesn't have a cheap public accessor today —
+            // renders as "n/a" until one lands. Follow-up in the LMAC/PHY area.
             cell_load_pct: None,
         }
     }
 }
 
+/// Handles returned from [`build_bs_stack`] that outlive the function and
+/// need to be threaded into `main` (e.g. shared with the dashboard server).
+pub struct BsStackHandles {
+    pub router: MessageRouter,
+    pub tsource: Option<TelemetrySource>,
+    pub cdispatchers: HashMap<TetraEntity, CommandDispatcher>,
+    pub tsink: Option<TelemetrySink>,
+    /// Shared dashboard state — used by both the built-in WAP portal and, if
+    /// enabled, the dashboard HTTP server. Constructed once inside
+    /// `build_bs_stack` so both surfaces observe the same live table.
+    pub dashboard_state: tetra_entities::net_dashboard::DashboardState,
+}
+
 /// Start base station stack
-fn build_bs_stack(
-    cfg: &mut SharedConfig,
-    config_path: &str,
-) -> (
-    MessageRouter,
-    Option<TelemetrySource>,
-    HashMap<TetraEntity, CommandDispatcher>,
-    Option<TelemetrySink>,
-) {
+fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> BsStackHandles {
     let mut router = MessageRouter::new(cfg.clone());
 
     // Build telemetry sink/source — always create if either telemetry or dashboard is enabled
@@ -437,6 +479,19 @@ fn build_bs_stack(
     let mle = MleBs::new(cfg.clone());
     let mut mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
     let mut sndcp = Sndcp::new(cfg.clone());
+    // Clone the shared pdp-context counter *before* SNDCP is moved into the
+    // router; this lets external observers (e.g. the WAP portal) read the
+    // live count without needing a reference to the entity itself.
+    let pdp_count_observer = sndcp.pdp_count_observer();
+
+    // Build the shared dashboard state up-front so anything that runs before
+    // the dashboard HTTP server (currently the WAP portal) can share the
+    // exact same live table with it. `DashboardServer::with_state` is used
+    // below to attach the same handle to the HTTP server.
+    let dashboard_state: tetra_entities::net_dashboard::DashboardState = std::sync::Arc::new(std::sync::RwLock::new(
+        tetra_entities::net_dashboard::DashboardStateInner::new(config_path.to_owned()),
+    ));
+
     // PD-9: bridge SNDCP's uplink/downlink IP queues to the OS TUN interface
     // via the pd-gateway crate.  Gated on [packet_data].enabled so configs
     // without packet data (or dev machines without TUN) are unaffected.  On
@@ -448,7 +503,7 @@ fn build_bs_stack(
     // when [wap_gateway].enabled = true. Bind failures are logged as warnings
     // so the stack still comes up (the gateway can be diagnosed via journalctl).
     if cfg.config().wap_gateway.enabled {
-        wire_wap_gateway(&cfg.config().wap_gateway);
+        wire_wap_gateway(&cfg.config().wap_gateway, dashboard_state.clone(), pdp_count_observer);
     }
     let mut cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
     // Wire the built-in WX/METAR service's reply channel: its background fetch threads
@@ -519,7 +574,15 @@ fn build_bs_stack(
     // Init network time
     router.set_dl_time(TdmaTime::default());
 
-    (router, tsource, c_d, tsink)
+    // dashboard_state was constructed early in build_bs_stack and shared with
+    // the WAP portal + (later) the dashboard HTTP server.
+    BsStackHandles {
+        router,
+        tsource,
+        cdispatchers: c_d,
+        tsink,
+        dashboard_state,
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -590,7 +653,10 @@ fn main() {
         );
     }
 
-    let (mut router, tsource, cdispatchers, dapnet_telemetry_sink) = build_bs_stack(&mut cfg, &args.config);
+    let (mut router, tsource, cdispatchers, dapnet_telemetry_sink, dashboard_state) = {
+        let h = build_bs_stack(&mut cfg, &args.config);
+        (h.router, h.tsource, h.cdispatchers, h.tsink, h.dashboard_state)
+    };
     let dapnet_cmd_tx = cdispatchers.get(&TetraEntity::Cmce).map(|dispatcher| dispatcher.clone_sender());
     let mut dapnet_telegram_sink: Option<TelegramAlertSink> = None;
     #[allow(unused_assignments)]
@@ -641,7 +707,9 @@ fn main() {
         // Optional dashboard HTTP server.
         let dashboard: Option<std::sync::Arc<DashboardServer>> = if has_dashboard {
             let dash_cfg = cfg.config().dashboard.clone().unwrap();
-            let mut dashboard = DashboardServer::new(args.config.clone());
+            // Reuse the state built in build_bs_stack so the dashboard and the
+            // WAP portal read from the exact same live snapshot.
+            let mut dashboard = DashboardServer::with_state(args.config.clone(), dashboard_state.clone());
 
             // Propagate optional source_dir override for OTA updates.
             dashboard.set_source_dir(dash_cfg.source_dir.clone());

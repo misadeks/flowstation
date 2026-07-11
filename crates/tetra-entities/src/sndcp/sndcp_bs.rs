@@ -248,6 +248,11 @@ pub struct Sndcp {
     gateway_downlink_rx: Option<crossbeam_channel::Receiver<GatewayDownlink>>,
     /// Current TDMA time, recorded in `tick_start`.
     dltime: TdmaTime,
+    /// Live count of `contexts`, updated on every insert / remove. Cloned
+    /// out via [`Self::pdp_count_observer`] so external observers (the
+    /// built-in WAP portal in `bluestation-bs`) can display the count
+    /// without owning a reference to the entity.
+    pdp_count_observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Sndcp {
@@ -262,7 +267,24 @@ impl Sndcp {
             gateway_uplink_tx: None,
             gateway_downlink_rx: None,
             dltime: TdmaTime::default(),
+            pdp_count_observer: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Clone the shared `AtomicUsize` handle that tracks the live PDP-context
+    /// count. The value is updated on every `contexts.insert / remove` call
+    /// inside SNDCP; external observers (e.g. the built-in WAP portal) just
+    /// `.load(Relaxed)` it.
+    pub fn pdp_count_observer(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.pdp_count_observer)
+    }
+
+    /// Refresh the shared PDP counter to match the current context table.
+    /// Call from every mutation site.
+    #[inline]
+    fn refresh_pdp_count(&self) {
+        self.pdp_count_observer
+            .store(self.contexts.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// PD-9: install the pd-gateway bridge channels.  `bluestation-bs` calls
@@ -467,6 +489,7 @@ impl Sndcp {
         };
         self.ipv4_to_key.insert(ipv4, key);
         self.contexts.insert(key, ctx);
+        self.refresh_pdp_count();
 
         send_downlink(
             queue, main_address, ind.link_id, ind.endpoint_id,
@@ -512,6 +535,7 @@ impl Sndcp {
         self.ipv4_pool.free(ipv4);
         self.ipv4_to_key.remove(&ipv4);
         self.contexts.remove(&key);
+        self.refresh_pdp_count();
         tracing::info!("SNDCP: context {:?} NSAPI={nsapi} IPv4={ipv4} deactivated", main_address);
     }
 
@@ -532,6 +556,7 @@ impl Sndcp {
                 self.ipv4_pool.free(ipv4);
                 self.ipv4_to_key.remove(&ipv4);
                 self.contexts.remove(&key);
+                self.refresh_pdp_count();
                 tracing::info!(
                     "SNDCP: SwMI-initiated deactivation confirmed for {:?} NSAPI={nsapi}",
                     main_address
@@ -1258,6 +1283,7 @@ impl Sndcp {
             self.ipv4_to_key.remove(&ipv4);
             self.contexts.remove(&key);
         }
+        self.refresh_pdp_count();
     }
 
     // -- Helpers ---------------------------------------------------------------
