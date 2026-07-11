@@ -28,6 +28,7 @@ async fn run_serves_wsp_connect_and_shuts_down_on_cancel() {
         listen_addr: Ipv4Addr::LOCALHOST,
         listen_port: listen.port(),
         upstream_url: "http://127.0.0.1:8081".to_owned(),
+        portal: None,
     };
     let shutdown = CancellationToken::new();
 

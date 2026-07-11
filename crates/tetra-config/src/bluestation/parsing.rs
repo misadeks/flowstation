@@ -207,11 +207,20 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     }
 
-    // Optional wap_gateway section — reject unknown keys.
-    if let Some(ref wg) = root.wap_gateway
-        && !wg.extra.is_empty()
-    {
-        return Err(format!("Unrecognized fields in wap_gateway config: {:?}", sorted_keys(&wg.extra)).into());
+    // Optional wap_gateway section — reject unknown keys at both [wap_gateway] and [wap_gateway.portal] levels.
+    if let Some(ref wg) = root.wap_gateway {
+        if !wg.extra.is_empty() {
+            return Err(format!("Unrecognized fields in wap_gateway config: {:?}", sorted_keys(&wg.extra)).into());
+        }
+        if let Some(ref p) = wg.portal
+            && !p.extra.is_empty()
+        {
+            return Err(format!(
+                "Unrecognized fields in wap_gateway.portal config: {:?}",
+                sorted_keys(&p.extra)
+            )
+            .into());
+        }
     }
 
     // Build cell config, then inject the separately-parsed neighbor cells and sds_command_control

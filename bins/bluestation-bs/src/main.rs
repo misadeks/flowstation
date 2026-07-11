@@ -267,10 +267,32 @@ fn wire_pd_gateway(sndcp: &mut Sndcp, pd: &tetra_config::bluestation::CfgPacketD
 fn wire_wap_gateway(wg: &tetra_config::bluestation::CfgWapGateway) {
     let rt = shared_gateway_runtime();
 
+    // Optional built-in portal. When enabled we build a minimal
+    // `PortalDataSource` implementation right here. Wiring live radios /
+    // SDS state from `DashboardState` and PDP-context counts from `Sndcp`
+    // is a separate follow-up refactor (both are constructed later in
+    // `build_bs_stack` / `main`, and re-plumbing them for portal access
+    // is intentionally out of scope for the MVP branch).
+    let portal = if wg.portal.enabled {
+        let pcfg = wap_gateway::portal::PortalConfig {
+            path_prefix: wg.portal.path_prefix.clone(),
+            metar_icao: wg.portal.metar_icao.clone(),
+            metar_refresh_seconds: wg.portal.metar_refresh_seconds,
+            radios_max: wg.portal.radios_max,
+        };
+        Some(wap_gateway::PortalRunConfig {
+            config: pcfg,
+            data: std::sync::Arc::new(BluestationPortalData::new()),
+        })
+    } else {
+        None
+    };
+
     let run_cfg = wap_gateway::RunConfig {
         listen_addr: wg.listen_addr,
         listen_port: wg.listen_port,
         upstream_url: wg.upstream_url.clone(),
+        portal,
     };
 
     // Fire-and-forget: process shutdown drops the runtime which cancels the
@@ -284,9 +306,53 @@ fn wire_wap_gateway(wg: &tetra_config::bluestation::CfgWapGateway) {
     });
 
     eprintln!(
-        " -> WAP gateway enabled ({}:{}, upstream {})",
-        wg.listen_addr, wg.listen_port, wg.upstream_url
+        " -> WAP gateway enabled ({}:{}, upstream {}{})",
+        wg.listen_addr,
+        wg.listen_port,
+        wg.upstream_url,
+        if wg.portal.enabled {
+            format!(", portal {}", wg.portal.path_prefix)
+        } else {
+            String::new()
+        },
     );
+}
+
+/// Minimal `PortalDataSource` adapter used by the built-in WAP portal.
+///
+/// **MVP scope:** returns the FlowStation version + process uptime for the
+/// system page and an empty radios list. The prompt calls out full
+/// live-state wiring (via `DashboardState` and `Sndcp`) as a Phase 3
+/// deliverable; that requires re-plumbing dashboard construction to accept
+/// an externally-built `DashboardState`, which is intentionally deferred to
+/// a follow-up so the WSP + WMLC framework can be validated on hardware
+/// first.
+#[derive(Debug)]
+struct BluestationPortalData {
+    started_at: std::time::Instant,
+}
+
+impl BluestationPortalData {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl wap_gateway::portal::PortalDataSource for BluestationPortalData {
+    fn radios(&self, _max: usize) -> Vec<wap_gateway::portal::RadioSnapshot> {
+        Vec::new()
+    }
+
+    fn system(&self) -> wap_gateway::portal::SystemSnapshot {
+        wap_gateway::portal::SystemSnapshot {
+            uptime: self.started_at.elapsed(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            pdp_contexts: 0,
+            cell_load_pct: None,
+        }
+    }
 }
 
 /// Start base station stack
