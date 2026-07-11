@@ -241,6 +241,14 @@ pub struct AlLink {
     /// NOTE: spec ambiguous — chosen behaviour: unbounded queue for V1;
     /// cap and shed with warn in a later PR if we see memory pressure.
     pub pending_sdus: VecDeque<Vec<u8>>,
+
+    // ── PD-5c-H47: AL-SETUP-CON echo cache ────────────────────────────────────
+    /// Cached copy of the last accepted `AL-SETUP` echo, keyed to the
+    /// current negotiated parameters. When the peer sends a byte-identical
+    /// duplicate `AL-SETUP` (its `AL-SETUP-CON` was lost in DL air), we
+    /// re-emit this cached echo verbatim without re-running the accept
+    /// flow. Invalidated on every transition out of `Established`.
+    pub last_setup_echo: Option<AlSetup>,
 }
 
 impl AlLink {
@@ -277,6 +285,10 @@ impl AlLink {
         self.disc_retries = 0;
         self.pending_setup_pdu = None;
         self.pending_reconnect_pdu = None;
+        // PD-5c-H47: cached SETUP echo is tied to a live Established link.
+        // Any transfer-state reset means the negotiation is being replayed,
+        // so drop the cache.
+        self.last_setup_echo = None;
     }
 }
 
@@ -1509,6 +1521,47 @@ impl Llc {
             return;
         }
 
+        // PD-5c-H47: duplicate-SETUP fast path. When we've already accepted
+        // an AL-SETUP on this link and the peer's fresh proposal is
+        // byte-identical to what we accepted, its AL-SETUP-CON was almost
+        // certainly lost in DL air. Re-emit the cached echo verbatim so the
+        // peer sees the CON on the second try, without re-running the full
+        // accept flow (which would purge UMAC, reset RX/TX state, and reset
+        // phase — none of which is appropriate here because the link is
+        // still live). AlSetup derives PartialEq, so we compare what our
+        // echo *would* be for this incoming proposal to the cached echo:
+        // if the proposals match, the echoes match too.
+        let cache_setup_echo_enabled = {
+            let cfg = self.config.config();
+            cfg.llc.advanced_link.cache_setup_echo
+        };
+        if cache_setup_echo_enabled {
+            if let Some(link) = self.al_links.get(&key) {
+                if link.phase == AlPhase::Established
+                    && pdu.setup_report == SetupReport::Success
+                {
+                    if let Some(cached) = &link.last_setup_echo {
+                        let would_be_echo = Self::build_setup_echo(&pdu, SetupReport::Success);
+                        if &would_be_echo == cached {
+                            let msg = Self::make_al_sap_msg_setup(
+                                cached.clone(),
+                                carrier_num,
+                                main_address,
+                                key.link_id,
+                                key.endpoint_id,
+                            );
+                            queue.push_back(msg);
+                            tracing::info!(
+                                "AL link {:?} duplicate SETUP — re-echoed cached AL-SETUP-CON (H47)",
+                                key
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Validate the proposal.
         let supported = Self::is_setup_supported(&pdu);
         if !supported {
@@ -1603,6 +1656,7 @@ impl Llc {
             carrier_num,
             needs_deferred_ack: false,
             pending_sdus: VecDeque::new(),
+            last_setup_echo: None,
         });
         // Reset any transfer state carried over from a prior session on
         // this same link key.  On a freshly-inserted link this is a
@@ -1626,6 +1680,12 @@ impl Llc {
 
         // Echo back with Success.
         let echo = Self::build_setup_echo(&pdu, SetupReport::Success);
+        // PD-5c-H47: cache the echo so a duplicate AL-SETUP (peer's CON was
+        // lost in DL air) can be answered without re-running the accept
+        // flow. See the duplicate-detection block at the top of this fn.
+        if let Some(link) = self.al_links.get_mut(&key) {
+            link.last_setup_echo = Some(echo.clone());
+        }
         let msg = Self::make_al_sap_msg_setup(echo, carrier_num, main_address, key.link_id, key.endpoint_id);
         queue.push_back(msg);
     }
@@ -2151,6 +2211,7 @@ impl Llc {
                         carrier_num,
                         needs_deferred_ack: false,
                         pending_sdus: VecDeque::new(),
+                        last_setup_echo: None,
                     });
                 }
                 let msg = Self::make_al_sap_msg_reconnect(
@@ -2196,10 +2257,11 @@ impl Llc {
         let dltime = self.dltime;
         // Extract config-driven retry limits before the loop to avoid borrow conflicts
         // with the mutable borrow of self.al_links inside the loop.
-        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect) = {
+        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect, cfg_proactive_disc) = {
             let cfg = self.config.config();
             let al = &cfg.llc.advanced_link;
-            (al.max_setup_retries, al.max_disc_retries, al.max_reconnect_retries)
+            (al.max_setup_retries, al.max_disc_retries, al.max_reconnect_retries,
+             al.proactive_disc_on_retx_exhaust)
         };
         let mut msgs: Vec<SapMsg> = Vec::new();
         let mut links_to_set_idle: Vec<AlLinkKey> = Vec::new();
@@ -2207,6 +2269,9 @@ impl Llc {
         // PD-10c-H36: collect drop events for post-loop emission (can't call
         // &self.emit_delivery while self.al_links is mutably borrowed).
         let mut drops: Vec<(AlLinkKey, u8, AlDeliveryOutcome)> = Vec::new();
+        // PD-5c-H47: collect links that hit retx-exhaustion so we can emit
+        // AL-DISC + TmaPurgeByAddressReq after the al_links borrow ends.
+        let mut retx_exhausted_links: Vec<AlLinkKey> = Vec::new();
 
         for (key, link) in self.al_links.iter_mut() {
             // 0. T.272 — RNR receiver-not-ready expiry (must run before step 1 so that
@@ -2390,6 +2455,13 @@ impl Llc {
                                     key, sdu.n_s, sdu.retx_count, effective_max_retx
                                 );
                                 drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
+                                // PD-5c-H47: mark this link for proactive
+                                // AL-DISC + UMAC purge so the peer can tear
+                                // down its side immediately instead of
+                                // waiting for its own SDU-lifetime timer.
+                                if cfg_proactive_disc && !retx_exhausted_links.contains(key) {
+                                    retx_exhausted_links.push(*key);
+                                }
                             }
                             sdus_to_remove.push(sdu.n_s);
                             continue;
@@ -2402,6 +2474,9 @@ impl Llc {
                                 key, sdu.n_s
                             );
                             drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
+                            if cfg_proactive_disc && !retx_exhausted_links.contains(key) {
+                                retx_exhausted_links.push(*key);
+                            }
                             sdus_to_remove.push(sdu.n_s);
                             continue;
                         }
@@ -2628,6 +2703,45 @@ impl Llc {
         }
         for key in links_to_remove {
             self.al_links.remove(&key);
+        }
+
+        // PD-5c-H47: proactive AL-DISC + UMAC purge for links that hit
+        // retx-exhaustion. Emitted after `drops` are queued but before
+        // `emit_delivery` fires, so H36 subscribers still see the
+        // `DroppedRetxExhausted` event first when the drops loop runs
+        // below. Mirrors DIMETRA `dlai_cancel_pd_transmission_on_user_removal`
+        // (BRC @ 0x0021ad6c) — the same purge helper the H39 DISC path
+        // already targets — and matches the standard normal-teardown
+        // AlDiscCause used on every clean session end.
+        for key in retx_exhausted_links {
+            let (service, carrier_num, main_address) =
+                match self.al_links.get(&key) {
+                    Some(link) => (link.service, link.carrier_num, link.main_address),
+                    None => continue, // already gone (e.g. duplicate hit above)
+                };
+            let disc_pdu = AlDisc {
+                advanced_link_service: service,
+                advanced_link_number_n261: key.n261,
+                report: AlDiscCause::Success,
+            };
+            msgs.push(Self::make_al_sap_msg_disc(
+                disc_pdu,
+                carrier_num,
+                main_address,
+                key.link_id,
+                key.endpoint_id,
+            ));
+            msgs.push(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::TmaPurgeByAddressReq { issi: key.ssi },
+            });
+            self.al_links.remove(&key);
+            tracing::warn!(
+                "AL link {:?} retx-exhausted — emitted proactive AL-DISC(Success) + TmaPurgeByAddressReq (H47)",
+                key
+            );
         }
 
         let pending_to_send: Vec<(AlLinkKey, Vec<u8>)> = {

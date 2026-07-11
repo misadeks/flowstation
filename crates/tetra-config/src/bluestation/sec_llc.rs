@@ -61,6 +61,21 @@ pub struct CfgAdvancedLink {
     /// Maximum TL-SDU length (N.271) in octets.  Must be a spec-valid
     /// power-of-two: 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096.
     pub max_tl_sdu_octets: u16,
+
+    /// PD-5c-H47: when the AL retransmission budget is exhausted for a
+    /// downlink SDU, proactively emit an `AL-DISC(Success)` (plus a
+    /// `TmaPurgeByAddressReq` to UMAC) so the peer tears down its side
+    /// immediately instead of waiting for its own SDU-lifetime timer to
+    /// fire. Default `true`; flip to `false` at a site where this
+    /// interacts poorly with a non-standard MS stack.
+    pub proactive_disc_on_retx_exhaust: bool,
+
+    /// PD-5c-H47: cache the last accepted `AL-SETUP` echo per link and
+    /// re-emit it verbatim when the peer sends a byte-identical duplicate
+    /// `AL-SETUP` (i.e., the CON was lost in DL air). Skips the full
+    /// accept flow (purge + `reset_transfer_state`) on the duplicate.
+    /// Default `true`.
+    pub cache_setup_echo: bool,
 }
 
 impl Default for CfgAdvancedLink {
@@ -74,6 +89,8 @@ impl Default for CfgAdvancedLink {
             max_disc_retries: 3,
             max_reconnect_retries: 3,
             max_tl_sdu_octets: 4096,
+            proactive_disc_on_retx_exhaust: true,
+            cache_setup_echo: true,
         }
     }
 }
@@ -106,6 +123,10 @@ pub struct AdvancedLinkDto {
     pub max_reconnect_retries: u8,
     #[serde(default = "default_max_tl_sdu_octets")]
     pub max_tl_sdu_octets: u16,
+    #[serde(default = "default_proactive_disc_on_retx_exhaust")]
+    pub proactive_disc_on_retx_exhaust: bool,
+    #[serde(default = "default_cache_setup_echo")]
+    pub cache_setup_echo: bool,
 
     /// Unknown-field detector — parsing.rs rejects any entry present here.
     #[serde(flatten)]
@@ -123,6 +144,8 @@ impl Default for AdvancedLinkDto {
             max_disc_retries: default_max_disc_retries(),
             max_reconnect_retries: default_max_reconnect_retries(),
             max_tl_sdu_octets: default_max_tl_sdu_octets(),
+            proactive_disc_on_retx_exhaust: default_proactive_disc_on_retx_exhaust(),
+            cache_setup_echo: default_cache_setup_echo(),
             extra: HashMap::new(),
         }
     }
@@ -136,6 +159,8 @@ fn default_max_setup_retries() -> u8 { 3 }
 fn default_max_disc_retries() -> u8 { 3 }
 fn default_max_reconnect_retries() -> u8 { 3 }
 fn default_max_tl_sdu_octets() -> u16 { 4096 }
+fn default_proactive_disc_on_retx_exhaust() -> bool { true }
+fn default_cache_setup_echo() -> bool { true }
 
 /// Serde DTO for `[llc]`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -251,6 +276,8 @@ pub fn validate_advanced_link_config(dto: AdvancedLinkDto) -> Result<CfgAdvanced
         max_disc_retries: dto.max_disc_retries,
         max_reconnect_retries: dto.max_reconnect_retries,
         max_tl_sdu_octets: dto.max_tl_sdu_octets,
+        proactive_disc_on_retx_exhaust: dto.proactive_disc_on_retx_exhaust,
+        cache_setup_echo: dto.cache_setup_echo,
     })
 }
 
@@ -286,6 +313,9 @@ mod tests {
         assert_eq!(cfg.max_disc_retries, 3);
         assert_eq!(cfg.max_reconnect_retries, 3);
         assert_eq!(cfg.max_tl_sdu_octets, 4096);
+        // PD-5c-H47: both new AL reliability toggles default on.
+        assert!(cfg.proactive_disc_on_retx_exhaust);
+        assert!(cfg.cache_setup_echo);
     }
 
     #[test]
@@ -318,12 +348,17 @@ mod tests {
             max_disc_retries = 4
             max_reconnect_retries = 3
             max_tl_sdu_octets = 512
+            proactive_disc_on_retx_exhaust = false
+            cache_setup_echo = false
         "#;
         let dto: AdvancedLinkDto = toml::from_str(toml_str).expect("TOML must parse");
         let cfg = validate_advanced_link_config(dto).expect("must validate");
         assert_eq!(cfg.segment_payload_octets, 40);
         assert_eq!(cfg.tx_window, 2);
         assert_eq!(cfg.max_tl_sdu_octets, 512);
+        // PD-5c-H47: overrides plumb through.
+        assert!(!cfg.proactive_disc_on_retx_exhaust);
+        assert!(!cfg.cache_setup_echo);
     }
 
     #[test]

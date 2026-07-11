@@ -13,8 +13,18 @@ use tetra_core::frames;
 // after 1.7 s wait, triggering ~11 s of MS WTP-layer re-invocation retries
 // (page loads but slowly). Bumped to 90 frames (~5 s) to comfortably cover
 // large-SDU round-trip on single-slot PDCH.
+//
+// 2026-07-11 (H47): retuned back to 36 frames (~2.04 s) after the H17
+// tail-tracking fix (llc_bs_ms.rs:2231-2289) — the ACK-wait clock now only
+// opens *after* UMAC reports the tail on air, so the timer only has to cover
+// peer reassembly + AL-ACK round-trip (~200-400 ms typical, ~800 ms
+// worst-case). 5.1 s was leaving 3 retries stretched over ~15 s of wall
+// clock when air conditions clipped a single segment (MTP6550 field trace
+// 2026-07-11 16:27:07-16:27:17). 36 frames matches the ETSI TS 100 392-2
+// v3.7.1 Annex A.1 Table A.1 spec default of ~2 s while still being ~6×
+// the measured ACK RTT, so premature-retx risk is negligible.
 pub const T251_SENDER_RETRY_TIMER: u32 = frames!(4); // 4 signalling frames
-pub const T252_ACK_WAITING_TIMER: u32 = frames!(90);
+pub const T252_ACK_WAITING_TIMER: u32 = frames!(36);
 pub const T261_SETUP_WAITING_TIMER: u32 = frames!(4);
 pub const T263_DISCONNECT_WAITING_TIMER: u32 = frames!(4);
 pub const T265_RECONNECT_WAITING_TIMER: u32 = frames!(4);
