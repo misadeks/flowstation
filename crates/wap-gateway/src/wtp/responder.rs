@@ -43,10 +43,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::al_feedback::{AlDeliveryEvent, AlDeliveryOutcome, SharedAlPeerResolver};
 use crate::error::WapResult;
 use crate::wdp::Wdp;
 use crate::wtp::pdu::{HeaderFlags, TransactionClass, WtpPdu, abort_reason};
@@ -151,6 +152,20 @@ struct Transaction {
     retx_count: u8,
     /// Deadline at which we retransmit the Result (`Some` while awaiting Ack).
     retx_at: Option<Instant>,
+    /// PD-10c-H36: peer's TETRA ISSI resolved at Result-send time via
+    /// `AlPeerResolver`. `None` when no resolver was installed or the peer's
+    /// IPv4 didn't map to any live PDP context. Used by the AL feedback
+    /// subscriber to match LLC delivery events back to WTP transactions.
+    peer_issi: Option<u32>,
+    /// PD-10c-H36: instant the Result finished being handed to WDP. Used to
+    /// bound the correlation window (100 ms .. 15 s) — outside that window
+    /// we ignore AL delivery events for this txn.
+    result_sent_at: Option<Instant>,
+    /// PD-10c-H36: set to `true` once the subscriber observes an LLC
+    /// Delivered event that plausibly corresponds to our Result. Consumed
+    /// by the H33 replay gate in `on_invoke` to suppress duplicate replays
+    /// that would pile up on MS's AL RX window and cause link resets.
+    al_delivered: bool,
 }
 
 impl Transaction {
@@ -172,6 +187,14 @@ pub struct Responder {
     handler: Handler,
     cfg: ResponderConfig,
     txns: Arc<DashMap<TxnKey, TxnRef>>,
+    /// PD-10c-H36: peer resolver used to map WTP peers → TETRA ISSI at
+    /// Result-send time. `None` when AL feedback is disabled.
+    peer_resolver: Option<SharedAlPeerResolver>,
+    /// PD-10c-H36: broadcast receiver for LLC AL delivery events, wrapped
+    /// in `Arc<Mutex>` so the subscriber can be spawned from `run` while
+    /// the `Responder` itself stays `Clone`. Taken (`.take()`) exactly once
+    /// in `run`. `None` when AL feedback is disabled.
+    al_events_rx: Arc<Mutex<Option<broadcast::Receiver<AlDeliveryEvent>>>>,
 }
 
 impl Responder {
@@ -181,6 +204,27 @@ impl Responder {
             handler,
             cfg,
             txns: Arc::new(DashMap::new()),
+            peer_resolver: None,
+            al_events_rx: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// PD-10c-H36: enable AL delivery feedback. Called from
+    /// [`crate::run`] when [`crate::RunConfig::al_feedback`] is `Some`. After
+    /// this call, `run` will spawn a subscriber task that watches
+    /// `events` for LLC delivery outcomes and mutates transaction state
+    /// (clears pending retx, sets the `al_delivered` flag).
+    pub fn enable_al_feedback(
+        &mut self,
+        events: broadcast::Receiver<AlDeliveryEvent>,
+        resolver: SharedAlPeerResolver,
+    ) {
+        self.peer_resolver = Some(resolver);
+        // Store the receiver behind an Arc<Mutex> so `run` (which owns
+        // `self` by value but clones it for the sweeper) can hand ownership
+        // to the subscriber task.
+        if let Ok(mut slot) = self.al_events_rx.try_lock() {
+            *slot = Some(events);
         }
     }
 
@@ -190,9 +234,18 @@ impl Responder {
         // Spawn a background sweeper for idle transactions + retx.
         let sweeper = tokio::spawn(sweep_loop(self.clone()));
 
+        // PD-10c-H36: spawn the AL delivery subscriber if wiring is present.
+        let al_subscriber = {
+            let rx_opt = self.al_events_rx.lock().await.take();
+            rx_opt.map(|rx| tokio::spawn(al_feedback_loop(self.clone(), rx)))
+        };
+
         let result = self.recv_loop().await;
 
         sweeper.abort();
+        if let Some(h) = al_subscriber {
+            h.abort();
+        }
         result
     }
 
@@ -313,6 +366,36 @@ impl Responder {
         if let Some(existing) = self.txns.get(&key).map(|r| r.clone()) {
             let mut txn = existing.lock().await;
             if let Phase::ResultSent { segments } = &txn.phase {
+                // PD-10c-H36: if the LLC layer has already reported a
+                // Delivered event that plausibly matches our Result
+                // (peer_issi matched, within the correlation window), the
+                // MS's re-Invoke is almost certainly the WTP-layer racing
+                // ahead of its own AL-ACK — replaying now would enqueue a
+                // fresh AL SDU on top of one that's already been received,
+                // pile up MS's AL RX window (3 SDUs), and cause exactly
+                // the link-reset loop this whole feature is here to fix.
+                //
+                // Only suppress inside a short window after send — if too
+                // much time has passed the peer may have genuinely lost
+                // Result state and we should replay as a last resort.
+                const AL_SUPPRESS_WINDOW: Duration = Duration::from_secs(5);
+                if txn.al_delivered {
+                    let within_window = txn
+                        .result_sent_at
+                        .map(|t| t.elapsed() < AL_SUPPRESS_WINDOW)
+                        .unwrap_or(false);
+                    if within_window {
+                        txn.touch();
+                        info!(
+                            %peer,
+                            tid,
+                            elapsed_ms = txn.result_sent_at.map(|t| t.elapsed().as_millis()).unwrap_or(0),
+                            "H36: MS re-Invoke but LLC already acked our Result — suppressing replay"
+                        );
+                        return Ok(());
+                    }
+                }
+
                 let segments = segments.clone();
                 txn.touch();
                 drop(txn);
@@ -348,6 +431,9 @@ impl Responder {
                     last_activity: Instant::now(),
                     retx_count: 0,
                     retx_at: None,
+                    peer_issi: None,
+                    result_sent_at: None,
+                    al_delivered: false,
                 }))
             })
             .clone();
@@ -493,6 +579,17 @@ impl Responder {
         txn.phase = Phase::ResultSent { segments };
         txn.retx_count = 0;
         txn.retx_at = Some(Instant::now() + self.cfg.t_ack);
+        // PD-10c-H36: seed correlation fields for the AL delivery
+        // subscriber. Resolver lookup is best-effort — a missing entry
+        // (no active PDP for this IPv4) just leaves peer_issi=None and the
+        // subscriber will ignore this txn, falling back to today's
+        // retx/replay behaviour.
+        txn.peer_issi = self
+            .peer_resolver
+            .as_ref()
+            .and_then(|r| r.issi_for_peer(txn.peer));
+        txn.result_sent_at = Some(Instant::now());
+        txn.al_delivered = false;
     }
 
     async fn retransmit_result(&self, key: TxnKey) {
@@ -564,6 +661,107 @@ async fn sweep_loop(resp: Responder) {
         for key in to_evict {
             debug!(?key, "evicting idle transaction");
             resp.txns.remove(&key);
+        }
+    }
+}
+
+// ── PD-10c-H36 AL delivery feedback subscriber ───────────────────────────────
+
+/// Correlation window: LLC delivery events for a txn are only meaningful
+/// if the Result was sent recently. Below the lower bound we assume the
+/// event belongs to a *prior* transaction on the same ISSI (H25 eviction
+/// edges); above the upper bound the peer has probably moved on. Both
+/// bounds are conservative — the important thing is that the mid-band
+/// covers the typical AL RTT (a few hundred ms) plus MS jitter.
+const AL_CORR_MIN_ELAPSED: Duration = Duration::from_millis(100);
+const AL_CORR_MAX_ELAPSED: Duration = Duration::from_secs(15);
+
+async fn al_feedback_loop(resp: Responder, mut rx: broadcast::Receiver<AlDeliveryEvent>) {
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                resp.on_al_delivery(ev).await;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(dropped = n, "H36: AL feedback subscriber lagged; some events dropped (retx fallback still active)");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                debug!("H36: AL feedback channel closed; subscriber exiting");
+                return;
+            }
+        }
+    }
+}
+
+impl Responder {
+    /// PD-10c-H36: handle one LLC AL delivery event. Walks the transaction
+    /// table, finds `ResultSent` txns whose peer ISSI matches and whose
+    /// Result was sent inside the correlation window, and either cancels
+    /// the pending retx (`Delivered`) or logs at debug (`Dropped*`).
+    async fn on_al_delivery(&self, ev: AlDeliveryEvent) {
+        // Snapshot keys so we don't hold a DashMap iterator across awaits.
+        let keys: Vec<TxnKey> = self.txns.iter().map(|r| *r.key()).collect();
+        for key in keys {
+            let Some(txn_ref) = self.txns.get(&key).map(|r| r.clone()) else {
+                continue;
+            };
+            let mut txn = txn_ref.lock().await;
+            if !matches!(txn.phase, Phase::ResultSent { .. }) {
+                continue;
+            }
+            if txn.peer_issi != Some(ev.ssi) {
+                continue;
+            }
+            let elapsed = match txn.result_sent_at {
+                Some(t) => t.elapsed(),
+                None => continue,
+            };
+            if elapsed < AL_CORR_MIN_ELAPSED || elapsed > AL_CORR_MAX_ELAPSED {
+                continue;
+            }
+            match ev.outcome {
+                AlDeliveryOutcome::Delivered => {
+                    txn.al_delivered = true;
+                    if txn.retx_at.is_some() {
+                        txn.retx_at = None;
+                        info!(
+                            peer = %txn.peer,
+                            tid = txn.tid,
+                            ssi = ev.ssi,
+                            n_s = ev.n_s,
+                            elapsed_ms = elapsed.as_millis(),
+                            "H36: LLC AL-ACK observed — cancelling pending Result retx"
+                        );
+                    } else {
+                        debug!(
+                            peer = %txn.peer,
+                            tid = txn.tid,
+                            ssi = ev.ssi,
+                            n_s = ev.n_s,
+                            "H36: LLC AL-ACK observed (no pending retx to cancel)"
+                        );
+                    }
+                }
+                AlDeliveryOutcome::DroppedFireAndForget => {
+                    debug!(
+                        peer = %txn.peer,
+                        tid = txn.tid,
+                        ssi = ev.ssi,
+                        n_s = ev.n_s,
+                        "H36: LLC fire-and-forget drop (max_sdu_retx=0) — retx path stays live"
+                    );
+                }
+                AlDeliveryOutcome::DroppedRetxExhausted => {
+                    debug!(
+                        peer = %txn.peer,
+                        tid = txn.tid,
+                        ssi = ev.ssi,
+                        n_s = ev.n_s,
+                        "H36: LLC retx-exhausted drop — retx path stays live"
+                    );
+                }
+            }
         }
     }
 }
@@ -809,5 +1007,208 @@ mod tests {
             }
         }
         assert_eq!(result_body.expect("no Result received"), b"AAAABBBB");
+    }
+
+    // ── PD-10c-H36: AL delivery feedback + H33 suppression gate ──────────
+
+    /// Fake resolver that returns a fixed ISSI for every peer. Simulates
+    /// SNDCP having a live PDP context for the test client.
+    struct FixedResolver(u32);
+    impl crate::AlPeerResolver for FixedResolver {
+        fn issi_for_peer(&self, _peer: SocketAddr) -> Option<u32> {
+            Some(self.0)
+        }
+    }
+
+    /// Build a Responder with AL feedback enabled and return the send handle
+    /// so tests can inject delivery events. Runs the responder loop in a
+    /// tokio task on the given server socket.
+    async fn spawn_feedback_responder(
+        server_wdp: Wdp,
+        ssi: u32,
+        cfg: ResponderConfig,
+    ) -> broadcast::Sender<AlDeliveryEvent> {
+        let (tx, _rx_seed) = broadcast::channel::<AlDeliveryEvent>(32);
+        let handler = handler_fn(|_peer, req| async move {
+            let mut resp = b"echo:".to_vec();
+            resp.extend_from_slice(&req);
+            resp
+        });
+        let mut resp = Responder::new(server_wdp, handler, cfg);
+        resp.enable_al_feedback(tx.subscribe(), Arc::new(FixedResolver(ssi)));
+        tokio::spawn(async move {
+            let _ = resp.run().await;
+        });
+        tx
+    }
+
+    /// Drain one Result PDU from the client side, returning `(rcv_tid, bytes)`.
+    async fn recv_result(client_wdp: &Wdp) -> (u16, Vec<u8>) {
+        let (_peer, bytes) = tokio::time::timeout(Duration::from_secs(2), client_wdp.recv())
+            .await
+            .expect("recv timed out")
+            .unwrap();
+        let pdu = WtpPdu::decode(&bytes).unwrap();
+        match pdu {
+            WtpPdu::Result { tid, .. } => (tid, bytes),
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// PD-10c-H36 core: after the responder sends a Result and receives an
+    /// AL Delivered event for the peer, a subsequent MS re-Invoke on the
+    /// same TID must NOT trigger an H33 replay (the peer's LLC already
+    /// acked our downlink SDU; replaying would pile up MS's AL RX window).
+    #[tokio::test]
+    async fn h36_delivered_event_suppresses_h33_replay() {
+        let server_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let client_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let server_addr = server_wdp.local_addr();
+        let ssi = 1234567;
+
+        let tx = spawn_feedback_responder(server_wdp, ssi, ResponderConfig::default()).await;
+
+        // Send initial Invoke.
+        let invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: false },
+            tid: 0x0001,
+            version: 0,
+            tid_new: true,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"first".to_vec(),
+        };
+        client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
+
+        // Drain the Result.
+        let (_, _) = recv_result(&client_wdp).await;
+
+        // Wait past the 100 ms lower correlation bound before firing the
+        // Delivered event so the subscriber correlates it to our txn.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        tx.send(AlDeliveryEvent {
+            ssi,
+            link_id: 0,
+            endpoint_id: 0,
+            n261: 0,
+            n_s: 0,
+            outcome: AlDeliveryOutcome::Delivered,
+        }).unwrap();
+        // Give the subscriber task a moment to process.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Fire a re-Invoke on the same TID (as if MS's WTP retried). Under
+        // pre-H36 behaviour this would trigger an H33 replay. Under H36
+        // it must be suppressed.
+        let re_invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: true },
+            tid: 0x0001,
+            version: 0,
+            tid_new: false,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"first".to_vec(),
+        };
+        client_wdp.send(server_addr, &re_invoke.encode()).await.unwrap();
+
+        // No PDU must arrive in a short window.
+        let quiet = tokio::time::timeout(Duration::from_millis(400), client_wdp.recv()).await;
+        assert!(quiet.is_err(), "H36 must suppress the H33 replay, but a PDU arrived: {:?}", quiet);
+    }
+
+    /// Regression / fallback: with AL feedback enabled but NO Delivered
+    /// event fired, a re-Invoke must still trigger the H33 replay path.
+    /// This guarantees H36 is purely additive and doesn't break the
+    /// existing hardware-fix behaviour when the LLC hook never fires.
+    #[tokio::test]
+    async fn h36_no_delivered_event_still_replays_on_re_invoke() {
+        let server_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let client_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let server_addr = server_wdp.local_addr();
+
+        // Disable auto-retx so the only Result we see comes from the replay.
+        let mut cfg = ResponderConfig::default();
+        cfg.max_retx = 0;
+        cfg.t_ack = Duration::from_secs(60);
+        let _tx = spawn_feedback_responder(server_wdp, 999999, cfg).await;
+
+        let invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: false },
+            tid: 0x0002,
+            version: 0,
+            tid_new: true,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"orig".to_vec(),
+        };
+        client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
+        let _ = recv_result(&client_wdp).await;
+
+        // No Delivered event fired. Now re-Invoke.
+        let re_invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: true },
+            tid: 0x0002,
+            version: 0,
+            tid_new: false,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"orig".to_vec(),
+        };
+        client_wdp.send(server_addr, &re_invoke.encode()).await.unwrap();
+
+        // H33 replay must arrive.
+        let (tid, _bytes) = recv_result(&client_wdp).await;
+        assert_eq!(tid & 0x7FFF, 0x0002, "replayed Result must carry the same TID");
+    }
+
+    /// Delivered event with a non-matching ISSI must not mutate any txn.
+    #[tokio::test]
+    async fn h36_delivered_wrong_ssi_is_ignored() {
+        let server_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let client_wdp = Wdp::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await.unwrap();
+        let server_addr = server_wdp.local_addr();
+        let peer_ssi = 111;
+
+        let mut cfg = ResponderConfig::default();
+        cfg.max_retx = 0;
+        cfg.t_ack = Duration::from_secs(60);
+        let tx = spawn_feedback_responder(server_wdp, peer_ssi, cfg).await;
+
+        let invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: false },
+            tid: 0x0003,
+            version: 0,
+            tid_new: true,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"body".to_vec(),
+        };
+        client_wdp.send(server_addr, &invoke.encode()).await.unwrap();
+        let _ = recv_result(&client_wdp).await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Fire event for a DIFFERENT ssi.
+        tx.send(AlDeliveryEvent {
+            ssi: 999,
+            link_id: 0,
+            endpoint_id: 0,
+            n261: 0,
+            n_s: 0,
+            outcome: AlDeliveryOutcome::Delivered,
+        }).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Re-Invoke should still replay (H36 did not fire because ssi didn't match).
+        let re_invoke = WtpPdu::Invoke {
+            flags: HeaderFlags { gtr: false, ttr: true, rid: true },
+            tid: 0x0003,
+            version: 0,
+            tid_new: false,
+            user_ack: false,
+            class: TransactionClass::Class2,
+            payload: b"body".to_vec(),
+        };
+        client_wdp.send(server_addr, &re_invoke.encode()).await.unwrap();
+        let (_tid, _bytes) = recv_result(&client_wdp).await;
     }
 }

@@ -14,6 +14,7 @@ use tetra_saps::tla::{
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
+use crate::llc::al_events::{AlDeliveryEvent, AlDeliveryHook, AlDeliveryOutcome};
 use crate::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
 use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
@@ -313,6 +314,13 @@ pub struct Llc {
     /// AL-DATA / AL-FINAL PDU.  Default = 400 bits (suitable for a single MAC
     /// block minus header overhead).  AL-5 may make this configurable.
     pub al_segment_payload_bits: usize,
+
+    /// PD-10c-H36: optional sync callback fired on every AL SDU-level
+    /// delivery outcome (peer AL-ACK, fire-and-forget release, retx
+    /// exhaustion). Consumed by `wap-gateway` via a bridge in
+    /// `bluestation-bs` to suppress redundant WSP/WTP retransmissions.
+    /// `None` in isolated unit tests and when the wap-gateway is disabled.
+    delivery_hook: Option<AlDeliveryHook>,
 }
 
 impl Llc {
@@ -327,6 +335,28 @@ impl Llc {
             link_send_seq: HashMap::new(),
             al_links: HashMap::new(),
             al_segment_payload_bits: seg_payload_bits,
+            delivery_hook: None,
+        }
+    }
+
+    /// PD-10c-H36: install the [`AlDeliveryHook`]. Called once at wiring time
+    /// by `bluestation-bs`. Any previously installed hook is replaced.
+    pub fn set_delivery_hook(&mut self, hook: AlDeliveryHook) {
+        self.delivery_hook = Some(hook);
+    }
+
+    /// Fire the delivery hook if installed. Never panics; a hook that panics
+    /// would take down the entity thread, but that's on the hook implementer.
+    fn emit_delivery(&self, key: AlLinkKey, n_s: u8, outcome: AlDeliveryOutcome) {
+        if let Some(hook) = &self.delivery_hook {
+            hook(AlDeliveryEvent {
+                ssi: key.ssi,
+                link_id: key.link_id,
+                endpoint_id: key.endpoint_id,
+                n261: key.n261,
+                n_s,
+                outcome,
+            });
         }
     }
 
@@ -1867,46 +1897,64 @@ impl Llc {
     ///
     /// ETSI TS 100 392-2 v3.10.1 clause 21.4.5.
     fn on_al_ack_rnr(&mut self, _queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAckAlRnr) {
-        let Some(link) = self.al_links.get_mut(&key) else {
-            tracing::warn!("on_al_ack_rnr: link {:?} not found", key);
-            return;
+        // PD-10c-H36: two-scope split — the first block owns the mutable
+        // borrow on `self.al_links`; once it drops, the second block calls
+        // `self.emit_delivery` (which needs `&self` for the hook) without a
+        // borrow-checker conflict.
+        let delivered: Vec<u8> = {
+            let Some(link) = self.al_links.get_mut(&key) else {
+                tracing::warn!("on_al_ack_rnr: link {:?} not found", key);
+                return;
+            };
+            if link.phase != AlPhase::Established && link.phase != AlPhase::FlowControlled {
+                tracing::warn!(
+                    "on_al_ack_rnr: PDU in phase {:?} (expected Established/FlowControlled), dropping",
+                    link.phase
+                );
+                return;
+            }
+
+            if pdu.kind == AlAckAlRnrKind::Rnr {
+                link.phase = AlPhase::FlowControlled;
+                link.t_rnr_start = Some(self.dltime);
+                tracing::debug!("AL link {:?} entering FlowControlled (peer RNR)", key);
+            } else if link.phase == AlPhase::FlowControlled {
+                link.phase = AlPhase::Established;
+                link.t_rnr_start = None;
+                tracing::debug!("AL link {:?} leaving FlowControlled (ACK received)", key);
+            }
+
+            // Process all acknowledgement blocks.
+            let all_blocks =
+                std::iter::once(&pdu.first_block).chain(pdu.other_blocks.iter());
+
+            let mut delivered: Vec<u8> = Vec::new();
+            for block in all_blocks {
+                if let Some(n_s) = Self::process_ack_block(link, block) {
+                    delivered.push(n_s);
+                }
+            }
+            delivered
         };
-        if link.phase != AlPhase::Established && link.phase != AlPhase::FlowControlled {
-            tracing::warn!(
-                "on_al_ack_rnr: PDU in phase {:?} (expected Established/FlowControlled), dropping",
-                link.phase
-            );
-            return;
-        }
-
-        if pdu.kind == AlAckAlRnrKind::Rnr {
-            link.phase = AlPhase::FlowControlled;
-            link.t_rnr_start = Some(self.dltime);
-            tracing::debug!("AL link {:?} entering FlowControlled (peer RNR)", key);
-        } else if link.phase == AlPhase::FlowControlled {
-            link.phase = AlPhase::Established;
-            link.t_rnr_start = None;
-            tracing::debug!("AL link {:?} leaving FlowControlled (ACK received)", key);
-        }
-
-        // Process all acknowledgement blocks.
-        let all_blocks =
-            std::iter::once(&pdu.first_block).chain(pdu.other_blocks.iter());
-
-        for block in all_blocks {
-            Self::process_ack_block(link, block);
+        for n_s in delivered {
+            self.emit_delivery(key, n_s, AlDeliveryOutcome::Delivered);
         }
     }
 
     /// Apply one `AcknowledgementBlock` to the link's outstanding SDU window.
-    fn process_ack_block(link: &mut AlLink, block: &AcknowledgementBlock) {
+    ///
+    /// Returns `Some(n_s)` when this block fully acknowledged an outstanding
+    /// SDU (used by the caller to fire the H36 delivery hook).
+    fn process_ack_block(link: &mut AlLink, block: &AcknowledgementBlock) -> Option<u8> {
         let n_r = block.n_r;
 
         match block.ack_length {
             AckLength::EntireSduReceived => {
                 // Remove the matching SDU from the window.
+                let was_outstanding = link.outstanding_sdus.iter().any(|sdu| sdu.n_s == n_r);
                 link.outstanding_sdus.retain(|sdu| sdu.n_s != n_r);
                 tracing::debug!("AL N(S)={} fully acknowledged", n_r);
+                if was_outstanding { Some(n_r) } else { None }
             }
             AckLength::SduFcsFailure => {
                 // Peer reports FCS failure; schedule immediate retransmission.
@@ -1915,10 +1963,11 @@ impl Llc {
                     sdu.acked_segments.iter_mut().for_each(|a| *a = false);
                     tracing::debug!("AL N(S)={} FCS failure, scheduling retx", n_r);
                 }
+                None
             }
             AckLength::Segments(n) => {
                 let Some(sdu) = link.outstanding_sdus.iter_mut().find(|s| s.n_s == n_r) else {
-                    return;
+                    return None;
                 };
                 // All segments before S(R) are received.
                 let total = sdu.acked_segments.len();
@@ -1955,6 +2004,9 @@ impl Llc {
                     let ns = sdu.n_s;
                     link.outstanding_sdus.retain(|s| s.n_s != ns);
                     tracing::debug!("AL N(S)={} fully acknowledged (via segment bitmap)", ns);
+                    Some(ns)
+                } else {
+                    None
                 }
             }
         }
@@ -2078,6 +2130,9 @@ impl Llc {
         let mut msgs: Vec<SapMsg> = Vec::new();
         let mut links_to_set_idle: Vec<AlLinkKey> = Vec::new();
         let mut links_to_remove: Vec<AlLinkKey> = Vec::new();
+        // PD-10c-H36: collect drop events for post-loop emission (can't call
+        // &self.emit_delivery while self.al_links is mutably borrowed).
+        let mut drops: Vec<(AlLinkKey, u8, AlDeliveryOutcome)> = Vec::new();
 
         for (key, link) in self.al_links.iter_mut() {
             // 0. T.272 — RNR receiver-not-ready expiry (must run before step 1 so that
@@ -2192,11 +2247,13 @@ impl Llc {
                                     "AL link {:?} N(S)={} fire-and-forget SDU released (max_sdu_retx=0)",
                                     key, sdu.n_s
                                 );
+                                drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedFireAndForget));
                             } else {
                                 tracing::warn!(
                                     "AL link {:?} N(S)={} exhausted retransmissions, dropping SDU",
                                     key, sdu.n_s
                                 );
+                                drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
                             }
                             sdus_to_remove.push(sdu.n_s);
                             continue;
@@ -2208,6 +2265,7 @@ impl Llc {
                                 "AL link {:?} N(S)={} exceeded peer-requested retx cap (3), dropping",
                                 key, sdu.n_s
                             );
+                            drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
                             sdus_to_remove.push(sdu.n_s);
                             continue;
                         }
@@ -2465,6 +2523,11 @@ impl Llc {
         let had = !msgs.is_empty();
         for msg in msgs {
             queue.push_back(msg);
+        }
+        // PD-10c-H36: emit any drops now that the mutable borrow on
+        // self.al_links has ended.
+        for (key, n_s, outcome) in drops {
+            self.emit_delivery(key, n_s, outcome);
         }
         had
     }

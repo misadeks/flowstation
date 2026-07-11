@@ -1723,3 +1723,98 @@ fn al_tx_multifrag_retx_resets_last_segment_tx_at_h17() {
     assert_eq!(link.outstanding_sdus[0].retx_count, 1,
         "no second retx — clock did not restart until retx tail is Transmitted");
 }
+
+
+// ---- PD-10c-H36: AL delivery hook ------------------------------------------
+
+use std::sync::{Arc, Mutex};
+use tetra_entities::llc::al_events::{AlDeliveryEvent, AlDeliveryOutcome};
+
+/// PD-10c-H36: install the delivery hook; feeding an AL-ACK with
+/// EntireSduReceived must fire exactly one Delivered event with the acked
+/// N(S) and the link SSI.
+#[test]
+fn h36_delivery_hook_fires_on_entire_sdu_ack() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let events: Arc<Mutex<Vec<AlDeliveryEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    llc.set_delivery_hook(Arc::new(move |ev| sink.lock().unwrap().push(ev)));
+
+    establish_link(&mut llc, &mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"hook".to_vec()));
+    drain_queue(&mut queue);
+
+    let ack_pdu = AlAckAlRnr {
+        kind: AlAckAlRnrKind::Ack,
+        first_block: AcknowledgementBlock {
+            n_r: 0,
+            ack_length: AckLength::EntireSduReceived,
+            s_r: None,
+            ack_bitmap: None,
+        },
+        other_blocks: vec![],
+    };
+    let mut buf = BitBuffer::new_autoexpand(64);
+    ack_pdu.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_tma_ind(buf));
+
+    let got = events.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "exactly one delivery event expected, got {:?}", got);
+    let ev = &got[0];
+    assert_eq!(ev.outcome, AlDeliveryOutcome::Delivered);
+    assert_eq!(ev.n_s, 0);
+    assert_eq!(ev.ssi, SSI);
+    assert_eq!(ev.link_id, LINK_ID);
+    assert_eq!(ev.endpoint_id, ENDPOINT_ID);
+    assert_eq!(ev.n261, N261);
+}
+
+/// PD-10c-H36: fire-and-forget release (max_sdu_retx=0, T.252 expires
+/// with no ACK) must emit a DroppedFireAndForget event.
+#[test]
+fn h36_delivery_hook_fires_on_fire_and_forget_drop() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    let events: Arc<Mutex<Vec<AlDeliveryEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    llc.set_delivery_hook(Arc::new(move |ev| sink.lock().unwrap().push(ev)));
+
+    let t0 = establish_and_tx_one_sdu(&mut llc, &mut queue, 0, b"drop".to_vec());
+    let t_post = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t_post);
+
+    let got = events.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "exactly one drop event expected, got {:?}", got);
+    let ev = &got[0];
+    assert_eq!(ev.outcome, AlDeliveryOutcome::DroppedFireAndForget);
+    assert_eq!(ev.n_s, 0);
+    assert_eq!(ev.ssi, SSI);
+}
+
+/// PD-10c-H36: if no hook is installed, LLC must behave exactly as before.
+#[test]
+fn h36_ack_path_works_without_hook() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"nohook".to_vec()));
+    drain_queue(&mut queue);
+    let ack_pdu = AlAckAlRnr {
+        kind: AlAckAlRnrKind::Ack,
+        first_block: AcknowledgementBlock {
+            n_r: 0,
+            ack_length: AckLength::EntireSduReceived,
+            s_r: None,
+            ack_bitmap: None,
+        },
+        other_blocks: vec![],
+    };
+    let mut buf = BitBuffer::new_autoexpand(64);
+    ack_pdu.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_tma_ind(buf));
+    let link = llc.al_links.get(&test_key()).unwrap();
+    assert_eq!(link.outstanding_sdus.len(), 0);
+}

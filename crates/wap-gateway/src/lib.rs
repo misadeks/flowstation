@@ -40,6 +40,7 @@
 //! * [`wsp`]    — Wireless Session Protocol: capability + header codec, session FSM.
 //! * [`error`]  — `WapError` / `WapResult`.
 
+pub mod al_feedback;
 pub mod error;
 pub mod portal;
 pub mod wdp;
@@ -49,7 +50,9 @@ pub mod wtp;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+pub use al_feedback::{AlDeliveryEvent, AlDeliveryOutcome, AlPeerResolver, SharedAlPeerResolver};
 pub use error::{WapError, WapResult};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -76,6 +79,40 @@ pub struct RunConfig {
     /// path matches [`PortalConfig::path_prefix`] are served locally from
     /// [`portal::pages`] instead of proxied.
     pub portal: Option<PortalRunConfig>,
+    /// PD-10c-H36: optional AL delivery feedback wiring. When *both*
+    /// [`al_feedback`] and [`peer_resolver`] are supplied, the WTP
+    /// responder spawns an extra subscriber task that watches for LLC
+    /// AL-ACK / drop events and suppresses redundant Result retransmits
+    /// on WSP transactions whose peer's most recent downlink SDU was
+    /// already delivered. Both `None` (the default) keeps behaviour
+    /// identical to PD-10c-H35.
+    pub al_feedback: Option<AlFeedbackWiring>,
+}
+
+/// PD-10c-H36 wiring bundle. Held separately so `RunConfig` stays `Clone`
+/// (broadcast receivers are not `Clone` — we hand out one receiver per
+/// `run` invocation).
+pub struct AlFeedbackWiring {
+    pub sender: broadcast::Sender<AlDeliveryEvent>,
+    pub peer_resolver: SharedAlPeerResolver,
+}
+
+impl std::fmt::Debug for AlFeedbackWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlFeedbackWiring")
+            .field("sender_receiver_count", &self.sender.receiver_count())
+            .field("peer_resolver", &"<dyn AlPeerResolver>")
+            .finish()
+    }
+}
+
+impl Clone for AlFeedbackWiring {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            peer_resolver: Arc::clone(&self.peer_resolver),
+        }
+    }
 }
 
 /// Runtime portal wiring, passed alongside [`RunConfig`].
@@ -131,7 +168,10 @@ pub async fn run(cfg: RunConfig, shutdown: CancellationToken) -> WapResult<()> {
             async move { wsp.handle(peer, payload).await }
         })
     };
-    let responder = Responder::new(wdp, handler, ResponderConfig::default());
+    let mut responder = Responder::new(wdp, handler, ResponderConfig::default());
+    if let Some(wiring) = cfg.al_feedback {
+        responder.enable_al_feedback(wiring.sender.subscribe(), wiring.peer_resolver);
+    }
 
     tokio::select! {
         res = responder.run() => res,

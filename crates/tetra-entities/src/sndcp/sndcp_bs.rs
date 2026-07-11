@@ -253,6 +253,14 @@ pub struct Sndcp {
     /// built-in WAP portal in `bluestation-bs`) can display the count
     /// without owning a reference to the entity.
     pdp_count_observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// PD-10c-H36: shared IPv4 → SSI reverse-lookup snapshot for external
+    /// consumers (`wap-gateway`'s AL-ACK correlator, which sees peers as
+    /// `SocketAddr` and needs the ISSI to match against LLC delivery
+    /// events). Updated in lock-step with `ipv4_to_key` on every context
+    /// activate / deactivate. Read-heavy from the wap-gateway subscriber
+    /// task; write-light (a couple of times per PDP session lifecycle) —
+    /// a plain `RwLock<HashMap>` is more than fast enough.
+    issi_observer: std::sync::Arc<std::sync::RwLock<HashMap<Ipv4Addr, u32>>>,
 }
 
 impl Sndcp {
@@ -268,15 +276,21 @@ impl Sndcp {
             gateway_downlink_rx: None,
             dltime: TdmaTime::default(),
             pdp_count_observer: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            issi_observer: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
-    /// Clone the shared `AtomicUsize` handle that tracks the live PDP-context
-    /// count. The value is updated on every `contexts.insert / remove` call
-    /// inside SNDCP; external observers (e.g. the built-in WAP portal) just
-    /// `.load(Relaxed)` it.
+    /// Clone the shared PDP counter handle (see field docs).
     pub fn pdp_count_observer(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         std::sync::Arc::clone(&self.pdp_count_observer)
+    }
+
+    /// PD-10c-H36: clone the shared IPv4 → SSI reverse-lookup handle.
+    /// Consumed by `bluestation-bs` to implement `wap_gateway::AlPeerResolver`.
+    pub fn issi_observer(
+        &self,
+    ) -> std::sync::Arc<std::sync::RwLock<HashMap<Ipv4Addr, u32>>> {
+        std::sync::Arc::clone(&self.issi_observer)
     }
 
     /// Refresh the shared PDP counter to match the current context table.
@@ -488,6 +502,10 @@ impl Sndcp {
             al_link: None,
         };
         self.ipv4_to_key.insert(ipv4, key);
+        // PD-10c-H36: publish IPv4 → SSI for external correlators.
+        if let Ok(mut m) = self.issi_observer.write() {
+            m.insert(ipv4, key.ssi);
+        }
         self.contexts.insert(key, ctx);
         self.refresh_pdp_count();
 
@@ -534,6 +552,7 @@ impl Sndcp {
 
         self.ipv4_pool.free(ipv4);
         self.ipv4_to_key.remove(&ipv4);
+        if let Ok(mut m) = self.issi_observer.write() { m.remove(&ipv4); }
         self.contexts.remove(&key);
         self.refresh_pdp_count();
         tracing::info!("SNDCP: context {:?} NSAPI={nsapi} IPv4={ipv4} deactivated", main_address);
@@ -555,6 +574,7 @@ impl Sndcp {
                 let ipv4 = ctx.ipv4;
                 self.ipv4_pool.free(ipv4);
                 self.ipv4_to_key.remove(&ipv4);
+                if let Ok(mut m) = self.issi_observer.write() { m.remove(&ipv4); }
                 self.contexts.remove(&key);
                 self.refresh_pdp_count();
                 tracing::info!(
@@ -1281,6 +1301,7 @@ impl Sndcp {
         for (key, ipv4) in to_remove {
             self.ipv4_pool.free(ipv4);
             self.ipv4_to_key.remove(&ipv4);
+            if let Ok(mut m) = self.issi_observer.write() { m.remove(&ipv4); }
             self.contexts.remove(&key);
         }
         self.refresh_pdp_count();

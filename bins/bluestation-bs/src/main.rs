@@ -29,7 +29,10 @@ use tetra_entities::net_telemetry::{
 use tetra_entities::network::transports::websocket::{WebSocketTransport, WebSocketTransportConfig};
 use tetra_entities::{
     cmce::cmce_bs::CmceBs,
-    llc::llc_bs_ms::Llc,
+    llc::{
+        al_events::{AlDeliveryEvent as LlcAlDeliveryEvent, AlDeliveryOutcome as LlcAlDeliveryOutcome},
+        llc_bs_ms::Llc,
+    },
     lmac::lmac_bs::LmacBs,
     mle::mle_bs::MleBs,
     mm::mm_bs::MmBs,
@@ -268,6 +271,7 @@ fn wire_wap_gateway(
     wg: &tetra_config::bluestation::CfgWapGateway,
     dashboard_state: tetra_entities::net_dashboard::DashboardState,
     pdp_count_observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    al_feedback: Option<wap_gateway::AlFeedbackWiring>,
 ) {
     let rt = shared_gateway_runtime();
 
@@ -295,6 +299,7 @@ fn wire_wap_gateway(
         listen_port: wg.listen_port,
         upstream_url: wg.upstream_url.clone(),
         portal,
+        al_feedback,
     };
 
     // Fire-and-forget: process shutdown drops the runtime which cancels the
@@ -344,6 +349,26 @@ impl BluestationPortalData {
             dashboard_state,
             pdp_count_observer,
         }
+    }
+}
+
+/// PD-10c-H36: implements [`wap_gateway::AlPeerResolver`] over the SNDCP
+/// snapshot. The map is populated by SNDCP on PDP-context activate and
+/// cleared on deactivate — a plain `RwLock<HashMap>` because the write
+/// rate is bound to physical PDP lifecycles (rare) while the read rate is
+/// per-Result-send (also low; contended reads still complete in µs).
+#[derive(Debug)]
+struct BluestationAlPeerResolver {
+    issi_map: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<std::net::Ipv4Addr, u32>>>,
+}
+
+impl wap_gateway::AlPeerResolver for BluestationAlPeerResolver {
+    fn issi_for_peer(&self, peer: std::net::SocketAddr) -> Option<u32> {
+        let ipv4 = match peer.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => return None,
+        };
+        self.issi_map.read().ok().and_then(|m| m.get(&ipv4).copied())
     }
 }
 
@@ -475,7 +500,7 @@ fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> BsStackHandles {
     // Add remaining components
     let lmac = LmacBs::new(cfg.clone());
     let umac = UmacBs::new(cfg.clone(), tsink.clone());
-    let llc = Llc::new(cfg.clone());
+    let mut llc = Llc::new(cfg.clone());
     let mle = MleBs::new(cfg.clone());
     let mut mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
     let mut sndcp = Sndcp::new(cfg.clone());
@@ -483,6 +508,9 @@ fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> BsStackHandles {
     // router; this lets external observers (e.g. the WAP portal) read the
     // live count without needing a reference to the entity itself.
     let pdp_count_observer = sndcp.pdp_count_observer();
+    // PD-10c-H36: same pattern for the IPv4 → SSI reverse map used by the
+    // wap-gateway AL-ACK correlator.
+    let issi_observer = sndcp.issi_observer();
 
     // Build the shared dashboard state up-front so anything that runs before
     // the dashboard HTTP server (currently the WAP portal) can share the
@@ -503,7 +531,42 @@ fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> BsStackHandles {
     // when [wap_gateway].enabled = true. Bind failures are logged as warnings
     // so the stack still comes up (the gateway can be diagnosed via journalctl).
     if cfg.config().wap_gateway.enabled {
-        wire_wap_gateway(&cfg.config().wap_gateway, dashboard_state.clone(), pdp_count_observer);
+        // PD-10c-H36: build the AL delivery feedback bridge. LLC emits sync
+        // AlDeliveryEvents through the installed hook; we translate them
+        // into wap_gateway::AlDeliveryEvent (mirror struct — wap-gateway
+        // has no tetra-entities dep) and publish on a broadcast channel.
+        // The wap-gateway responder subscribes and correlates via the ISSI
+        // resolver built over the SNDCP snapshot.
+        let (al_tx, _al_rx_seed) = tokio::sync::broadcast::channel::<wap_gateway::AlDeliveryEvent>(256);
+        let al_tx_hook = al_tx.clone();
+        llc.set_delivery_hook(std::sync::Arc::new(move |ev: LlcAlDeliveryEvent| {
+            let outcome = match ev.outcome {
+                LlcAlDeliveryOutcome::Delivered => wap_gateway::AlDeliveryOutcome::Delivered,
+                LlcAlDeliveryOutcome::DroppedFireAndForget => {
+                    wap_gateway::AlDeliveryOutcome::DroppedFireAndForget
+                }
+                LlcAlDeliveryOutcome::DroppedRetxExhausted => {
+                    wap_gateway::AlDeliveryOutcome::DroppedRetxExhausted
+                }
+            };
+            let _ = al_tx_hook.send(wap_gateway::AlDeliveryEvent {
+                ssi: ev.ssi,
+                link_id: ev.link_id,
+                endpoint_id: ev.endpoint_id,
+                n261: ev.n261,
+                n_s: ev.n_s,
+                outcome,
+            });
+        }));
+        let resolver: wap_gateway::SharedAlPeerResolver =
+            std::sync::Arc::new(BluestationAlPeerResolver { issi_map: issi_observer });
+        let wiring = wap_gateway::AlFeedbackWiring { sender: al_tx, peer_resolver: resolver };
+        wire_wap_gateway(
+            &cfg.config().wap_gateway,
+            dashboard_state.clone(),
+            pdp_count_observer,
+            Some(wiring),
+        );
     }
     let mut cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
     // Wire the built-in WX/METAR service's reply channel: its background fetch threads
