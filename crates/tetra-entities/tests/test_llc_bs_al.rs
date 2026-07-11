@@ -237,8 +237,83 @@ fn al_disc_from_peer_removes_link() {
     // Link must be removed.
     assert!(!llc.al_links.contains_key(&test_key()), "link should be removed after DISC");
 
-    // One outgoing AL-DISC reply.
-    assert_eq!(msgs.len(), 1);
+    // PD-5c-H39: DISC now emits a TmaPurgeByAddressReq to UMAC BEFORE the
+    // outgoing AL-DISC reply, so we expect two messages: the purge (Llc→Umac
+    // Control) and the DISC echo (TmaUnitdataReq).
+    assert_eq!(msgs.len(), 2, "expected purge + DISC reply, got {:?}", msgs);
+    match &msgs[0].msg {
+        SapMsgInner::TmaPurgeByAddressReq { issi } => {
+            assert_eq!(*issi, SSI, "purge must carry the peer ISSI");
+        }
+        other => panic!("expected TmaPurgeByAddressReq first, got {:?}", other),
+    }
+    assert!(matches!(msgs[1].msg, SapMsgInner::TmaUnitdataReq(_)));
+}
+
+/// PD-5c-H39: AL-DISC that confirms our own DISC (we_initiated path) must
+/// also purge queued DL PDUs for the peer.
+#[test]
+fn al_disc_confirming_our_disc_emits_purge() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+
+    // Establish link, then flip it into DisconnectPending as if we had
+    // sent our own AL-DISC.
+    establish_link(&mut llc, &mut queue);
+    let link = llc.al_links.get_mut(&test_key()).expect("link");
+    link.phase = AlPhase::DisconnectPending;
+    drain_queue(&mut queue);
+
+    // Peer confirms with its own AL-DISC.
+    let disc = AlDisc {
+        advanced_link_service: AdvancedLinkService::Ack,
+        advanced_link_number_n261: N261,
+        report: AlDiscCause::Success,
+    };
+    let mut buf = BitBuffer::new_autoexpand(16);
+    disc.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_tma_ind(buf));
+    let msgs = drain_queue(&mut queue);
+
+    // Link removed.
+    assert!(!llc.al_links.contains_key(&test_key()));
+
+    // Only message: the purge SapMsg (no DISC echo on the we_initiated path).
+    assert_eq!(msgs.len(), 1, "expected purge only, got {:?}", msgs);
+    match &msgs[0].msg {
+        SapMsgInner::TmaPurgeByAddressReq { issi } => {
+            assert_eq!(*issi, SSI);
+        }
+        other => panic!("expected TmaPurgeByAddressReq, got {:?}", other),
+    }
+}
+
+/// PD-5c-H39: stray DISC for an unknown link must not emit a purge.
+#[test]
+fn al_disc_without_established_link_no_purge() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+
+    // No SETUP first; send a DISC out of the blue.
+    let disc = AlDisc {
+        advanced_link_service: AdvancedLinkService::Ack,
+        advanced_link_number_n261: N261,
+        report: AlDiscCause::Success,
+    };
+    let mut buf = BitBuffer::new_autoexpand(16);
+    disc.to_bitbuf(&mut buf);
+    buf.seek(0);
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_tma_ind(buf));
+    let msgs = drain_queue(&mut queue);
+
+    // No purge — nothing to purge. The peer-initiated branch still emits a
+    // DISC echo (protocol robustness), so exactly one TmaUnitdataReq.
+    assert_eq!(msgs.len(), 1, "expected only DISC echo, got {:?}", msgs);
+    assert!(
+        !matches!(msgs[0].msg, SapMsgInner::TmaPurgeByAddressReq { .. }),
+        "unknown-link DISC must not emit purge"
+    );
     assert!(matches!(msgs[0].msg, SapMsgInner::TmaUnitdataReq(_)));
 }
 

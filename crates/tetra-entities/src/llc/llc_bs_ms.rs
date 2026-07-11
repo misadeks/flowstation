@@ -1638,6 +1638,37 @@ impl Llc {
         main_address: TetraAddress,
         pdu: AlDisc,
     ) {
+        // PD-5c-H39: mirror the H38 purge on the DISC teardown path.
+        //
+        // Motorola BRC fires `dlai_cancel_pd_transmission_on_user_removal`
+        // (@ 0x0021ad6c) when the user record for an AL peer is torn down.
+        // Even though the SETUP-side purge (H38) covers the "DISC → new
+        // SETUP" reconnect race, the DISC handler still needs to purge any
+        // DL PDUs already queued in UMAC for this peer: an MS that DISCs
+        // without ever re-SETUPping (e.g. it powered off, roamed, or
+        // switched to voice) would otherwise leak stale MAC-RESOURCE /
+        // grant PDUs onto the air until UMAC drains them. Emitting the
+        // purge from DISC as well matches the "SETUP + DISC both purge"
+        // pattern in the DIMETRA firmware and closes the audit P0-1 gap.
+        //
+        // Guardrail: emit the purge BEFORE removing the link entry so the
+        // ISSI is still resolvable from `key.ssi`, and only when a link
+        // entry actually exists — stray DISCs for unknown peers do not
+        // deserve a purge (nothing to purge).
+        let link_exists = self.al_links.contains_key(&key);
+        if link_exists {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::TmaPurgeByAddressReq { issi: key.ssi },
+            });
+            tracing::debug!(
+                "AL link {:?} torn down: queued TmaPurgeByAddressReq(issi={}) to UMAC",
+                key, key.ssi
+            );
+        }
+
         // Check if this is a confirming reply to our own AL-DISC.
         let we_initiated = matches!(
             self.al_links.get(&key),
