@@ -142,6 +142,27 @@ pub enum SapMsgInner {
         issi: u32,
         nsapi: u8,
     },
+
+    /// LLC → UMAC: purge any queued DL TMA / PDCH PDUs addressed to `issi`.
+    ///
+    /// PD-5c-H38 (2026-07-11): emitted by LLC when it accepts a re-establishing
+    /// AL-SETUP from a peer that already had an Established/FlowControlled AL
+    /// link. Mirrors DIMETRA BRC firmware behaviour
+    /// (`dlai_cancel_pd_transmission_on_setup_req` →
+    /// `dlai_remove_tma_requests_by_address` +
+    /// `_clean_pd_user_dl_tx_state_if_needed` +
+    /// `rm_cancel_transmission_conditional`): on AL-SETUP re-accept, cancel
+    /// any packet-data DL transmission queued for that peer so no stale
+    /// segments carrying pre-setup N(S) values leak onto the air after the
+    /// peer has already reset its AL RX window.
+    ///
+    /// UMAC drains any matching entries from its `pdch_dl_queue` and from the
+    /// per-timeslot signalling `dltx_queues` of every carrier scheduler. Safe
+    /// to send on first-time setup — the queues are empty then and it becomes
+    /// a no-op.
+    TmaPurgeByAddressReq {
+        issi: u32,
+    },
 }
 
 impl Display for SapMsgInner {
@@ -226,6 +247,9 @@ impl Display for SapMsgInner {
             // SapMsgInner::TlbTlSysinfoInd(_) => write!(f, "TlbTlSysinfoInd"),
             SapMsgInner::PdchReleaseReq { issi, nsapi } => {
                 write!(f, "PdchReleaseReq(issi={}, nsapi={})", issi, nsapi)
+            }
+            SapMsgInner::TmaPurgeByAddressReq { issi } => {
+                write!(f, "TmaPurgeByAddressReq(issi={})", issi)
             }
         }
     }

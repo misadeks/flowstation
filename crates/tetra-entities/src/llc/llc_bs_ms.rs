@@ -1470,6 +1470,38 @@ impl Llc {
         };
         let max_tl_sdu_octets = pdu.max_tl_sdu_length_n271.octets();
 
+        // PD-5c-H38: detect whether this AL-SETUP re-establishes an existing
+        // AL link (any live phase — Established, FlowControlled, RnrReceived,
+        // or a lingering SetupPending / DisconnectPending). If so, purge any
+        // DL PDUs still queued in UMAC for this peer BEFORE we send the
+        // AL-SETUP echo. The peer's fresh AL RX window would drop stale
+        // pre-setup N(S) segments AND wedge on them, so it never ACKs the
+        // subsequent fresh N(S)=0 SDU — the exact 20-25 s
+        // AL-SETUP/menu-result loop observed on the MTP6550 hardware log
+        // 2026-07-11 12:51:57–12:52:46.
+        //
+        // Mirrors DIMETRA BRC firmware
+        // `dlai_cancel_pd_transmission_on_setup_req` (in rlj_app @ 0x0021ae18):
+        //   dlai_remove_tma_requests_by_address(issi)
+        //   _clean_pd_user_dl_tx_state_if_needed(issi)
+        //   rm_cancel_transmission_conditional(...)
+        //
+        // Safe on the first-time-setup path (link entry absent) — the guard
+        // below skips the message so first-time behaviour is unchanged.
+        let is_re_setup = self.al_links.contains_key(&key);
+        if is_re_setup {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::TmaPurgeByAddressReq { issi: key.ssi },
+            });
+            tracing::debug!(
+                "AL link {:?} re-setup: queued TmaPurgeByAddressReq(issi={}) to UMAC",
+                key, key.ssi
+            );
+        }
+
         // Accept: create or update the link.
         let link = self.al_links.entry(key).or_insert_with(|| AlLink {
             key,

@@ -354,6 +354,40 @@ impl BsChannelScheduler {
         self.ulsched = EMPTY_SCHED;
     }
 
+    /// Remove queued DL signalling elements addressed to a specific ISSI from
+    /// every timeslot's `dltx_queues` and from the deferred `dltx_next_slot_queue`.
+    ///
+    /// PD-5c-H38: called when LLC accepts a re-establishing AL-SETUP so any
+    /// in-flight AL-DATA segments from the prior session are dropped before
+    /// they can be broadcast to a peer whose AL RX window has just reset.
+    /// Broadcasts, RandomAccessAcks for other addresses, stealing blocks and
+    /// bare FragBufs are left in place; only MAC-RESOURCE PDUs and grants
+    /// whose address matches `issi` are removed.
+    pub fn purge_dl_for_ssi(&mut self, issi: u32) -> usize {
+        let mut removed = 0usize;
+        let matches_ssi = |elem: &DlSchedElem| -> bool {
+            match elem {
+                DlSchedElem::RandomAccessAck(addr) => addr.ssi == issi,
+                DlSchedElem::Grant(addr, _, _) => addr.ssi == issi,
+                DlSchedElem::Resource(res, _, _) => {
+                    matches!(res.addr, Some(a) if a.ssi == issi)
+                }
+                // Broadcast/FragBuf/Stealing carry no per-SSI addressing at
+                // this layer, so they're not eligible for targeted purge.
+                _ => false,
+            }
+        };
+        for q in self.dltx_queues.iter_mut() {
+            let before = q.len();
+            q.retain(|e| !matches_ssi(e));
+            removed += before - q.len();
+        }
+        let before = self.dltx_next_slot_queue.len();
+        self.dltx_next_slot_queue.retain(|e| !matches_ssi(e));
+        removed += before - self.dltx_next_slot_queue.len();
+        removed
+    }
+
     /// Sets the current downlink time to the given TdmaTime
     /// Wipes the schedule, as it can no longer be guaranteed to be valid
     pub fn set_dl_time(&mut self, new_ts: TdmaTime) {
@@ -2675,6 +2709,46 @@ mod tests {
             1,
             "PDCH data must be queued on TS4"
         );
+    }
+
+    /// PD-5c-H38: `purge_dl_for_ssi` must drop queued Resource/Grant PDUs
+    /// addressed to the target ISSI without touching entries for other
+    /// addresses.
+    #[test]
+    fn purge_dl_for_ssi_drops_only_matching_entries() {
+        let mut sched = get_testing_slotter();
+
+        let victim = TetraAddress { ssi: 5001, ssi_type: SsiType::Issi };
+        let bystander = TetraAddress { ssi: 5002, ssi_type: SsiType::Issi };
+
+        // Queue two Resource PDUs on TS4: one for the victim, one for a
+        // bystander. Both would sit in `dltx_queues[3]`.
+        let victim_pdu = BsChannelScheduler::dl_make_minimal_resource(&victim, None, false);
+        let bystander_pdu = BsChannelScheduler::dl_make_minimal_resource(&bystander, None, false);
+        sched.dl_enqueue_tma_for_link(4, victim_pdu, BitBuffer::new(64), None);
+        sched.dl_enqueue_tma_for_link(4, bystander_pdu, BitBuffer::new(64), None);
+        assert_eq!(sched.dltx_queues[3].len(), 2, "pre-condition: both PDUs queued");
+
+        // Purge everything for the victim.
+        let removed = sched.purge_dl_for_ssi(victim.ssi);
+        assert_eq!(removed, 1, "should have removed exactly the victim's PDU");
+        assert_eq!(
+            sched.dltx_queues[3].len(),
+            1,
+            "bystander's PDU must remain in the TS4 queue"
+        );
+    }
+
+    /// PD-5c-H38: purging with no queued PDUs must be a no-op (safe on
+    /// first-time AL-SETUP where no state exists yet).
+    #[test]
+    fn purge_dl_for_ssi_is_noop_when_queues_empty() {
+        let mut sched = get_testing_slotter();
+        let removed = sched.purge_dl_for_ssi(9999);
+        assert_eq!(removed, 0, "empty queues must remove nothing");
+        for (i, q) in sched.dltx_queues.iter().enumerate() {
+            assert_eq!(q.len(), 0, "TS{} must still be empty", i + 1);
+        }
     }
 
     // ------------------------------------------------------------------

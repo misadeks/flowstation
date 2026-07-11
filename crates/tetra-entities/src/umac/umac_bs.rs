@@ -1734,6 +1734,42 @@ impl UmacBs {
         }
     }
 
+    /// Handle `TmaPurgeByAddressReq` from LLC (PD-5c-H38).
+    ///
+    /// LLC emits this when it accepts a re-establishing AL-SETUP so any
+    /// in-flight DL PDUs addressed to that peer are removed before they can
+    /// be broadcast to a peer whose AL RX has just reset. Mirrors DIMETRA
+    /// BRC `dlai_cancel_pd_transmission_on_setup_req` →
+    /// `dlai_remove_tma_requests_by_address` semantics.
+    ///
+    /// Drains matching entries from the PDCH DL queue and from every carrier
+    /// scheduler's per-timeslot dltx queues. Gated on `packet_data_enabled`
+    /// because AL re-setup only happens on packet-data-carrying MS; keeping
+    /// the guard also mirrors the DIMETRA gate (BRC only runs this path when
+    /// its own PD state machine is active).
+    fn handle_tma_purge_by_address_req(&mut self, issi: u32) {
+        if !self.packet_data_enabled {
+            return;
+        }
+        let pdch_before = self.pdch_dl_queue.len();
+        self.pdch_dl_queue.retain(|(q_issi, _)| *q_issi != issi);
+        let pdch_removed = pdch_before - self.pdch_dl_queue.len();
+
+        let mut sig_removed = self.channel_scheduler.purge_dl_for_ssi(issi);
+        for sched in self.secondary_channel_schedulers.iter_mut() {
+            sig_removed += sched.purge_dl_for_ssi(issi);
+        }
+
+        if pdch_removed > 0 || sig_removed > 0 {
+            tracing::info!(
+                "UMAC: TmaPurgeByAddressReq issi={} → dropped {} signalling PDU(s), {} PDCH PDU(s)",
+                issi, sig_removed, pdch_removed
+            );
+        } else {
+            tracing::debug!("UMAC: TmaPurgeByAddressReq issi={} → nothing queued to drop", issi);
+        }
+    }
+
     /// Handle a `TmaUnitdataReq` with `packet_data_flag = true` (PDCH path).
     ///
     /// PD-5c-H2 (this crate): the primary PDCH grant is piggybacked on the
@@ -2376,6 +2412,11 @@ impl TetraEntityTrait for UmacBs {
                 // ── PD-5: PdchReleaseReq (gated) ────────────────────────────
                 if let SapMsgInner::PdchReleaseReq { issi, nsapi } = message.msg {
                     self.handle_pdch_release_req(issi, nsapi);
+                    return;
+                }
+                // ── PD-5c-H38: TmaPurgeByAddressReq (gated) ────────────────
+                if let SapMsgInner::TmaPurgeByAddressReq { issi } = message.msg {
+                    self.handle_tma_purge_by_address_req(issi);
                     return;
                 }
                 self.rx_control(queue, message);
