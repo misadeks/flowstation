@@ -1338,15 +1338,46 @@ impl TetraEntityTrait for Sndcp {
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        let SapMsgInner::LtpdMleUnitdataInd(ref ind) = message.msg else {
-            tracing::debug!(
-                "SNDCP: unhandled prim (sap={:?}): {:?}", message.sap, message.msg
-            );
-            return;
-        };
-        // Clone to avoid holding a reference across mutable `on_uplink_pdu` dispatch.
-        let ind = ind.clone();
-        self.on_uplink_pdu(queue, &ind);
+        // PD-REWRITE C3: formal TLA-SAP primitives from LLC. SNDCP-owns-the-
+        // decision logic lands in Commits 4b/4c; for C3 these are stub arms
+        // that log at DEBUG so their arrival is observable without changing
+        // behavior. The parallel `al_events` hook path continues to drive
+        // WTP suppression (H36) until Commit 5 retires it.
+        match &message.msg {
+            SapMsgInner::LtpdMleUnitdataInd(ind) => {
+                let ind = ind.clone();
+                self.on_uplink_pdu(queue, &ind);
+            }
+            SapMsgInner::TlaTlEstablishInd(e) => {
+                tracing::debug!(
+                    ssi = e.main_address.ssi, n261 = e.n261,
+                    "SNDCP C3 stub: TlaTlEstablishInd (SNDCP wiring in C4c)"
+                );
+            }
+            SapMsgInner::TlaTlReconnectInd(e) => {
+                tracing::debug!(
+                    ssi = e.main_address.ssi, n261 = e.n261,
+                    "SNDCP C3 stub: TlaTlReconnectInd (SNDCP wiring in C4c)"
+                );
+            }
+            SapMsgInner::TlaTlReleaseInd(e) => {
+                tracing::debug!(
+                    ssi = e.main_address.ssi, n261 = e.n261, cause = ?e.cause,
+                    "SNDCP C3 stub: TlaTlReleaseInd (SNDCP wiring in C4c)"
+                );
+            }
+            SapMsgInner::TlaTlReportOutcomeInd(e) => {
+                tracing::debug!(
+                    ssi = e.main_address.ssi, n_s = e.n_s, outcome = ?e.outcome,
+                    "SNDCP C3 stub: TlaTlReportOutcomeInd (SNDCP decision logic in C4b)"
+                );
+            }
+            _ => {
+                tracing::debug!(
+                    "SNDCP: unhandled prim (sap={:?}): {:?}", message.sap, message.msg
+                );
+            }
+        }
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {

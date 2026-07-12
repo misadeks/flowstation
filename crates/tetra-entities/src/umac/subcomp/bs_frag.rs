@@ -58,6 +58,31 @@ impl BsFragger {
         let total_len_bits = hdr_len_bits + sdu_len_bits + num_fill_bits;
         let total_len_bytes = total_len_bits / 8;
 
+        // PD-REWRITE C2: ETSI TS 100 392-2 §21.4.3.1 caps a MAC-RESOURCE block
+        // at 2848 bits. Physical slot capacity is much smaller for
+        // π/4-DQPSK/D8PSK (~432 bits) so this cap is effectively unreachable
+        // on those channels, but we defend against it explicitly for QAM
+        // channel modes and for defense-in-depth against upstream bugs that
+        // might feed us an oversized PDU. Emit a WARN with the observed size
+        // vs the cap so operators can catch spurious rejections in prod (per
+        // Phase 3 design §5 risk mitigation).
+        const MAC_RESOURCE_MAX_BITS: usize = 2848;
+        if total_len_bits > MAC_RESOURCE_MAX_BITS {
+            tracing::warn!(
+                target: "pd_rewrite_c2",
+                total_bits = total_len_bits,
+                hdr_bits = hdr_len_bits,
+                sdu_bits = sdu_len_bits,
+                fill_bits = num_fill_bits,
+                max_bits = MAC_RESOURCE_MAX_BITS,
+                spec = "ETSI TS 100 392-2 §21.4.3.1",
+                "MAC-RESOURCE gate: block exceeds spec max; dropping (mark as consumed)"
+            );
+            self.is_fully_transmitted = true;
+            self.mac_hdr_is_written = true;
+            return true;
+        }
+
         // Check if we can fit all in a single MAC-RESOURCE
         if total_len_bits <= slot_cap_bits {
             // Fits in one MAC-RESOURCE
@@ -497,5 +522,43 @@ mod tests {
         assert_eq!(reporter.get_state(), TxState::Discarded);
         assert!(reporter.is_in_final_state());
         assert!(!reporter.is_transmitted());
+    }
+
+    // ── PD-REWRITE C2 tests ────────────────────────────────────────────────
+
+    /// C2: MAC-RESOURCE block that would exceed 2848 bits is dropped by the
+    /// spec gate; the fragger reports the SDU as fully-consumed (dropped
+    /// rather than fragmented) and a WARN log with the observed size is
+    /// emitted at target `pd_rewrite_c2` so operators can catch spurious
+    /// fires in prod.
+    ///
+    /// NOTE on the "at exactly 2848 bits" boundary: parent's ideal test would
+    /// cover both directions (at 2848 = pass, at 2849 = rejected). While
+    /// writing this test I discovered that flowstation's current
+    /// `MacResource::length_ind` field can't correctly serialize a block near
+    /// 2848 bits — the length indication truncates before we ever reach the
+    /// 2848 boundary. That's a pre-existing limitation orthogonal to the
+    /// 2848 gate; a proper "at boundary" test would first require length_ind
+    /// encoding to support the full spec range (out of Commit 2a scope).
+    /// The over-2848 direction is what actually matters for the gate — it's
+    /// the direction that would emit a spec-violating block on air, and this
+    /// test pins it.
+    #[test]
+    fn c2_mac_resource_over_2848_bits_is_rejected() {
+        debug::setup_logging_verbose();
+        let pdu = get_default_resource();
+        let hdr_bits = pdu.compute_header_len();
+        // Force total_len_bits > 2848 by using an SDU of exactly (2848 - hdr + 8) bits.
+        let sdu_bits = 2848 - hdr_bits + 8;
+        let sdu = BitBuffer::new(sdu_bits);
+        let mut mac_block = BitBuffer::new(4096);
+        let start_pos = mac_block.get_len_written();
+        let mut fragger = BsFragger::new(pdu, sdu, None);
+        let done = fragger.get_next_chunk(&mut mac_block);
+        assert!(done, "C2 T1b: over-2848 block must be reported as consumed (dropped)");
+        assert_eq!(
+            mac_block.get_len_written(), start_pos,
+            "C2 T1b: no bytes should have been written to the mac_block (block was rejected)"
+        );
     }
 }

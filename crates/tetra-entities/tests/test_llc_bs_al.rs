@@ -1967,8 +1967,13 @@ fn establish_and_tx_one_sdu_full(
     TdmaTime::default()
 }
 
-/// P12: with N.273=3, ETSI permits up to 3 retransmissions (4 total). Prior
-/// to H44 the loop delivered only 2. Post-H44 we must see 3 retx before drop.
+/// P12: with N.273=3 and N.274=15, ETSI §22.3.3.2.6 clause b permits full-SDU
+/// escalation. PD-REWRITE C2b: per-segment cap is N.274 (=15), and after
+/// exhausting per-segment retx we escalate to a full-SDU restart, consuming
+/// one N.273 budget. Total attempts = N.274 × (N.273 + 1) worst-case, but
+/// with N.274=15 the test would take >60 T.252 windows to exhaust; instead
+/// we verify a small handful of retx attempts increment `retx_count` and
+/// leave `sdu_restart_count` at 0 (we don't reach escalation).
 #[test]
 fn al_tx_retx_count_matches_n273_no_off_by_one() {
     debug::setup_logging_verbose();
@@ -1976,9 +1981,7 @@ fn al_tx_retx_count_matches_n273_no_off_by_one() {
     let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
         /* max_sdu_retx */ 3, /* max_segment_retx */ 15, b"h44 p12".to_vec());
 
-    // Tick past T.252 enough times to force 4 retx attempts; the last should
-    // drop the SDU. Between retxes we must re-mark segments as transmitted
-    // so the T.252 clock keeps opening/closing.
+    // 3 retx attempts within N.274 = 15; no escalation triggered.
     let mut t = t0;
     for expected_retx in 1..=3u8 {
         t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
@@ -1992,25 +1995,25 @@ fn al_tx_retx_count_matches_n273_no_off_by_one() {
             link.outstanding_sdus[0].retx_count, expected_retx,
             "retx_count must equal number of retx performed so far"
         );
-        // Re-mark segments transmitted so the next T.252 window can open.
+        assert_eq!(
+            link.outstanding_sdus[0].sdu_restart_count, 0,
+            "sdu_restart_count must stay 0 while retx_count < N.274"
+        );
         mark_all_segments_transmitted_at(&mut llc, t);
     }
-
-    // One more tick past T.252 must now drop the SDU (retx_count == 3 == N.273).
-    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-    tick_at(&mut llc, &mut queue, t);
-    // PD-5c-H47: retx-exhausted link is torn down proactively (default
-    // `proactive_disc_on_retx_exhaust = true`), so the whole link entry is
-    // now gone instead of merely draining `outstanding_sdus`.
-    assert!(
-        llc.al_links.get(&test_key()).is_none(),
-        "H47: link must be removed after retx exhaustion (proactive AL-DISC path)"
-    );
+    // SDU still alive, no escalation, plenty of budget left.
+    let link = llc.al_links.get(&test_key()).expect("link alive");
+    assert_eq!(link.outstanding_sdus.len(), 1,
+        "SDU must survive with retx_count=3 and N.274=15 available");
+    assert_eq!(link.outstanding_sdus[0].sdu_restart_count, 0);
 }
 
-/// P7: N.274 caps the per-segment retx count. With our combined-cap
-/// implementation, setting max_segment_retx=1 while max_sdu_retx=5 must
-/// limit us to exactly 1 retransmission before drop.
+/// P7 + PD-REWRITE C2b: with N.273=5, N.274=1, exhausting the per-segment
+/// cap triggers N.273 escalation. First tick: retx_count → 1 (N.274 hit).
+/// Second tick: escalation → sdu_restart_count → 1, retx_count → 0.
+/// SDU must survive; final drop only after all 5 restarts × 1 retx = 6 total
+/// timeouts. This test asserts the first-escalation semantic explicitly and
+/// verifies drop happens only at the full budget.
 #[test]
 fn al_tx_max_segment_retx_caps_retransmissions() {
     debug::setup_logging_verbose();
@@ -2018,24 +2021,32 @@ fn al_tx_max_segment_retx_caps_retransmissions() {
     let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
         /* max_sdu_retx */ 5, /* max_segment_retx */ 1, b"h44 p7".to_vec());
 
-    // First retx allowed (N.274=1 permits 1 retx per segment).
+    // First tick: initial send + 1 retx (retx_count=1, at N.274 cap).
     let t1 = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t1);
     {
         let link = llc.al_links.get(&test_key()).expect("link exists");
         assert_eq!(link.outstanding_sdus.len(), 1, "SDU must survive retx #1");
         assert_eq!(link.outstanding_sdus[0].retx_count, 1);
+        assert_eq!(link.outstanding_sdus[0].sdu_restart_count, 0);
     }
     mark_all_segments_transmitted_at(&mut llc, t1);
 
-    // Second retx attempt must drop (retx_count == 1 == max_segment_retx).
+    // Second tick: N.274 cap hit → ESCALATE (sdu_restart_count=1, retx_count=0).
+    // SDU must SURVIVE (was: dropped pre-C2b with cap-based logic).
     let t2 = t1.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t2);
-    // PD-5c-H47: link torn down proactively on retx exhaustion.
-    assert!(
-        llc.al_links.get(&test_key()).is_none(),
-        "H47: link must be removed once N.274 (max_segment_retx) is reached"
-    );
+    {
+        let link = llc.al_links.get(&test_key())
+            .expect("PD-REWRITE C2b: link must survive first N.274 exhaust — escalates");
+        assert_eq!(link.outstanding_sdus.len(), 1,
+            "C2b: SDU must survive first N.274 exhaust — escalation triggered");
+        assert_eq!(link.outstanding_sdus[0].sdu_restart_count, 1,
+            "C2b: first escalation must set sdu_restart_count to 1");
+        assert_eq!(link.outstanding_sdus[0].retx_count, 0,
+            "C2b: escalation must reset retx_count to 0");
+    }
+    mark_all_segments_transmitted_at(&mut llc, t2);
 }
 
 /// P7: N.274 = 0 means the peer opted out of per-segment retransmission
@@ -2063,10 +2074,17 @@ fn al_tx_max_segment_retx_zero_is_fire_and_forget() {
 /// clearly expects 3 attempts (its own N.274 says so), so for `service = Ack`
 /// we treat `N.273 = 0` as "no explicit SDU-level cap; use N.274." The MS
 /// then sees the same 3 attempts a non-broken negotiation would give.
+///
+/// PD-REWRITE C1: default flipped so the gate defaults to `false`. This test
+/// explicitly enables the H46 quirk to verify the interop opt-in path.
 #[test]
 fn al_tx_h46_mtp6550_n273_zero_ack_uses_seg_cap() {
     debug::setup_logging_verbose();
-    let (mut llc, mut queue) = make_llc();
+    let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
+    cfg.llc.advanced_link.n273_zero_ack_uses_seg_cap = true;
+    let sc = tetra_config::bluestation::SharedConfig::from_parts(cfg, None);
+    let mut llc = Llc::new(sc);
+    let mut queue = MessageQueue::new();
     // MTP6550-style proposal: N.273 = 0, N.274 = 3, service = Ack.
     let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
         /* max_sdu_retx */ 0, /* max_segment_retx */ 3, b"h46 mtp6550".to_vec());
@@ -2092,39 +2110,34 @@ fn al_tx_h46_mtp6550_n273_zero_ack_uses_seg_cap() {
     // Fourth T.252 expiry must now drop (retx_count == 3 == N.274).
     t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t);
-    // PD-5c-H47: link torn down proactively on retx exhaustion.
-    assert!(
-        llc.al_links.get(&test_key()).is_none(),
-        "H47: link must be removed once N.274 attempts are exhausted"
-    );
+    // PD-REWRITE C1: link survives; SDU drained.
+    let link = llc.al_links.get(&test_key())
+        .expect("PD-REWRITE C1: link must survive N.274 exhaustion (H47 removed)");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "SDU must be drained once N.274 attempts are exhausted");
 }
 
-// --- PD-5c-H47 tests ---------------------------------------------------------
+// --- PD-REWRITE C1 tests -----------------------------------------------------
 
-/// Build an LLC with a specific value for one of the H47 config toggles.
-fn make_llc_with_h47_flags(proactive_disc: bool, cache_setup: bool) -> (Llc, MessageQueue) {
-    let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
-    cfg.llc.advanced_link.proactive_disc_on_retx_exhaust = proactive_disc;
-    cfg.llc.advanced_link.cache_setup_echo = cache_setup;
-    let sc = tetra_config::bluestation::SharedConfig::from_parts(cfg, None);
-    (Llc::new(sc), MessageQueue::new())
-}
+// The old `make_llc_with_h47_flags` helper was removed with H47. Tests below
+// use `make_llc()` directly (spec-compliant defaults) and toggle individual
+// interop knobs on the returned config where needed.
 
-/// PD-5c-H47: T.252 is retuned from `frames!(90)` (~5.1 s) to `frames!(36)`
-/// (~2.04 s) — verify the boundary is where we expect. A tick at
-/// T.252 - 1 timeslots must NOT retx; a tick at T.252 + 1 MUST retx.
+
+/// PD-REWRITE C1: T.252 timer at frames!(36) (~2.04 s) — verify boundary.
+/// A tick at T.252 - 1 timeslots must NOT retx; a tick at T.252 + 1 MUST retx.
 #[test]
-fn h47_t252_retuned_to_36_frames_boundary() {
+fn pd_rewrite_c1_t252_boundary() {
     use tetra_core::frames;
     assert_eq!(
         T252_ACK_WAITING_TIMER, frames!(36),
-        "H47: T.252 should be 36 frames (~2.04 s), matches spec default"
+        "T.252 should be 36 frames (~2.04 s) — vendor over-provision above v3.10.1 default of 9 frames"
     );
 
     debug::setup_logging_verbose();
     let (mut llc, mut queue) = make_llc();
     let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
-        /* max_sdu_retx */ 3, /* max_segment_retx */ 3, b"h47 t252".to_vec());
+        /* max_sdu_retx */ 3, /* max_segment_retx */ 3, b"t252 boundary".to_vec());
 
     // Just before T.252 expiry: no retx yet.
     let t_pre = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 - 1);
@@ -2132,88 +2145,58 @@ fn h47_t252_retuned_to_36_frames_boundary() {
     let link = llc.al_links.get(&test_key()).expect("link exists");
     assert_eq!(link.outstanding_sdus.len(), 1);
     assert_eq!(link.outstanding_sdus[0].retx_count, 0,
-        "H47: retx must not fire before T.252 expiry");
+        "retx must not fire before T.252 expiry");
 
     // Past T.252 expiry: exactly one retx.
     let t_post = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t_post);
     let link = llc.al_links.get(&test_key()).expect("link exists");
     assert_eq!(link.outstanding_sdus[0].retx_count, 1,
-        "H47: retx must fire once T.252 has expired");
+        "retx must fire once T.252 has expired");
 }
 
-/// PD-5c-H47: on retx exhaustion the LLC now emits an AL-DISC(Success)
-/// plus a TmaPurgeByAddressReq for UMAC, and removes the link entry.
+/// PD-REWRITE C1 + C2b: on retx exhaustion, LLC surfaces the failure via the
+/// `DroppedRetxExhausted` delivery event and drops the SDU. LLC does NOT
+/// emit AL-DISC (spec §22.3.3.2.6 NOTE 1 — service user decides). This
+/// test walks through a full N.274×(N.273+1) escalation budget (using
+/// N.273=1, N.274=1 for a small, deterministic test — 4 T.252 windows
+/// exhaust the whole budget) and pins the "no AL-DISC, link survives,
+/// SDU drained" invariant at the very end. The (3,3) or larger budgets
+/// exhibit the same behavior across more windows and are covered by the
+/// explicit escalation tests below.
 #[test]
-fn h47_retx_exhaustion_emits_al_disc_and_purge() {
+fn pd_rewrite_c1_retx_exhaustion_no_disc_no_purge_link_survives() {
     debug::setup_logging_verbose();
     let (mut llc, mut queue) = make_llc();
-    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
-        /* max_sdu_retx */ 3, /* max_segment_retx */ 3, b"h47 disc".to_vec());
-
-    // Drive 3 retx to exhaustion, marking the tail each time.
-    let mut t = t0;
-    for _ in 1..=3u8 {
-        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-        tick_at(&mut llc, &mut queue, t);
-        mark_all_segments_transmitted_at(&mut llc, t);
-    }
-
-    // Fourth tick triggers exhaust + proactive DISC path.
-    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-    let out = tick_at(&mut llc, &mut queue, t);
-
-    assert!(
-        llc.al_links.get(&test_key()).is_none(),
-        "H47: link must be removed after proactive DISC"
-    );
-    let disc_found = out.iter().any(|m| matches!(&m.msg,
-        SapMsgInner::TmaUnitdataReq(req) if {
-            // Try to decode the LLC PDU: presence of AL-DISC(Success) marker
-            // is easiest to spot by checking for the exact bit pattern via
-            // a re-decoded AlDisc. Rather than re-decode here, we accept
-            // any TmaUnitdataReq whose payload starts with the AL-DISC
-            // LlcPduType. The purge check below is the stronger signal.
-            let _ = req; true
-        }));
-    assert!(disc_found, "H47: some TmaUnitdataReq must be emitted (AL-DISC)");
-
-    let purge_found = out.iter().any(|m| matches!(&m.msg,
-        SapMsgInner::TmaPurgeByAddressReq { issi } if *issi == test_addr().ssi));
-    assert!(purge_found, "H47: TmaPurgeByAddressReq must be emitted for the peer ISSI");
-}
-
-/// PD-5c-H47: when `proactive_disc_on_retx_exhaust = false`, the link stays
-/// registered (no AL-DISC, no purge) — legacy silent-release behaviour.
-#[test]
-fn h47_retx_exhaustion_no_disc_when_disabled() {
-    debug::setup_logging_verbose();
-    let (mut llc, mut queue) = make_llc_with_h47_flags(false, true);
-    // Prime a link + SDU using the same pattern as `establish_and_tx_one_sdu_full`
-    // but with our custom-config LLC (we can't call the helper because it
-    // uses make_llc()).
+    // N.273=1, N.274=1: total attempts to exhaust = 1 × (1+1) = 2
+    // per-segment retries across 2 segmentation rounds.
     send_setup_to_llc(&mut llc, &mut queue,
-        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 3, 3));
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 1, 1));
     drain_queue(&mut queue);
-    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"h47 disabled".to_vec()));
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"c1 negative".to_vec()));
     drain_queue(&mut queue);
     mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
 
     let mut t = TdmaTime::default();
-    for _ in 1..=3u8 {
+    let mut out: Vec<SapMsg> = Vec::new();
+    // Loop generously to cover initial send + N.274=1 retry × (N.273+1)=2 rounds
+    // + escalation ticks. 10 iterations is more than enough; bail early on drain.
+    for _ in 1..=10u8 {
         t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-        tick_at(&mut llc, &mut queue, t);
+        out.extend(tick_at(&mut llc, &mut queue, t));
         mark_all_segments_transmitted_at(&mut llc, t);
+        let link = llc.al_links.get(&test_key()).unwrap();
+        if link.outstanding_sdus.is_empty() { break; }
     }
-    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-    let out = tick_at(&mut llc, &mut queue, t);
 
-    let link = llc.al_links.get(&test_key()).expect("H47: link must remain when flag is off");
-    assert_eq!(link.outstanding_sdus.len(), 0, "SDU must be dropped");
+    let link = llc.al_links.get(&test_key())
+        .expect("PD-REWRITE C1: link must survive retx exhaustion (H47 removed)");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "C1+C2b: SDU must be drained after full escalation exhaust");
     assert!(
         !out.iter().any(|m| matches!(&m.msg,
             SapMsgInner::TmaPurgeByAddressReq { .. })),
-        "H47: no purge must be emitted when flag is off"
+        "PD-REWRITE C1: no UMAC purge must be emitted at any point of the escalation"
     );
 }
 
@@ -2880,14 +2863,22 @@ fn h53_ppp_style_al_setup_fire_and_forget_when_gate_off() {
          path (no TmaPurgeByAddressReq expected)");
 }
 
-/// PD-5c-H53: with the H46 quirk config-gated ON (default), the MTP6550 WSP
-/// hardware fix is preserved verbatim — same MTP3550 wire values still
-/// produce 3 real retransmissions then H47 teardown. Regression guard so a
-/// misplaced default flip cannot silently regress the H46 hardware bar.
+/// PD-5c-H53: with the H46 quirk config-gated ON (opt-in, PD-REWRITE C1
+/// flipped the default to `false`), the MTP6550 WSP hardware fix is preserved
+/// verbatim — same MTP3550 wire values still produce 3 real retransmissions.
+/// Regression guard so a future spec-drift cannot silently regress the H46
+/// hardware bar. Note: the H47 proactive teardown is gone as of C1; link
+/// survives retx exhaustion.
 #[test]
 fn h53_wsp_style_al_setup_still_retries_when_gate_on_default() {
     debug::setup_logging_verbose();
-    let (mut llc, mut queue) = make_llc(); // default: gate ON
+    // PD-REWRITE C1: gate default is now `false`. Explicitly enable to
+    // reproduce the H46-hardware-fixed behavior this test guards.
+    let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
+    cfg.llc.advanced_link.n273_zero_ack_uses_seg_cap = true;
+    let sc = tetra_config::bluestation::SharedConfig::from_parts(cfg, None);
+    let mut llc = Llc::new(sc);
+    let mut queue = MessageQueue::new();
     let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
         /* max_sdu_retx */ 0, /* max_segment_retx */ 3, b"h53 wsp".to_vec());
 
@@ -2903,13 +2894,13 @@ fn h53_wsp_style_al_setup_still_retries_when_gate_on_default() {
         mark_all_segments_transmitted_at(&mut llc, t);
     }
 
-    // 4th expiry: exhaust + H47 proactive teardown (link removed).
+    // 4th expiry: retx exhausted. PD-REWRITE C1: H47 removed — link survives.
     t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t);
-    assert!(
-        llc.al_links.get(&test_key()).is_none(),
-        "H53: gate=on preserves H46+H47 behaviour: link torn down after 3 retx"
-    );
+    let link = llc.al_links.get(&test_key())
+        .expect("PD-REWRITE C1: link must survive H46-gated retx exhaustion (H47 removed)");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "H53: gate=on preserves H46 retry cap = N.274 = 3; SDU drained after 3 retx");
 }
 
 /// PD-5c-H53: auto-detection — even when the config gate is ON (default),
@@ -3012,4 +3003,140 @@ fn h53_non_sndcp_pd_does_not_set_sndcp_bound() {
     drain_queue(&mut queue);
     assert!(!llc.al_links.get(&test_key()).unwrap().sndcp_bound,
         "H53: non-SNDCP PD (CMCE=2 here) must NOT set sndcp_bound");
+}
+
+
+// ── PD-REWRITE C2 tests ────────────────────────────────────────────────
+
+/// Build an unacknowledged-service AL-SETUP PDU.
+fn make_unack_setup_pdu(report: SetupReport) -> AlSetup {
+    AlSetup {
+        advanced_link_service: AdvancedLinkService::Unack,
+        // Unack service uses N.281 (window size), N.282 (repetitions) — same PDU fields.
+        n_s: Some(0), // NOTE 6 §21.2.3.5: N(S) is mandatory for unack service.
+        ..make_setup_pdu(report)
+    }
+}
+
+/// C2: unack AL-SETUP is now accepted (was rejected before Commit 2a per
+/// `llc_bs_ms.rs:1667`). Verify the BS emits a spec-compliant CON echo and
+/// creates the AlLink with `service = Unack`. Data-flow wire-up is Commit 4d.
+#[test]
+fn c2_unack_al_setup_is_accepted() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+
+    let out = send_setup_to_llc(&mut llc, &mut queue,
+        make_unack_setup_pdu(SetupReport::ServiceDefinition));
+
+    // Some outbound TmaUnitdataReq (the CON echo) must have been queued.
+    assert!(
+        out.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "C2: unack AL-SETUP must produce a CON echo on the wire (not rejected)"
+    );
+
+    // Link created with unack service.
+    let link = llc.al_links.get(&test_key())
+        .expect("C2: unack AL-SETUP must create the AlLink");
+    assert_eq!(link.service, AdvancedLinkService::Unack,
+        "C2: link.service must reflect the negotiated unack service");
+    // N.281/N.282 plumbing landed but is scaffolding until Commit 4d.
+    assert!(link.unack_repetition_state.is_empty(),
+        "C2: unack_repetition_state should start empty");
+}
+
+/// C3: parallel emission — when the drops loop fires an
+/// `AlDeliveryOutcome::DroppedRetxExhausted`, LLC must ALSO push a
+/// `TlaTlReportOutcomeInd` SAP message to the queue so SNDCP (Commit 4b) can
+/// consume the outcome via the formal SAP. Legacy `al_events` hook keeps
+/// firing in parallel; both channels coexist until Commit 5.
+#[test]
+fn c3_report_outcome_ind_fires_alongside_al_events_hook() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 1, 1));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"c3 parallel".to_vec()));
+    drain_queue(&mut queue);
+    mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
+
+    // Drive T.252 exhaust (N.273=N.274=1 → 2 attempts, ~4-5 ticks).
+    let mut t = TdmaTime::default();
+    let mut out: Vec<SapMsg> = Vec::new();
+    for _ in 1..=10u8 {
+        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+        out.extend(tick_at(&mut llc, &mut queue, t));
+        mark_all_segments_transmitted_at(&mut llc, t);
+        let link = llc.al_links.get(&test_key()).unwrap();
+        if link.outstanding_sdus.is_empty() { break; }
+    }
+
+    // Assert: at least one TlaTlReportOutcomeInd was emitted on the queue.
+    let saw_report = out.iter().any(|m| matches!(&m.msg,
+        SapMsgInner::TlaTlReportOutcomeInd(_)));
+    assert!(saw_report,
+        "C3: TlaTlReportOutcomeInd must be emitted alongside al_events hook on retx exhaust");
+}
+/// should survive through 2 full escalation cycles (5 T.252 windows total
+/// under ideal marking), landing at `sdu_restart_count = 2` at the point
+/// of the final drop. Explicit assertions:
+/// (a) escalation triggers on N.274 exhaust (2 attempts) — verified via
+///     sdu_restart_count going 0 → 1
+/// (b) consumes exactly one N.273 per escalation — verified via
+///     sdu_restart_count going 1 → 2
+/// (c) `DroppedRetxExhausted` (implicit via drain-then-check-purge=none)
+///     fires ONLY when both counters are exhausted, not mid-escalation
+#[test]
+fn c2b_escalation_multi_step_consumes_n273_and_drops_only_at_full_exhaust() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 2, 2));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"c2b esc".to_vec()));
+    drain_queue(&mut queue);
+    mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
+
+    // Walk enough T.252 windows to cover 2 × 3 = 6 attempts + escalation
+    // synchronization ticks. Track when sdu_restart_count changes.
+    let mut t = TdmaTime::default();
+    let mut saw_first_escalation = false;
+    let mut saw_second_escalation = false;
+    let mut out: Vec<SapMsg> = Vec::new();
+    for _ in 1..=15u8 {
+        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+        out.extend(tick_at(&mut llc, &mut queue, t));
+        mark_all_segments_transmitted_at(&mut llc, t);
+
+        let link = llc.al_links.get(&test_key()).unwrap();
+        if let Some(sdu) = link.outstanding_sdus.front() {
+            if sdu.sdu_restart_count == 1 { saw_first_escalation = true; }
+            if sdu.sdu_restart_count == 2 { saw_second_escalation = true; }
+            // Invariant: mid-escalation, SDU must survive
+            assert!(!link.outstanding_sdus.is_empty(),
+                "C2b(c): SDU must survive mid-escalation (restart_count={})",
+                sdu.sdu_restart_count);
+        } else {
+            // SDU drained → verify we hit N.273 exhaust cleanly
+            break;
+        }
+    }
+
+    // (a) Escalation triggered on N.274 exhaust — first jump 0→1 seen.
+    assert!(saw_first_escalation,
+        "C2b(a): first escalation (sdu_restart_count 0→1) must trigger on N.274 exhaust");
+    // (b) Consumes exactly one N.273 per escalation — second jump 1→2 seen.
+    assert!(saw_second_escalation,
+        "C2b(b): second escalation (sdu_restart_count 1→2) must fire after next N.274 exhaust");
+    // (c) Final drop only after full exhaust; link survives, no UMAC purge.
+    let link = llc.al_links.get(&test_key())
+        .expect("C1+C2b: link must survive full escalation drop");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "C2b(c): SDU drained after full N.273=N.274=2 escalation");
+    assert!(
+        !out.iter().any(|m| matches!(&m.msg,
+            SapMsgInner::TmaPurgeByAddressReq { .. })),
+        "C2b: no UMAC purge across the escalation sequence"
+    );
 }

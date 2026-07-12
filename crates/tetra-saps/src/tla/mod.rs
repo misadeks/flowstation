@@ -236,6 +236,93 @@ pub struct TlaTlReportInd {
     pub endpoint_id: Option<Todo>,
 }
 
+// ─── PD-REWRITE C3: formal TL-* primitives on TLA SAP ──────────────────────
+//
+// LLC emits these at spec-defined AL state transitions.  SNDCP consumes them
+// in Commits 4b/4c to own the reset/disconnect/reconnect/release decision
+// (see phase3-design.md §Commit 4a-d).  During the migration window
+// (Commit 3 → Commit 5) both these primitives AND the legacy
+// `al_events.rs` `AlDeliveryHook` fire in parallel at the same LLC call
+// sites; `al_events.rs` retires in Commit 5.
+
+/// Emitted by LLC when an AL-SETUP round-trip completes and the link
+/// transitions to `Established`.  Fired at every LLC AL-SETUP success site;
+/// parallel primitive for what previously was not surfaced upward at all.
+#[derive(Debug, Clone)]
+pub struct TlaTlEstablishInd {
+    pub main_address: TetraAddress,
+    pub link_id: LinkId,
+    pub endpoint_id: EndpointId,
+    pub n261: u8,
+    /// 0 = unacknowledged AL service, 1 = acknowledged AL service.
+    pub service: u8,
+}
+
+/// Emitted by LLC when an AL-RECONNECT round-trip completes.  Placeholder
+/// primitive: LLC-side reconnect wiring is minimal today, so this type is
+/// defined for SAP shape completeness; the emission site is filled in
+/// during Commits 4c (SNDCP-side wiring) or a follow-up C3b if the
+/// LLC-side reconnect handling requires more scaffolding.
+#[derive(Debug, Clone)]
+pub struct TlaTlReconnectInd {
+    pub main_address: TetraAddress,
+    pub link_id: LinkId,
+    pub endpoint_id: EndpointId,
+    pub n261: u8,
+}
+
+/// Emitted by LLC when an AL link is released (peer AL-DISC, local
+/// TL-RELEASE, or MAC-driven purge).  Distinct from `TlDisconnectInd`
+/// (which is spec-defined for peer-initiated disconnect only) — this
+/// primitive covers ALL release paths so SNDCP has a single funnel.
+#[derive(Debug, Clone)]
+pub struct TlaTlReleaseInd {
+    pub main_address: TetraAddress,
+    pub link_id: LinkId,
+    pub endpoint_id: EndpointId,
+    pub n261: u8,
+    pub cause: TlaReleaseCause,
+}
+
+/// Cause classifier for [`TlaTlReleaseInd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlaReleaseCause {
+    /// Peer sent an AL-DISC PDU.
+    PeerDisconnect,
+    /// Local user requested release (TL-RELEASE.req).
+    LocalRelease,
+    /// Peer sent an AL-SETUP with reason "Reset".
+    PeerReset,
+}
+
+/// Emitted by LLC alongside every `AlDeliveryHook` fire so SNDCP can
+/// consume delivery outcomes via the formal SAP path instead of the
+/// out-of-band `al_events.rs` hook.  Both channels fire in parallel from
+/// Commit 3 through Commit 5; Commit 5 retires `al_events.rs`.
+#[derive(Debug, Clone)]
+pub struct TlaTlReportOutcomeInd {
+    pub main_address: TetraAddress,
+    pub link_id: LinkId,
+    pub endpoint_id: EndpointId,
+    pub n261: u8,
+    pub n_s: u8,
+    pub outcome: TlaReportOutcome,
+}
+
+/// Reason-typed outcome for [`TlaTlReportOutcomeInd`].  Mirrors
+/// `AlDeliveryOutcome` in `tetra-entities` but lives in the SAP crate so
+/// callers (SNDCP, wap-gateway) don't need to import entity types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlaReportOutcome {
+    /// Peer explicitly AL-ACKed the entire SDU.
+    Delivered,
+    /// SDU released without a peer AL-ACK on a fire-and-forget link.
+    FireAndForget,
+    /// SDU exhausted its per-link N.274 × (N.273 + 1) retx budget.
+    RetxExhausted,
+}
+// ─── end PD-REWRITE C3 primitives ──────────────────────────────────────────
+
 /// Clause 20.3.5.1.9
 /// TL-UNITDATA request: this primitive shall be used in the unacknowledged data transfer service by the layer 2
 /// service user to request layer 2 to transmit a TL-SDU.

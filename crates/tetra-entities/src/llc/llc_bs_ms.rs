@@ -172,8 +172,20 @@ pub struct OutstandingSdu {
     /// is dropped before the peer's AL-ACK for the last fragment can
     /// physically arrive. Compare against `last_segment_tx_at` instead.
     pub last_segment_tx_at: Option<TdmaTime>,
-    /// Number of SDU-level retransmissions performed so far (vs N.273).
+    /// Number of retransmissions performed on the current segmentation
+    /// round (vs N.274). Reset to `0` when an N.274→N.273 escalation
+    /// restarts the SDU from segment 0.
     pub retx_count: u8,
+    /// PD-REWRITE C2b: number of N.274→N.273 escalations performed for
+    /// this SDU (per ETSI TS 100 392-2 §22.3.3.2.3). Each escalation is
+    /// triggered when `retx_count` reaches the per-segment cap and
+    /// consumes one N.273 budget; the SDU restarts from segment 0 with
+    /// `retx_count` reset. The SDU is finally dropped with
+    /// `DroppedRetxExhausted` when `sdu_restart_count >= link.max_sdu_retx`
+    /// (i.e. N.273 exhausted).  When `N.274 == 0` or `N.273 == 0`
+    /// escalation is short-circuited — see the retx logic in
+    /// `submit_al_activity_to_umac`.
+    pub sdu_restart_count: u8,
     /// When `true` the SDU is (re)sent on the very next `submit_al_activity_to_umac`
     /// call regardless of the T.251 timer (set on peer-reported FCS failure).
     pub force_retx: bool,
@@ -198,10 +210,20 @@ pub struct AlLink {
     /// a larger window.  For `connection_width == 1` (Extended AL) we honor
     /// the negotiated window.  See PD-5c-H15.
     pub effective_tx_sdu_window: u8,
-    /// N.273 — max SDU retransmissions.
+    /// N.273 — max SDU retransmissions (for acknowledged service) OR
+    /// N.282 — number of TL-SDU repetitions (for unacknowledged service).
+    /// Same 3-bit field in AL-SETUP; semantic depends on `service` bit per
+    /// ETSI TS 100 392-2 §21.2.3.5 Table 21.23 NOTE 5.
     pub max_sdu_retx: u8,
-    /// N.274 — max per-segment retransmissions.
+    /// N.274 — max per-segment retransmissions. Ack-service only; ignored
+    /// on unack links (which have no ACK mechanism).
     pub max_segment_retx: u8,
+    /// PD-REWRITE C2: N.282 repetition-count tracking for unack service.
+    /// Keyed by peer N(S); value is repetitions performed so far. Empty on
+    /// ack-service links. Field is scaffolding for Commit 4d (unack data
+    /// flow wire-up); no code reads it yet. Do not remove.
+    #[allow(dead_code)]
+    pub unack_repetition_state: HashMap<u8, u8>,
     // ── TX window ─────────────────────────────────────────────────────────────
     /// Next N(S) value to assign when segmenting a new SDU; wraps mod (tx_window+1).
     pub next_n_s: u8,
@@ -404,6 +426,12 @@ impl Llc {
 
     /// Fire the delivery hook if installed. Never panics; a hook that panics
     /// would take down the entity thread, but that's on the hook implementer.
+    ///
+    /// PD-REWRITE C3: legacy hook is still fired here. Callers should ALSO
+    /// push a `SapMsgInner::TlaTlReportOutcomeInd` to the message queue via
+    /// [`Self::make_report_outcome_ind_msg`] so the outcome is available on
+    /// the formal SAP path (parallel emission during the C3 → C5 migration
+    /// window). `al_events.rs` retires in Commit 5.
     fn emit_delivery(&self, key: AlLinkKey, n_s: u8, outcome: AlDeliveryOutcome) {
         if let Some(hook) = &self.delivery_hook {
             hook(AlDeliveryEvent {
@@ -414,6 +442,34 @@ impl Llc {
                 n_s,
                 outcome,
             });
+        }
+    }
+
+    /// PD-REWRITE C3: build the parallel `TlaTlReportOutcomeInd` SAP message
+    /// for a delivery outcome. Emitted alongside every `emit_delivery` call
+    /// site so SNDCP (Commit 4b) can consume outcomes via the formal SAP.
+    fn make_report_outcome_ind_msg(&self, key: AlLinkKey, n_s: u8, outcome: AlDeliveryOutcome) -> SapMsg {
+        use tetra_saps::tla::{TlaTlReportOutcomeInd, TlaReportOutcome};
+        let outcome = match outcome {
+            AlDeliveryOutcome::Delivered => TlaReportOutcome::Delivered,
+            AlDeliveryOutcome::DroppedFireAndForget => TlaReportOutcome::FireAndForget,
+            AlDeliveryOutcome::DroppedRetxExhausted => TlaReportOutcome::RetxExhausted,
+        };
+        SapMsg {
+            sap: Sap::TlaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Sndcp,
+            msg: SapMsgInner::TlaTlReportOutcomeInd(TlaTlReportOutcomeInd {
+                main_address: TetraAddress {
+                    ssi_type: tetra_core::SsiType::Issi,
+                    ssi: key.ssi,
+                },
+                link_id: key.link_id,
+                endpoint_id: key.endpoint_id,
+                n261: key.n261,
+                n_s,
+                outcome,
+            }),
         }
     }
 
@@ -1736,6 +1792,7 @@ impl Llc {
             effective_tx_sdu_window,
             max_sdu_retx: pdu.max_retx_n273_or_repetition_n282,
             max_segment_retx: pdu.max_segment_retx_n274,
+            unack_repetition_state: HashMap::new(),
             next_n_s: 0,
             outstanding_sdus: VecDeque::new(),
             reassemblers: HashMap::new(),
@@ -1794,10 +1851,16 @@ impl Llc {
     /// NOTE: spec ambiguous — V1 supports only Ack service and original AL
     /// (window 1..3).  Extended-AL (tl_sdu_window_size == 0 with Extended type)
     /// is rejected.
+    /// PD-REWRITE C2: accept both acknowledged AND unacknowledged AL service
+    /// negotiations. Previously rejected any AL-SETUP with `service != Ack`
+    /// (see git history for llc_bs_ms.rs:1667 pre-C2). ETSI TS 100 392-2
+    /// §28.3.2 mandates SNDCP support the low-delay (unack) reliability class
+    /// — this method's rejection was blocking that path even though the
+    /// unack RX/TX plumbing exists (see `on_al_udata` line 2122+ and
+    /// `x_tla_tlunitdata_req_al` line 839+). The SETUP-accept path is now
+    /// unblocked; the full unack data-flow wiring (SNDCP → AL-SETUP with
+    /// unack bit → SN-UNITDATA on AL-UDATA/AL-UFINAL) lands in Commit 4d.
     fn is_setup_supported(pdu: &AlSetup) -> bool {
-        if pdu.advanced_link_service != AdvancedLinkService::Ack {
-            return false;
-        }
         if pdu.tl_sdu_window_size_n272_n281 == 0 {
             if let Some(AdvancedLinkType::Extended) = pdu.advanced_link_type {
                 return false;
@@ -2221,7 +2284,7 @@ impl Llc {
     /// For both: processes acknowledgement blocks to advance the TX window.
     ///
     /// ETSI TS 100 392-2 v3.10.1 clause 21.4.5.
-    fn on_al_ack_rnr(&mut self, _queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAckAlRnr) {
+    fn on_al_ack_rnr(&mut self, queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAckAlRnr) {
         // PD-10c-H36: two-scope split — the first block owns the mutable
         // borrow on `self.al_links`; once it drops, the second block calls
         // `self.emit_delivery` (which needs `&self` for the hook) without a
@@ -2262,6 +2325,9 @@ impl Llc {
             delivered
         };
         for n_s in delivered {
+            // PD-REWRITE C3: parallel emission — legacy hook + formal SAP primitive.
+            let msg = self.make_report_outcome_ind_msg(key, n_s, AlDeliveryOutcome::Delivered);
+            queue.push_back(msg);
             self.emit_delivery(key, n_s, AlDeliveryOutcome::Delivered);
         }
     }
@@ -2385,6 +2451,7 @@ impl Llc {
                         effective_tx_sdu_window: al_cfg.tx_window,
                         max_sdu_retx: al_cfg.max_sdu_retx,
                         max_segment_retx: al_cfg.max_segment_retx,
+                        unack_repetition_state: HashMap::new(),
                         next_n_s: 0,
                         outstanding_sdus: VecDeque::new(),
                         reassemblers: HashMap::new(),
@@ -2450,12 +2517,11 @@ impl Llc {
         let dltime = self.dltime;
         // Extract config-driven retry limits before the loop to avoid borrow conflicts
         // with the mutable borrow of self.al_links inside the loop.
-        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect, cfg_proactive_disc,
+        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect,
              cfg_n273_zero_ack_uses_seg_cap) = {
             let cfg = self.config.config();
             let al = &cfg.llc.advanced_link;
             (al.max_setup_retries, al.max_disc_retries, al.max_reconnect_retries,
-             al.proactive_disc_on_retx_exhaust,
              al.n273_zero_ack_uses_seg_cap)
         };
         let mut msgs: Vec<SapMsg> = Vec::new();
@@ -2464,9 +2530,12 @@ impl Llc {
         // PD-10c-H36: collect drop events for post-loop emission (can't call
         // &self.emit_delivery while self.al_links is mutably borrowed).
         let mut drops: Vec<(AlLinkKey, u8, AlDeliveryOutcome)> = Vec::new();
-        // PD-5c-H47: collect links that hit retx-exhaustion so we can emit
-        // AL-DISC + TmaPurgeByAddressReq after the al_links borrow ends.
-        let mut retx_exhausted_links: Vec<AlLinkKey> = Vec::new();
+        // PD-REWRITE C1: `retx_exhausted_links` collection removed with H47.
+        // Retx exhaustion now surfaces upward exclusively via the
+        // `AlDeliveryOutcome::DroppedRetxExhausted` event (see `drops` above).
+        // The service user (SNDCP, once Commit 4b lands) decides reset /
+        // disconnect / reconnect / release. LLC never spontaneously emits
+        // AL-DISC — see ETSI TS 100 392-2 §22.3.3.2.6 NOTE 1.
 
         for (key, link) in self.al_links.iter_mut() {
             // 0. T.272 — RNR receiver-not-ready expiry (must run before step 1 so that
@@ -2619,61 +2688,90 @@ impl Llc {
                         // When either condition fails, fall through to the
                         // pre-H46 `min()` semantics — `N.273 = 0` yields
                         // `effective_max_retx = 0` (fire-and-forget).
-                        let effective_max_retx = if link.max_segment_retx == 0 {
-                            // Per audit §P7: N.274 = 0 means the peer opted
-                            // out of per-segment retx entirely. Any retx of
-                            // any segment violates the contract, so treat as
-                            // no retx budget at all.
+                        // PD-REWRITE C2b (§22.3.3.2.3): N.274 is the per-segment
+                        // (per-segmentation-round) retx cap. When it's exceeded,
+                        // ETSI TS 100 392-2 §22.3.3.2.6 clause b says the LLC
+                        // should "start re-sending of the complete TL-SDU using
+                        // the original segmentation" — i.e. reset the segment
+                        // retx counter to 0 and re-transmit from segment 0.
+                        // Each such restart consumes one N.273 budget. Drop
+                        // with `DroppedRetxExhausted` only when N.273 is also
+                        // exhausted. Escalation is short-circuited when
+                        // either counter is 0 (fire-and-forget or no-retry
+                        // policy stays as-is).
+                        let per_seg_cap = if link.max_segment_retx == 0 {
                             0
                         } else if link.max_sdu_retx == 0
                             && link.service == AdvancedLinkService::Ack
                             && cfg_n273_zero_ack_uses_seg_cap
                             && !link.sndcp_bound
                         {
-                            // PD-5c-H46: MTP6550 WSP quirk (see above).
+                            // PD-5c-H46 quirk: N.273=0 on ACK is treated as
+                            // "use N.274 as the effective cap" for MTP6550
+                            // WSP interop. Escalation stays short-circuited
+                            // (no N.273 budget to consume).
                             link.max_segment_retx
+                        } else if link.max_sdu_retx == 0 {
+                            // N.273=0 without H46: fire-and-forget (min-based).
+                            0
                         } else {
-                            std::cmp::min(link.max_sdu_retx, link.max_segment_retx)
+                            // Both counters > 0: escalation is permitted; per-
+                            // segment cap is N.274 alone (not min()) because
+                            // exhaustion escalates rather than drops.
+                            link.max_segment_retx
                         };
-                        // Use the link's per-negotiated max_sdu_retx (from SETUP PDU or config
-                        // default for reconnect-fallback links) rather than the global constant.
+
                         if !is_initial_send
-                            && sdu.retx_count >= effective_max_retx
+                            && sdu.retx_count >= per_seg_cap
                             && !peer_requested_retx
                         {
-                            // PD-5c-H19: with max_sdu_retx=0 (MS-negotiated for Original AL /
-                            // Motorola MTP3550), we've already transmitted the SDU once and by
-                            // spec have no retry budget. Prior behaviour dropped with a WARN
-                            // which is misleading — the bits are on the air, the peer simply
-                            // hasn't sent an AL-ACK (either it did receive them but its stack
-                            // suppresses AL-ACK to app-layer failures, or the ACK crossed
-                            // with a schedule change). Dropping does NOT undo the transmission;
-                            // it only frees our outstanding-SDU slot so we can enqueue the next
-                            // one. Log at DEBUG (fire-and-forget completion) instead of WARN
-                            // (protocol failure) — this stops the alarm-log storm on every
-                            // downlink SDU when the peer doesn't AL-ACK.
-                            if effective_max_retx == 0 {
+                            if per_seg_cap == 0 {
+                                // Fire-and-forget: no retries permitted; drop
+                                // as today. Log at DEBUG (fire-and-forget
+                                // completion) not WARN.
                                 tracing::debug!(
-                                    "AL link {:?} N(S)={} fire-and-forget SDU released (effective_max_retx=0)",
+                                    "AL link {:?} N(S)={} fire-and-forget SDU released (per_seg_cap=0)",
                                     key, sdu.n_s
                                 );
                                 drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedFireAndForget));
+                                sdus_to_remove.push(sdu.n_s);
+                                continue;
+                            } else if sdu.sdu_restart_count < link.max_sdu_retx {
+                                // Escalate: reset per-segment state, increment
+                                // N.273 counter, and re-send from segment 0
+                                // using the original segmentation.
+                                sdu.sdu_restart_count = sdu.sdu_restart_count.saturating_add(1);
+                                sdu.retx_count = 0;
+                                // Reset segment state to force re-send of all segments:
+                                //   - acked_segments: none acked in the new round
+                                //   - segment_reporters: fresh Pending reporters will be
+                                //     assigned by the segment-send loop below
+                                //   - sent_at / last_segment_tx_at: cleared so T.252
+                                //     restarts from the tail of the fresh transmission
+                                for acked in sdu.acked_segments.iter_mut() { *acked = false; }
+                                for r in sdu.segment_reporters.iter_mut() { *r = None; }
+                                sdu.sent_at = None;
+                                sdu.last_segment_tx_at = None;
+                                sdu.force_retx = true;
+                                tracing::info!(
+                                    "AL link {:?} N(S)={} N.274 exhausted — escalating to full-SDU retx {}/{} (§22.3.3.2.6)",
+                                    key, sdu.n_s, sdu.sdu_restart_count, link.max_sdu_retx
+                                );
+                                // Continue to top of outer loop to retry from segment 0.
+                                continue;
                             } else {
+                                // Both N.274 and N.273 exhausted — TL-REPORT failed transfer.
                                 tracing::warn!(
-                                    "AL link {:?} N(S)={} exhausted retransmissions (retx_count={}, effective_max={}), dropping SDU",
-                                    key, sdu.n_s, sdu.retx_count, effective_max_retx
+                                    "AL link {:?} N(S)={} exhausted retransmissions (retx_count={}, sdu_restart_count={}, N.273={}, N.274={}), dropping SDU",
+                                    key, sdu.n_s, sdu.retx_count, sdu.sdu_restart_count,
+                                    link.max_sdu_retx, link.max_segment_retx
                                 );
                                 drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
-                                // PD-5c-H47: mark this link for proactive
-                                // AL-DISC + UMAC purge so the peer can tear
-                                // down its side immediately instead of
-                                // waiting for its own SDU-lifetime timer.
-                                if cfg_proactive_disc && !retx_exhausted_links.contains(key) {
-                                    retx_exhausted_links.push(*key);
-                                }
+                                // PD-REWRITE C1: H47 proactive AL-DISC removed. Service
+                                // user decides teardown; LLC only reports the drop.
+                                sdus_to_remove.push(sdu.n_s);
+                                continue;
                             }
-                            sdus_to_remove.push(sdu.n_s);
-                            continue;
                         }
                         if peer_requested_retx && sdu.retx_count >= 3 {
                             // Even peer-requested retx has an upper bound to avoid
@@ -2683,9 +2781,7 @@ impl Llc {
                                 key, sdu.n_s
                             );
                             drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
-                            if cfg_proactive_disc && !retx_exhausted_links.contains(key) {
-                                retx_exhausted_links.push(*key);
-                            }
+                            // PD-REWRITE C1: H47 proactive AL-DISC removed here too.
                             sdus_to_remove.push(sdu.n_s);
                             continue;
                         }
@@ -2745,8 +2841,9 @@ impl Llc {
                         }
                         if !is_initial_send {
                             tracing::info!(
-                                "AL link {:?} N(S)={} retransmitting (attempt {}/{})",
-                                key, sdu.n_s, sdu.retx_count, effective_max_retx
+                                "AL link {:?} N(S)={} retransmitting (attempt {}/{}, restart {}/{})",
+                                key, sdu.n_s, sdu.retx_count, per_seg_cap,
+                                sdu.sdu_restart_count, link.max_sdu_retx
                             );
                         }
                     }
@@ -2914,44 +3011,17 @@ impl Llc {
             self.al_links.remove(&key);
         }
 
-        // PD-5c-H47: proactive AL-DISC + UMAC purge for links that hit
-        // retx-exhaustion. Emitted after `drops` are queued but before
-        // `emit_delivery` fires, so H36 subscribers still see the
-        // `DroppedRetxExhausted` event first when the drops loop runs
-        // below. Mirrors DIMETRA `dlai_cancel_pd_transmission_on_user_removal`
-        // (BRC @ 0x0021ad6c) — the same purge helper the H39 DISC path
-        // already targets — and matches the standard normal-teardown
-        // AlDiscCause used on every clean session end.
-        for key in retx_exhausted_links {
-            let (service, carrier_num, main_address) =
-                match self.al_links.get(&key) {
-                    Some(link) => (link.service, link.carrier_num, link.main_address),
-                    None => continue, // already gone (e.g. duplicate hit above)
-                };
-            let disc_pdu = AlDisc {
-                advanced_link_service: service,
-                advanced_link_number_n261: key.n261,
-                report: AlDiscCause::Success,
-            };
-            msgs.push(Self::make_al_sap_msg_disc(
-                disc_pdu,
-                carrier_num,
-                main_address,
-                key.link_id,
-                key.endpoint_id,
-            ));
-            msgs.push(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Llc,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::TmaPurgeByAddressReq { issi: key.ssi },
-            });
-            self.al_links.remove(&key);
-            tracing::warn!(
-                "AL link {:?} retx-exhausted — emitted proactive AL-DISC(Success) + TmaPurgeByAddressReq (H47)",
-                key
-            );
-        }
+        // PD-REWRITE C1: H47 (proactive AL-DISC + TmaPurgeByAddressReq on
+        // retx-exhaustion) removed as a spec violation. Per ETSI TS 100 392-2
+        // §22.3.3.2.6 NOTE 1, "the service user should immediately either
+        // reset or disconnect the advanced link" — that is the SERVICE USER's
+        // decision, not LLC's. Retx exhaustion surfaces upward exclusively
+        // via the `AlDeliveryOutcome::DroppedRetxExhausted` event on the
+        // al_events hook (see `drops`/`emit_delivery` below). Once Commit 5
+        // lands, that path becomes the formal `TlReportInd(RetxExhausted)`
+        // primitive on the TLA SAP; SNDCP (Commit 4b) then decides reset /
+        // disconnect / reconnect / release / deactivate per the policy in
+        // §28.3.2.
 
         let pending_to_send: Vec<(AlLinkKey, Vec<u8>)> = {
             let mut to_send = Vec::new();
@@ -2982,9 +3052,13 @@ impl Llc {
         for msg in msgs {
             queue.push_back(msg);
         }
-        // PD-10c-H36: emit any drops now that the mutable borrow on
-        // self.al_links has ended.
+        // PD-10c-H36 + PD-REWRITE C3: emit both the legacy al_events hook AND
+        // the formal `TlaTlReportOutcomeInd` SAP primitive so SNDCP (Commit 4b)
+        // can consume outcomes via the SAP. Both channels fire in parallel
+        // during the C3 → C5 migration window.
         for (key, n_s, outcome) in drops {
+            let msg = self.make_report_outcome_ind_msg(key, n_s, outcome);
+            queue.push_back(msg);
             self.emit_delivery(key, n_s, outcome);
         }
         had
@@ -3154,6 +3228,7 @@ impl Llc {
             segment_reporters: reporters.iter().cloned().map(Some).collect(),
             last_segment_tx_at: None,
             retx_count: 0,
+            sdu_restart_count: 0,
             force_retx: false,
         });
 
