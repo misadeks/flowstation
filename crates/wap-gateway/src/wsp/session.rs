@@ -62,6 +62,14 @@ use crate::wsp::pdu::{
 /// responder's idle sweep so both layers evict on the same cadence.
 pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Longer idle timeout for sessions in the `Suspended` state — MS may
+/// stay dormant for minutes before Resuming, and dropping the session
+/// during that window forces the MS to reconnect from scratch (defeats
+/// the whole point of Suspend/Resume). WAP-230 §7.4.4 doesn't specify a
+/// value; 15 min matches typical dormancy budgets for MTP-class radios
+/// on packet-data channels.
+pub const SUSPENDED_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// Session table key: `(MS peer address, gateway-chosen session id)`.
 pub type SessionKey = (SocketAddr, u32);
 
@@ -75,6 +83,12 @@ pub enum SessionState {
     Connecting,
     /// Fully established — Get / Post / etc. may flow.
     Connected,
+    /// MS has sent S-Suspend: session state is held but no traffic is
+    /// expected until an S-Resume (or a fresh Connect) arrives. Kept as
+    /// a distinct state so `evict_idle` can apply a longer timeout to
+    /// suspended sessions and `handle_resume` can log the exact prior
+    /// state transition. WAP-230 §7.4.
+    Suspended,
 }
 
 /// Per-session state stored in the session table.
@@ -197,9 +211,21 @@ impl WspGatewayState {
     /// the shared runtime.
     pub fn evict_idle(&self, now: Instant) {
         self.sessions.retain(|key, sess| {
-            let alive = now.duration_since(sess.last_seen) < SESSION_IDLE_TIMEOUT;
+            // PD-11-H2: suspended sessions get a longer timeout so a
+            // dormant MS can Resume minutes later without being forced
+            // to reconnect from scratch.
+            let timeout = match sess.state {
+                SessionState::Suspended => SUSPENDED_SESSION_IDLE_TIMEOUT,
+                _ => SESSION_IDLE_TIMEOUT,
+            };
+            let alive = now.duration_since(sess.last_seen) < timeout;
             if !alive {
-                info!(peer = %key.0, sid = key.1, "wsp: evicting idle session");
+                info!(
+                    peer = %key.0,
+                    sid = key.1,
+                    state = ?sess.state,
+                    "wsp: evicting idle session"
+                );
             }
             alive
         });
@@ -251,6 +277,8 @@ impl WspHandler {
         match pdu {
             WspPdu::Connect { .. } => self.handle_connect(peer, pdu),
             WspPdu::Disconnect { server_session_id } => self.handle_disconnect(peer, server_session_id),
+            WspPdu::Suspend { server_session_id } => self.handle_suspend(peer, server_session_id),
+            WspPdu::Resume { server_session_id, .. } => self.handle_resume(peer, server_session_id),
             WspPdu::MethodInvoke {
                 method_code: pdu_type::GET,
                 uri,
@@ -264,11 +292,27 @@ impl WspHandler {
                 build_status_reply(STATUS_METHOD_NOT_ALLOWED).encode()
             }
             other => {
-                info!(
-                    kind = other.pdu_type_code(),
-                    "wsp: PDU type not implemented in PD-10b, replying 501"
+                let code = other.pdu_type_code();
+                // WAP-230 §8.2.2 — Redirect / Push / ConfirmedPush /
+                // ConnectReply / Reply are server-initiated; receiving
+                // any of them from the MS is a protocol violation.
+                // Answer 400 (Bad Request) rather than 501 (Not
+                // Implemented) so the MS treats it as a hard error and
+                // stops the WTP retry loop instead of re-Inviting.
+                let is_server_only = matches!(
+                    code,
+                    pdu_type::REDIRECT | pdu_type::PUSH | pdu_type::CONFIRMED_PUSH | pdu_type::CONNECT_REPLY | pdu_type::REPLY
                 );
-                build_status_reply(STATUS_NOT_IMPLEMENTED).encode()
+                if is_server_only {
+                    warn!(kind = code, "wsp: server-only PDU received from MS — replying 400");
+                    build_status_reply(STATUS_BAD_REQUEST).encode()
+                } else {
+                    info!(
+                        kind = code,
+                        "wsp: PDU type not implemented in PD-10b, replying 501"
+                    );
+                    build_status_reply(STATUS_NOT_IMPLEMENTED).encode()
+                }
             }
         }
     }
@@ -335,6 +379,82 @@ impl WspHandler {
         // WTP class 2 still expects some Result body. Empty Reply with
         // status 200 is what Kannel emits.
         build_status_reply(STATUS_OK).encode()
+    }
+
+    /// PD-11-H2: WAP-230 §8.2.2.6 S-Suspend. MS notifies the gateway that
+    /// it is going into a dormant / low-power state. We flip the session
+    /// state to `Suspended` and keep every other field intact so a matching
+    /// Resume can pick up where we left off. Not confirmed at WSP layer;
+    /// answer with WSP `200 OK` for the WTP-Class-2 Result payload.
+    ///
+    /// If no session for `(peer, sid)` exists, we still reply 200 — the MS
+    /// was authoritative about its own state and a "session already gone"
+    /// case just means the eviction sweep or a prior Disconnect got there
+    /// first.
+    fn handle_suspend(&self, peer: SocketAddr, sid: u32) -> Vec<u8> {
+        let key = (peer, sid);
+        let mut updated = false;
+        let mut prior_state: Option<SessionState> = None;
+        if let Some(mut entry) = self.state.sessions.get_mut(&key) {
+            prior_state = Some(entry.state);
+            entry.state = SessionState::Suspended;
+            entry.last_seen = Instant::now();
+            updated = true;
+        }
+        info!(
+            peer = %peer,
+            sid,
+            found = updated,
+            prior_state = ?prior_state,
+            "wsp: Suspend received"
+        );
+        build_status_reply(STATUS_OK).encode()
+    }
+
+    /// PD-11-H2: WAP-230 §8.2.2.7 S-Resume. MS wakes from Suspend and asks
+    /// to continue the session identified by `sid`.
+    ///
+    /// Two outcomes:
+    ///
+    /// 1. **Session found (either state):** flip to `Connected`, refresh
+    ///    `last_seen`, and echo a fresh `ConnectReply` carrying the same
+    ///    server-session-id and the cached capabilities (WAP-230 §7.4.4:
+    ///    Resume behaves identically to Connect on the reply-encoding side).
+    ///    Subsequent GETs on the resumed session then flow normally.
+    /// 2. **Session unknown:** the operator either restarted `bluestation`
+    ///    or the eviction sweep dropped this session while MS was dormant.
+    ///    Reply with `Disconnect` for `sid` (WAP-230 §8.2.2.7 NOTE 3) —
+    ///    that tells the MS its session is gone and prompts a fresh Connect
+    ///    on the next user action, instead of the H33/501 retry loop we'd
+    ///    otherwise fall into.
+    fn handle_resume(&self, peer: SocketAddr, sid: u32) -> Vec<u8> {
+        let key = (peer, sid);
+        if let Some(mut entry) = self.state.sessions.get_mut(&key) {
+            let prior_state = entry.state;
+            entry.state = SessionState::Connected;
+            entry.last_seen = Instant::now();
+            let caps_snapshot = entry.client_capabilities.clone();
+            drop(entry);
+            info!(peer = %peer, sid, prior_state = ?prior_state, "wsp: Resume accepted");
+            // Build a ConnectReply carrying the cached caps + Encoding-Version:1.3
+            // (same shape as the original Connect echo). Reuse the configured
+            // capability mode so the resumed reply matches what MS saw on Connect.
+            let synthetic_connect = WspPdu::Connect {
+                version: 0x10,
+                capabilities: caps_snapshot,
+                headers: HeaderBlock::empty(),
+            };
+            match build_connect_reply(&synthetic_connect, sid, HeaderBlock::empty(), self.state.capability_mode) {
+                Ok(r) => r.encode(),
+                Err(e) => {
+                    warn!(error = %e, "wsp: build_connect_reply for Resume failed, replying 400");
+                    build_status_reply(STATUS_BAD_REQUEST).encode()
+                }
+            }
+        } else {
+            info!(peer = %peer, sid, "wsp: Resume for unknown session — replying Disconnect");
+            WspPdu::Disconnect { server_session_id: sid }.encode()
+        }
     }
 
     /// PD-10c hot path: fetch `uri` from upstream, translate the HTTP
@@ -593,6 +713,107 @@ mod tests {
         let future = Instant::now() + SESSION_IDLE_TIMEOUT + Duration::from_secs(1);
         state.evict_idle(future);
         assert_eq!(state.session_count(), 0);
+    }
+
+    // ── PD-11-H2: Suspend / Resume tests ─────────────────────────────────
+
+    async fn establish_session(h: &WspHandler, peer: SocketAddr) -> u32 {
+        let reply_bytes = h.handle(peer, synthetic_connect_bytes()).await;
+        match WspPdu::decode(&reply_bytes).unwrap() {
+            WspPdu::ConnectReply { server_session_id, .. } => server_session_id,
+            other => panic!("expected ConnectReply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn suspend_marks_session_suspended_but_keeps_it() {
+        let state = WspGatewayState::new();
+        let h = WspHandler::new(state.clone());
+        let peer = loopback_peer();
+        let sid = establish_session(&h, peer).await;
+
+        let suspend = WspPdu::Suspend { server_session_id: sid }.encode();
+        let reply_bytes = h.handle(peer, suspend).await;
+        let WspPdu::Reply { status, .. } = WspPdu::decode(&reply_bytes).unwrap() else {
+            panic!("Suspend must be answered with a Reply");
+        };
+        assert_eq!(status, STATUS_OK, "Suspend replied 200 OK");
+        assert_eq!(state.session_count(), 1, "Suspend keeps the session in the table");
+        let entry = state.sessions.get(&(peer, sid)).expect("session still present");
+        assert_eq!(entry.state, SessionState::Suspended);
+    }
+
+    #[tokio::test]
+    async fn resume_of_known_session_returns_connect_reply_and_flips_state_back() {
+        let state = WspGatewayState::new();
+        let h = WspHandler::new(state.clone());
+        let peer = loopback_peer();
+        let sid = establish_session(&h, peer).await;
+        let _ = h.handle(peer, WspPdu::Suspend { server_session_id: sid }.encode()).await;
+        assert_eq!(state.sessions.get(&(peer, sid)).unwrap().state, SessionState::Suspended);
+
+        let resume = WspPdu::Resume {
+            server_session_id: sid,
+            capabilities: Vec::new(),
+            headers: HeaderBlock::empty(),
+        }
+        .encode();
+        let reply_bytes = h.handle(peer, resume).await;
+        let WspPdu::ConnectReply { server_session_id: got_sid, headers, .. } = WspPdu::decode(&reply_bytes).unwrap() else {
+            panic!("Resume for known session must return a ConnectReply");
+        };
+        assert_eq!(got_sid, sid, "Resume echoes back the same session id");
+        assert_eq!(headers.raw, vec![0xC3, 0x93], "Encoding-Version: 1.3 present on Resume");
+        assert_eq!(state.sessions.get(&(peer, sid)).unwrap().state, SessionState::Connected);
+    }
+
+    #[tokio::test]
+    async fn resume_of_unknown_session_returns_disconnect() {
+        let state = WspGatewayState::new();
+        let h = WspHandler::new(state.clone());
+        let peer = loopback_peer();
+        // Never established anything for peer with sid=42.
+        let resume = WspPdu::Resume {
+            server_session_id: 42,
+            capabilities: Vec::new(),
+            headers: HeaderBlock::empty(),
+        }
+        .encode();
+        let reply_bytes = h.handle(peer, resume).await;
+        let WspPdu::Disconnect { server_session_id } = WspPdu::decode(&reply_bytes).unwrap() else {
+            panic!("Resume for unknown session must return a Disconnect");
+        };
+        assert_eq!(server_session_id, 42, "Disconnect echoes the sid MS asked to resume");
+    }
+
+    #[tokio::test]
+    async fn suspended_sessions_get_extended_idle_timeout() {
+        let state = WspGatewayState::new();
+        let h = WspHandler::new(state.clone());
+        let peer = loopback_peer();
+        let sid = establish_session(&h, peer).await;
+        let _ = h.handle(peer, WspPdu::Suspend { server_session_id: sid }.encode()).await;
+        // Advance past the normal timeout but not the suspended one.
+        let just_past_normal = Instant::now() + SESSION_IDLE_TIMEOUT + Duration::from_secs(1);
+        state.evict_idle(just_past_normal);
+        assert_eq!(state.session_count(), 1, "suspended session survives normal-timeout sweep");
+        // Advance past the suspended timeout.
+        let past_suspended = Instant::now() + SUSPENDED_SESSION_IDLE_TIMEOUT + Duration::from_secs(1);
+        state.evict_idle(past_suspended);
+        assert_eq!(state.session_count(), 0, "suspended session is dropped past its longer timeout");
+    }
+
+    #[tokio::test]
+    async fn server_only_pdu_from_ms_replies_400_not_501() {
+        // Redirect (0x03) is server-only per WAP-230 §8.2.2.3; MS sending
+        // one is a protocol violation and must get 400 (hard error) not
+        // 501 (which triggers WTP retry loop).
+        let h = WspHandler::new(WspGatewayState::new());
+        let reply_bytes = h.handle(loopback_peer(), vec![0x03, 0x00]).await;
+        let WspPdu::Reply { status, .. } = WspPdu::decode(&reply_bytes).unwrap() else {
+            panic!("expected Reply");
+        };
+        assert_eq!(status, STATUS_BAD_REQUEST);
     }
 
     // ── PD-10c: HTTP relay tests ─────────────────────────────────────────

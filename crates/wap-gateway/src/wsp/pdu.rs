@@ -101,6 +101,16 @@ pub enum WspPdu {
     },
     /// S-Disconnect — session teardown. Payload is the session id (uintvar).
     Disconnect { server_session_id: u32 },
+    /// S-Suspend — MS notifies the gateway that it is going into a
+    /// low-power / dormant state and its session should be *held* rather
+    /// than torn down. Wire payload is the session id (uintvar).
+    /// WAP-230 §8.2.2.6.
+    Suspend { server_session_id: u32 },
+    /// S-Resume — MS wakes from a Suspend state and wants to continue on
+    /// the previously-negotiated session. Wire payload is the session id
+    /// (uintvar), optionally followed by a capability block (unusual —
+    /// most MS omit it). WAP-230 §8.2.2.7.
+    Resume { server_session_id: u32, capabilities: Vec<Capability>, headers: HeaderBlock },
     /// S-Reply — response to a method (Get / Post). PD-10c wires up the
     /// real HTTP relay; PD-10b only needs the encoder to answer "501 Not
     /// Implemented" for anything that isn't Connect.
@@ -172,6 +182,15 @@ impl WspPdu {
                 }
                 Ok(Self::Disconnect { server_session_id: sid })
             }
+            pdu_type::SUSPEND => {
+                // WAP-230 §8.2.2.6: single uintvar server_session_id.
+                let (sid, n) = uintvar::decode(rest)?;
+                if n != rest.len() {
+                    return Err(WapError::WspDecode(format!("Suspend has {} trailing bytes", rest.len() - n)));
+                }
+                Ok(Self::Suspend { server_session_id: sid })
+            }
+            pdu_type::RESUME => decode_resume(rest),
             pdu_type::REPLY => decode_reply(rest),
             code if pdu_type::is_get_like(code) => decode_get_like(code, rest),
             other => Ok(Self::Unknown {
@@ -215,6 +234,27 @@ impl WspPdu {
                 out.push(pdu_type::DISCONNECT);
                 uintvar::encode(*server_session_id, &mut out);
             }
+            Self::Suspend { server_session_id } => {
+                out.push(pdu_type::SUSPEND);
+                uintvar::encode(*server_session_id, &mut out);
+            }
+            Self::Resume {
+                server_session_id,
+                capabilities,
+                headers,
+            } => {
+                // WAP-230 §8.2.2.7: type + uintvar sid + uintvar caps-len
+                // + uintvar headers-len + caps + headers. Every MS we've
+                // seen sends caps-len = 0 and headers-len = 0, but we
+                // encode the general form to round-trip.
+                out.push(pdu_type::RESUME);
+                uintvar::encode(*server_session_id, &mut out);
+                let caps = caps::encode_list(capabilities);
+                uintvar::encode(caps.len() as u32, &mut out);
+                uintvar::encode(headers.len() as u32, &mut out);
+                out.extend_from_slice(&caps);
+                out.extend_from_slice(&headers.raw);
+            }
             Self::Reply { status, headers, body } => {
                 out.push(pdu_type::REPLY);
                 out.push(*status);
@@ -242,6 +282,8 @@ impl WspPdu {
             Self::Connect { .. } => pdu_type::CONNECT,
             Self::ConnectReply { .. } => pdu_type::CONNECT_REPLY,
             Self::Disconnect { .. } => pdu_type::DISCONNECT,
+            Self::Suspend { .. } => pdu_type::SUSPEND,
+            Self::Resume { .. } => pdu_type::RESUME,
             Self::Reply { .. } => pdu_type::REPLY,
             Self::MethodInvoke { method_code, .. } => *method_code,
             Self::Unknown { pdu_type, .. } => *pdu_type,
@@ -298,6 +340,48 @@ fn decode_connect_reply(rest: &[u8]) -> WapResult<WspPdu> {
     let capabilities = caps::decode_list(&rest[cursor..caps_end])?;
     let headers = HeaderBlock::from_bytes(&rest[caps_end..hdrs_end]);
     Ok(WspPdu::ConnectReply {
+        server_session_id: sid,
+        capabilities,
+        headers,
+    })
+}
+
+/// Decode a WSP Resume PDU. WAP-230 §8.2.2.7 wire format after the type
+/// byte: `[sid uintvar][caps-len uintvar][headers-len uintvar][caps][headers]`.
+/// In practice most MTP browsers send the minimal 2-byte form with sid
+/// only and both length prefixes absent — we tolerate that by treating a
+/// short PDU as "sid only, empty caps and headers".
+fn decode_resume(rest: &[u8]) -> WapResult<WspPdu> {
+    let (sid, n) = uintvar::decode(rest)?;
+    let mut cursor = n;
+    // Minimal form: sid was the entire payload. Real MSs do this.
+    if cursor == rest.len() {
+        return Ok(WspPdu::Resume {
+            server_session_id: sid,
+            capabilities: Vec::new(),
+            headers: HeaderBlock::empty(),
+        });
+    }
+    // Full form: caps-len + headers-len + caps + headers.
+    let (caps_len, n) = uintvar::decode(&rest[cursor..])?;
+    cursor += n;
+    let (hdrs_len, n) = uintvar::decode(&rest[cursor..])?;
+    cursor += n;
+    let caps_end = cursor
+        .checked_add(caps_len as usize)
+        .ok_or_else(|| WapError::WspDecode("Resume caps length overflow".to_owned()))?;
+    let hdrs_end = caps_end
+        .checked_add(hdrs_len as usize)
+        .ok_or_else(|| WapError::WspDecode("Resume headers length overflow".to_owned()))?;
+    if rest.len() < hdrs_end {
+        return Err(WapError::Truncated {
+            expected: hdrs_end + 1,
+            actual: rest.len() + 1,
+        });
+    }
+    let capabilities = caps::decode_list(&rest[cursor..caps_end])?;
+    let headers = HeaderBlock::from_bytes(&rest[caps_end..hdrs_end]);
+    Ok(WspPdu::Resume {
         server_session_id: sid,
         capabilities,
         headers,

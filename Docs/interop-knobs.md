@@ -35,6 +35,41 @@ chances to land on air before SNDCP is notified of failure.
 (§22.3.3.2.6)`.  Grep `escalating to full-SDU retx` in the boot log to
 inventory active escalations.
 
+## WAP gateway WSP Suspend / Resume (PD-11-H2)
+
+The WAP gateway now implements WSP S-Suspend (PDU 0x08) and S-Resume
+(PDU 0x09) per WAP-230 §8.2.2.6 / §8.2.2.7. Motorola / UP.Browser MSs
+send Suspend when the packet-data channel drops (e.g. TUN interface
+teardown, MS entering dormancy) and Resume when it comes back —
+without proper Suspend/Resume handling the MS falls into a "same-tid
+re-Invoke every 4-8 s" loop as the gateway keeps replying 501 (Not
+Implemented).
+
+**Suspend behaviour:** the session record's `state` transitions to
+`Suspended`. Everything else (session id, cached client capabilities,
+peer address) is kept. The idle-eviction timeout for Suspended sessions
+is extended to 15 min (`SUSPENDED_SESSION_IDLE_TIMEOUT`) so a dormant
+MS can Resume minutes later without being forced to reconnect.
+
+**Resume behaviour:**
+* **Session found:** state flips back to `Connected`, `last_seen` is
+  refreshed, and the gateway echoes a fresh ConnectReply carrying the
+  cached capabilities. Subsequent GETs on the resumed session flow
+  normally.
+* **Session unknown** (operator restarted `bluestation`, or the eviction
+  sweep dropped the session while MS was dormant): the gateway replies
+  with a WSP Disconnect PDU carrying the requested session id. Per
+  WAP-230 §8.2.2.7 NOTE 3 this tells the MS its session is gone and
+  the MS then Connects fresh on the next user action — no H33/501
+  retry loop.
+
+**Server-only PDU protection:** if the MS ever illegally sends a
+server-initiated PDU (Redirect, Push, ConfirmedPush, ConnectReply,
+Reply — protocol violation per WAP-230 §8.2.2), the gateway now
+answers WSP `400 Bad Request` rather than `501 Not Implemented`.
+`400` is a hard-error status that stops the MS's WTP-layer retry loop
+instead of encouraging it.
+
 ## WAP gateway WSP capability handling (PD-11-H1)
 
 The WAP gateway's WSP ConnectReply builder can echo the MS-proposed
