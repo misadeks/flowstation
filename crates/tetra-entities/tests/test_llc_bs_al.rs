@@ -3045,7 +3045,39 @@ fn c2_unack_al_setup_is_accepted() {
         "C2: unack_repetition_state should start empty");
 }
 
-/// PD-REWRITE C2b: escalation multi-step. With N.273=2, N.274=2 the SDU
+/// C3: parallel emission — when the drops loop fires an
+/// `AlDeliveryOutcome::DroppedRetxExhausted`, LLC must ALSO push a
+/// `TlaTlReportOutcomeInd` SAP message to the queue so SNDCP (Commit 4b) can
+/// consume the outcome via the formal SAP. Legacy `al_events` hook keeps
+/// firing in parallel; both channels coexist until Commit 5.
+#[test]
+fn c3_report_outcome_ind_fires_alongside_al_events_hook() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 1, 1));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"c3 parallel".to_vec()));
+    drain_queue(&mut queue);
+    mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
+
+    // Drive T.252 exhaust (N.273=N.274=1 → 2 attempts, ~4-5 ticks).
+    let mut t = TdmaTime::default();
+    let mut out: Vec<SapMsg> = Vec::new();
+    for _ in 1..=10u8 {
+        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+        out.extend(tick_at(&mut llc, &mut queue, t));
+        mark_all_segments_transmitted_at(&mut llc, t);
+        let link = llc.al_links.get(&test_key()).unwrap();
+        if link.outstanding_sdus.is_empty() { break; }
+    }
+
+    // Assert: at least one TlaTlReportOutcomeInd was emitted on the queue.
+    let saw_report = out.iter().any(|m| matches!(&m.msg,
+        SapMsgInner::TlaTlReportOutcomeInd(_)));
+    assert!(saw_report,
+        "C3: TlaTlReportOutcomeInd must be emitted alongside al_events hook on retx exhaust");
+}
 /// should survive through 2 full escalation cycles (5 T.252 windows total
 /// under ideal marking), landing at `sdu_restart_count = 2` at the point
 /// of the final drop. Explicit assertions:

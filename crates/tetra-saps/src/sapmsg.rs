@@ -71,6 +71,12 @@ pub enum SapMsgInner {
     TlaTlDataReqAl(TlaTlDataReqAl),
     TlaTlUnitdataIndAl(TlaTlUnitdataIndAl),
     TlaTlUnitdataReqAl(TlaTlUnitdataReqAl),
+    // PD-REWRITE C3: formal TL-* primitives for AL state transitions.
+    // See `crates/tetra-saps/src/tla/mod.rs` (§PD-REWRITE C3 block).
+    TlaTlEstablishInd(TlaTlEstablishInd),
+    TlaTlReconnectInd(TlaTlReconnectInd),
+    TlaTlReleaseInd(TlaTlReleaseInd),
+    TlaTlReportOutcomeInd(TlaTlReportOutcomeInd),
 
     // LMM-SAP (MLE-MM)
     LmmMleUnitdataInd(LmmMleUnitdataInd),
@@ -234,6 +240,10 @@ impl Display for SapMsgInner {
             SapMsgInner::TlaTlDataReqAl(_) => write!(f, "TlaTlDataReqAl"),
             SapMsgInner::TlaTlUnitdataIndAl(_) => write!(f, "TlaTlUnitdataIndAl"),
             SapMsgInner::TlaTlUnitdataReqAl(_) => write!(f, "TlaTlUnitdataReqAl"),
+            SapMsgInner::TlaTlEstablishInd(_) => write!(f, "TlaTlEstablishInd"),
+            SapMsgInner::TlaTlReconnectInd(_) => write!(f, "TlaTlReconnectInd"),
+            SapMsgInner::TlaTlReleaseInd(_) => write!(f, "TlaTlReleaseInd"),
+            SapMsgInner::TlaTlReportOutcomeInd(_) => write!(f, "TlaTlReportOutcomeInd"),
             SapMsgInner::LmmMleUnitdataInd(_) => write!(f, "LmmMleUnitdataInd"),
             SapMsgInner::LmmMleUnitdataReq(_) => write!(f, "LmmMleUnitdataReq"),
             SapMsgInner::LcmcMleUnitdataInd(_) => write!(f, "LcmcMleUnitdataInd"),

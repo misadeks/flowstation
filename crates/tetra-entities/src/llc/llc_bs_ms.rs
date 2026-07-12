@@ -426,6 +426,12 @@ impl Llc {
 
     /// Fire the delivery hook if installed. Never panics; a hook that panics
     /// would take down the entity thread, but that's on the hook implementer.
+    ///
+    /// PD-REWRITE C3: legacy hook is still fired here. Callers should ALSO
+    /// push a `SapMsgInner::TlaTlReportOutcomeInd` to the message queue via
+    /// [`Self::make_report_outcome_ind_msg`] so the outcome is available on
+    /// the formal SAP path (parallel emission during the C3 → C5 migration
+    /// window). `al_events.rs` retires in Commit 5.
     fn emit_delivery(&self, key: AlLinkKey, n_s: u8, outcome: AlDeliveryOutcome) {
         if let Some(hook) = &self.delivery_hook {
             hook(AlDeliveryEvent {
@@ -436,6 +442,34 @@ impl Llc {
                 n_s,
                 outcome,
             });
+        }
+    }
+
+    /// PD-REWRITE C3: build the parallel `TlaTlReportOutcomeInd` SAP message
+    /// for a delivery outcome. Emitted alongside every `emit_delivery` call
+    /// site so SNDCP (Commit 4b) can consume outcomes via the formal SAP.
+    fn make_report_outcome_ind_msg(&self, key: AlLinkKey, n_s: u8, outcome: AlDeliveryOutcome) -> SapMsg {
+        use tetra_saps::tla::{TlaTlReportOutcomeInd, TlaReportOutcome};
+        let outcome = match outcome {
+            AlDeliveryOutcome::Delivered => TlaReportOutcome::Delivered,
+            AlDeliveryOutcome::DroppedFireAndForget => TlaReportOutcome::FireAndForget,
+            AlDeliveryOutcome::DroppedRetxExhausted => TlaReportOutcome::RetxExhausted,
+        };
+        SapMsg {
+            sap: Sap::TlaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Sndcp,
+            msg: SapMsgInner::TlaTlReportOutcomeInd(TlaTlReportOutcomeInd {
+                main_address: TetraAddress {
+                    ssi_type: tetra_core::SsiType::Issi,
+                    ssi: key.ssi,
+                },
+                link_id: key.link_id,
+                endpoint_id: key.endpoint_id,
+                n261: key.n261,
+                n_s,
+                outcome,
+            }),
         }
     }
 
@@ -2250,7 +2284,7 @@ impl Llc {
     /// For both: processes acknowledgement blocks to advance the TX window.
     ///
     /// ETSI TS 100 392-2 v3.10.1 clause 21.4.5.
-    fn on_al_ack_rnr(&mut self, _queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAckAlRnr) {
+    fn on_al_ack_rnr(&mut self, queue: &mut MessageQueue, key: AlLinkKey, pdu: AlAckAlRnr) {
         // PD-10c-H36: two-scope split — the first block owns the mutable
         // borrow on `self.al_links`; once it drops, the second block calls
         // `self.emit_delivery` (which needs `&self` for the hook) without a
@@ -2291,6 +2325,9 @@ impl Llc {
             delivered
         };
         for n_s in delivered {
+            // PD-REWRITE C3: parallel emission — legacy hook + formal SAP primitive.
+            let msg = self.make_report_outcome_ind_msg(key, n_s, AlDeliveryOutcome::Delivered);
+            queue.push_back(msg);
             self.emit_delivery(key, n_s, AlDeliveryOutcome::Delivered);
         }
     }
@@ -3015,9 +3052,13 @@ impl Llc {
         for msg in msgs {
             queue.push_back(msg);
         }
-        // PD-10c-H36: emit any drops now that the mutable borrow on
-        // self.al_links has ended.
+        // PD-10c-H36 + PD-REWRITE C3: emit both the legacy al_events hook AND
+        // the formal `TlaTlReportOutcomeInd` SAP primitive so SNDCP (Commit 4b)
+        // can consume outcomes via the SAP. Both channels fire in parallel
+        // during the C3 → C5 migration window.
         for (key, n_s, outcome) in drops {
+            let msg = self.make_report_outcome_ind_msg(key, n_s, outcome);
+            queue.push_back(msg);
             self.emit_delivery(key, n_s, outcome);
         }
         had
