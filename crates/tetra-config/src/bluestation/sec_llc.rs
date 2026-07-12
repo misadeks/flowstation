@@ -102,6 +102,27 @@ pub struct CfgAdvancedLink {
     /// unchanged); H50 covers the other case without regressing that one.
     /// Default `true`; flip to `false` as a rollback escape hatch.
     pub h47_cached_echo_clears_rx: bool,
+
+    /// PD-5c-H53: when an AL-SETUP negotiates `N.273 (max_sdu_retx) = 0`
+    /// with `service = Ack` and `N.274 (max_segment_retx) > 0`, treat
+    /// `N.273 = 0` as "no explicit SDU-level cap; use N.274 as the
+    /// effective bound". This is H46's MTP6550/WSP interpretation of
+    /// ETSI TS 100 392-2 clause 23.5 and keeps reliable delivery working
+    /// for WSP peers that expect their `N.274` retry budget to be
+    /// honoured.
+    ///
+    /// Flip to `false` to restore pre-H46 semantics: `N.273 = 0` means
+    /// literally zero SDU retries (fire-and-forget). This is the correct
+    /// reading for peers such as MTP3550 running ICMP/PPP over SNDCP,
+    /// whose kernel-side ICMP stack never emits AL-ACK regardless of
+    /// what the AL-SETUP negotiated.
+    ///
+    /// This gate is a global config knob; per-link automatic selection
+    /// via the SNDCP-bound marker (see `AlLink.sndcp_bound`) always
+    /// forces fire-and-forget on SNDCP-created links irrespective of
+    /// this setting. Default `true` to preserve H46 hardware-validated
+    /// WSP behaviour.
+    pub n273_zero_ack_uses_seg_cap: bool,
 }
 
 impl Default for CfgAdvancedLink {
@@ -119,6 +140,7 @@ impl Default for CfgAdvancedLink {
             cache_setup_echo: true,
             dedupe_completed_ns: true,
             h47_cached_echo_clears_rx: true,
+            n273_zero_ack_uses_seg_cap: true,
         }
     }
 }
@@ -159,6 +181,8 @@ pub struct AdvancedLinkDto {
     pub dedupe_completed_ns: bool,
     #[serde(default = "default_h47_cached_echo_clears_rx")]
     pub h47_cached_echo_clears_rx: bool,
+    #[serde(default = "default_n273_zero_ack_uses_seg_cap")]
+    pub n273_zero_ack_uses_seg_cap: bool,
 
     /// Unknown-field detector — parsing.rs rejects any entry present here.
     #[serde(flatten)]
@@ -180,6 +204,7 @@ impl Default for AdvancedLinkDto {
             cache_setup_echo: default_cache_setup_echo(),
             dedupe_completed_ns: default_dedupe_completed_ns(),
             h47_cached_echo_clears_rx: default_h47_cached_echo_clears_rx(),
+            n273_zero_ack_uses_seg_cap: default_n273_zero_ack_uses_seg_cap(),
             extra: HashMap::new(),
         }
     }
@@ -197,6 +222,7 @@ fn default_proactive_disc_on_retx_exhaust() -> bool { true }
 fn default_cache_setup_echo() -> bool { true }
 fn default_dedupe_completed_ns() -> bool { true }
 fn default_h47_cached_echo_clears_rx() -> bool { true }
+fn default_n273_zero_ack_uses_seg_cap() -> bool { true }
 
 /// Serde DTO for `[llc]`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -316,6 +342,7 @@ pub fn validate_advanced_link_config(dto: AdvancedLinkDto) -> Result<CfgAdvanced
         cache_setup_echo: dto.cache_setup_echo,
         dedupe_completed_ns: dto.dedupe_completed_ns,
         h47_cached_echo_clears_rx: dto.h47_cached_echo_clears_rx,
+        n273_zero_ack_uses_seg_cap: dto.n273_zero_ack_uses_seg_cap,
     })
 }
 
@@ -358,6 +385,8 @@ mod tests {
         assert!(cfg.dedupe_completed_ns);
         // PD-5c-H50: H47 cached-echo RX-clear defaults on.
         assert!(cfg.h47_cached_echo_clears_rx);
+        // PD-5c-H53: N.273=0+Ack coercion to N.274 defaults on (WSP-preserving).
+        assert!(cfg.n273_zero_ack_uses_seg_cap);
     }
 
     #[test]
@@ -394,6 +423,7 @@ mod tests {
             cache_setup_echo = false
             dedupe_completed_ns = false
             h47_cached_echo_clears_rx = false
+            n273_zero_ack_uses_seg_cap = false
         "#;
         let dto: AdvancedLinkDto = toml::from_str(toml_str).expect("TOML must parse");
         let cfg = validate_advanced_link_config(dto).expect("must validate");
@@ -407,6 +437,8 @@ mod tests {
         assert!(!cfg.dedupe_completed_ns);
         // PD-5c-H50: override plumbs through.
         assert!(!cfg.h47_cached_echo_clears_rx);
+        // PD-5c-H53: override plumbs through.
+        assert!(!cfg.n273_zero_ack_uses_seg_cap);
     }
 
     #[test]

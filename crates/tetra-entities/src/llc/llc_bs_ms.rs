@@ -45,6 +45,7 @@ use tetra_pdus::llc::pdus::al_disc::AlDisc;
 use tetra_pdus::llc::pdus::al_reconnect::AlReconnect;
 use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::llc::pdus::al_udata::AlAlUdataAlUfinal;
+use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -264,6 +265,23 @@ pub struct AlLink {
     /// ≤ 7 for extended): entries older than one window rollover cannot
     /// be duplicates by definition.
     pub recently_delivered_ns: VecDeque<u8>,
+
+    // ── PD-5c-H53: SNDCP-bound link marker ────────────────────────────────────
+    /// `true` once we've observed an inbound AL-DATA or AL-UDATA whose
+    /// first three bits (the MLE protocol discriminator) identify SNDCP
+    /// (`MleProtocolDiscriminator::Sndcp = 4`). Set lazily in `on_al_data`
+    /// / `on_al_udata` on the first fully-reassembled SDU whose PD is
+    /// SNDCP. Cleared by `reset_transfer_state` so a re-SETUP re-derives
+    /// the classification from the next SDU.
+    ///
+    /// Used by the DL retx loop to force pre-H46 fire-and-forget
+    /// semantics on SNDCP-bound links regardless of the global
+    /// `n273_zero_ack_uses_seg_cap` config gate: MTP3550 negotiates the
+    /// same wire values as MTP6550 (`N.273 = 0, N.274 = 3, service = Ack`)
+    /// but its kernel-side ICMP/PPP stack never emits AL-ACK, so honoring
+    /// the H46 quirk on SNDCP links wastes retries and triggers H47's
+    /// proactive DISC teardown loop.
+    pub sndcp_bound: bool,
 }
 
 impl AlLink {
@@ -309,6 +327,12 @@ impl AlLink {
         // stale entries could either false-positive or false-negative
         // against the fresh stream.
         self.recently_delivered_ns.clear();
+        // PD-5c-H53: SNDCP-bound classification is derived from the first
+        // observed SDU's MLE protocol discriminator. A re-SETUP starts a
+        // fresh transfer, so re-derive rather than carry a stale value
+        // in case the same AL link key is reused by a different upper
+        // layer.
+        self.sndcp_bound = false;
     }
 }
 
@@ -1731,6 +1755,7 @@ impl Llc {
             pending_sdus: VecDeque::new(),
             last_setup_echo: None,
             recently_delivered_ns: VecDeque::new(),
+            sndcp_bound: false,
         });
         // Reset any transfer state carried over from a prior session on
         // this same link key.  On a freshly-inserted link this is a
@@ -1959,6 +1984,23 @@ impl Llc {
                     );
                     completed_sdu = Some(sdu);
                     link.reassemblers.remove(&n_s);
+                    // PD-5c-H53: infer SNDCP-bound classification from the
+                    // MLE protocol discriminator (first 3 bits of the
+                    // reassembled SDU). Sticky once set until the next
+                    // `reset_transfer_state`.
+                    if !link.sndcp_bound {
+                        if let Some(sdu) = completed_sdu.as_ref() {
+                            if let Some(pd_bits) = sdu.peek_bits_startoffset(0, 3) {
+                                if pd_bits == MleProtocolDiscriminator::Sndcp.into_raw() {
+                                    link.sndcp_bound = true;
+                                    tracing::debug!(
+                                        "AL link {:?} classified as SNDCP-bound (H53 fire-and-forget policy will apply on DL)",
+                                        key
+                                    );
+                                }
+                            }
+                        }
+                    }
                     // PD-5c-H49: record this N(S) in the recently-delivered
                     // ring so a peer retransmit (its retry timer fired
                     // before our AL-ACK reached it) re-ACKs without
@@ -2106,6 +2148,20 @@ impl Llc {
                     );
                     link.unack_reassemblers.remove(&n_s);
                     link.unack_started_at.remove(&n_s);
+                    // PD-5c-H53: infer SNDCP-bound classification from the
+                    // MLE protocol discriminator (first 3 bits of the SDU).
+                    // Same logic as the acknowledged path in `on_al_data`.
+                    if !link.sndcp_bound {
+                        if let Some(pd_bits) = sdu.peek_bits_startoffset(0, 3) {
+                            if pd_bits == MleProtocolDiscriminator::Sndcp.into_raw() {
+                                link.sndcp_bound = true;
+                                tracing::debug!(
+                                    "AL link {:?} classified as SNDCP-bound via U-DATA (H53)",
+                                    key
+                                );
+                            }
+                        }
+                    }
                     Some(sdu)
                 }
                 Ok(UnackReassemblerFeed::FcsFailure { info, .. }) => {
@@ -2348,6 +2404,7 @@ impl Llc {
                         pending_sdus: VecDeque::new(),
                         last_setup_echo: None,
                         recently_delivered_ns: VecDeque::new(),
+                        sndcp_bound: false,
                     });
                 }
                 let msg = Self::make_al_sap_msg_reconnect(
@@ -2393,11 +2450,13 @@ impl Llc {
         let dltime = self.dltime;
         // Extract config-driven retry limits before the loop to avoid borrow conflicts
         // with the mutable borrow of self.al_links inside the loop.
-        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect, cfg_proactive_disc) = {
+        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect, cfg_proactive_disc,
+             cfg_n273_zero_ack_uses_seg_cap) = {
             let cfg = self.config.config();
             let al = &cfg.llc.advanced_link;
             (al.max_setup_retries, al.max_disc_retries, al.max_reconnect_retries,
-             al.proactive_disc_on_retx_exhaust)
+             al.proactive_disc_on_retx_exhaust,
+             al.n273_zero_ack_uses_seg_cap)
         };
         let mut msgs: Vec<SapMsg> = Vec::new();
         let mut links_to_set_idle: Vec<AlLinkKey> = Vec::new();
@@ -2548,6 +2607,18 @@ impl Llc {
                         //   only fires when N.273 itself is zero.
                         // - H26 peer-requested (SduFcsFailure) retx path
                         //   remains independent with its own cap of 3.
+                        // PD-5c-H53: gate H46's `N.273=0+Ack -> use N.274`
+                        // coercion on two conditions:
+                        //   1. Config `llc.advanced_link.n273_zero_ack_uses_seg_cap`
+                        //      is true (default; preserves H46/WSP hardware
+                        //      behaviour).
+                        //   2. The link is NOT SNDCP-bound (SNDCP-side ICMP/PPP
+                        //      kernel stacks never emit AL-ACK, so retrying is
+                        //      wasted work that then triggers H47's proactive
+                        //      DISC teardown loop).
+                        // When either condition fails, fall through to the
+                        // pre-H46 `min()` semantics — `N.273 = 0` yields
+                        // `effective_max_retx = 0` (fire-and-forget).
                         let effective_max_retx = if link.max_segment_retx == 0 {
                             // Per audit §P7: N.274 = 0 means the peer opted
                             // out of per-segment retx entirely. Any retx of
@@ -2556,8 +2627,10 @@ impl Llc {
                             0
                         } else if link.max_sdu_retx == 0
                             && link.service == AdvancedLinkService::Ack
+                            && cfg_n273_zero_ack_uses_seg_cap
+                            && !link.sndcp_bound
                         {
-                            // PD-5c-H46: MTP6550 quirk (see above).
+                            // PD-5c-H46: MTP6550 WSP quirk (see above).
                             link.max_segment_retx
                         } else {
                             std::cmp::min(link.max_sdu_retx, link.max_segment_retx)

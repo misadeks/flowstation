@@ -2823,3 +2823,193 @@ fn h50_disabled_config_preserves_stale_rx_behaviour() {
     );
 }
 
+
+// ─── PD-5c-H53: gate H46's N.273=0+Ack coercion + auto-fire-and-forget for SNDCP ─────
+
+/// Build an LLC with a specific value for the H53
+/// `n273_zero_ack_uses_seg_cap` toggle, all other flags at default.
+fn make_llc_with_h53_flag(n273_zero_ack_uses_seg_cap: bool) -> (Llc, MessageQueue) {
+    let mut cfg = ComponentTest::get_default_test_config(StackMode::Bs);
+    cfg.llc.advanced_link.n273_zero_ack_uses_seg_cap = n273_zero_ack_uses_seg_cap;
+    let sc = tetra_config::bluestation::SharedConfig::from_parts(cfg, None);
+    (Llc::new(sc), MessageQueue::new())
+}
+
+/// PD-5c-H53: with the H46 quirk config-gated OFF, an MTP3550-style AL-SETUP
+/// (`N.273 = 0, N.274 = 3, service = Ack`) reverts to pre-H46 fire-and-forget
+/// semantics for the DL SDU. Verifies the whole cycle stays silent: no retry,
+/// no proactive AL-DISC, no `TmaPurgeByAddressReq` — the SDU is released
+/// after one transmission and the link stays healthy for further traffic.
+#[test]
+fn h53_ppp_style_al_setup_fire_and_forget_when_gate_off() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc_with_h53_flag(false);
+    // MTP3550/PPP-style proposal — same wire values as MTP6550 WSP but the
+    // peer's SNDCP/ICMP stack never emits AL-ACK.
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 0, 3));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"h53 ppp".to_vec()));
+    drain_queue(&mut queue);
+    mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
+    {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert_eq!(link.max_sdu_retx, 0);
+        assert_eq!(link.max_segment_retx, 3);
+        assert_eq!(link.outstanding_sdus.len(), 1);
+    }
+
+    // One T.252 expiry: with the gate OFF, effective_max_retx collapses to
+    // min(0, 3) = 0 and the SDU is released as fire-and-forget.
+    let t = TdmaTime::default().add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    let out = tick_at(&mut llc, &mut queue, t);
+
+    // The link must survive (fire-and-forget release, not proactive DISC).
+    let link = llc.al_links.get(&test_key())
+        .expect("H53: link must survive fire-and-forget SDU release");
+    assert!(link.outstanding_sdus.is_empty(),
+        "H53: SDU must be released after one TX under fire-and-forget");
+    assert_eq!(link.phase, AlPhase::Established,
+        "H53: link must remain Established (no teardown on fire-and-forget)");
+
+    // No proactive AL-DISC and no purge on the fire-and-forget path.
+    let purge = out.iter().any(|m| matches!(&m.msg,
+        SapMsgInner::TmaPurgeByAddressReq { .. }));
+    assert!(!purge,
+        "H53: fire-and-forget release must NOT trigger the H47 proactive teardown \
+         path (no TmaPurgeByAddressReq expected)");
+}
+
+/// PD-5c-H53: with the H46 quirk config-gated ON (default), the MTP6550 WSP
+/// hardware fix is preserved verbatim — same MTP3550 wire values still
+/// produce 3 real retransmissions then H47 teardown. Regression guard so a
+/// misplaced default flip cannot silently regress the H46 hardware bar.
+#[test]
+fn h53_wsp_style_al_setup_still_retries_when_gate_on_default() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc(); // default: gate ON
+    let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
+        /* max_sdu_retx */ 0, /* max_segment_retx */ 3, b"h53 wsp".to_vec());
+
+    // 3 retx must fire under H46 (parity with al_tx_h46_mtp6550_n273_zero_ack_uses_seg_cap).
+    let mut t = t0;
+    for expected_retx in 1..=3u8 {
+        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+        tick_at(&mut llc, &mut queue, t);
+        let link = llc.al_links.get(&test_key())
+            .expect("H53: link must survive during H46 retries with gate on");
+        assert_eq!(link.outstanding_sdus[0].retx_count, expected_retx,
+            "H53: gate=on must preserve H46 retry cap = N.274 = 3");
+        mark_all_segments_transmitted_at(&mut llc, t);
+    }
+
+    // 4th expiry: exhaust + H47 proactive teardown (link removed).
+    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    tick_at(&mut llc, &mut queue, t);
+    assert!(
+        llc.al_links.get(&test_key()).is_none(),
+        "H53: gate=on preserves H46+H47 behaviour: link torn down after 3 retx"
+    );
+}
+
+/// PD-5c-H53: auto-detection — even when the config gate is ON (default),
+/// an AL link that has delivered at least one inbound SDU tagged as SNDCP
+/// (MLE protocol discriminator = 4) is flagged `sndcp_bound = true` and
+/// the DL retx loop reverts to fire-and-forget for that link. Preserves H46
+/// for WSP links (which never carry the SNDCP PD) while auto-fixing PPP
+/// links without operator TOML intervention.
+#[test]
+fn h53_sndcp_bound_link_uses_fire_and_forget_even_when_gate_on() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc(); // default: gate ON
+    // Establish with MTP3550-style negotiation.
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 0, 3));
+    drain_queue(&mut queue);
+
+    // Feed an inbound AL-DATA whose SDU starts with the SNDCP MLE protocol
+    // discriminator (0b100 = 4 in the top 3 bits of byte 0 → 0x80..0x9F).
+    let sndcp_sdu = vec![0x84u8, 0x00, 0x11, 0x22]; // top 3 bits = 100 → SNDCP
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_al_data_ind(&sndcp_sdu, 0));
+    take_data_ind_al(&mut queue).expect("H53: SNDCP-tagged SDU must deliver upward");
+    drain_queue(&mut queue);
+
+    // The link is now flagged as SNDCP-bound.
+    {
+        let link = llc.al_links.get(&test_key()).expect("link exists");
+        assert!(link.sndcp_bound,
+            "H53: link with an inbound SNDCP-tagged SDU must be sndcp_bound=true");
+        assert_eq!(link.max_sdu_retx, 0);
+        assert_eq!(link.max_segment_retx, 3);
+    }
+
+    // Now enqueue a DL SDU. Even though the config gate is ON (WSP-preserving),
+    // the sndcp_bound flag forces pre-H46 fire-and-forget on this link.
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"h53 dl ppp reply".to_vec()));
+    drain_queue(&mut queue);
+    mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
+
+    // One T.252 expiry must release the SDU as fire-and-forget — no retry,
+    // no proactive AL-DISC, no purge.
+    let t = TdmaTime::default().add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+    let out = tick_at(&mut llc, &mut queue, t);
+
+    let link = llc.al_links.get(&test_key())
+        .expect("H53: SNDCP-bound link must survive fire-and-forget release");
+    assert!(link.outstanding_sdus.is_empty(),
+        "H53: SNDCP-bound link must fire-and-forget the DL SDU (no retry)");
+    assert_eq!(link.phase, AlPhase::Established,
+        "H53: SNDCP-bound link must stay Established after fire-and-forget");
+    let purge = out.iter().any(|m| matches!(&m.msg,
+        SapMsgInner::TmaPurgeByAddressReq { .. }));
+    assert!(!purge,
+        "H53: SNDCP-bound fire-and-forget must NOT trigger H47 teardown path");
+}
+
+/// PD-5c-H53: reset_transfer_state clears the sndcp_bound marker so a
+/// re-SETUP re-derives the classification from the next inbound SDU. Guards
+/// against a stale-true carrying across a session boundary if the same AL
+/// link key is later reused by a different upper layer.
+#[test]
+fn h53_reset_transfer_state_clears_sndcp_bound() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    // Deliver an SNDCP-tagged SDU to set sndcp_bound=true.
+    let sndcp_sdu = vec![0x84u8, 0xAA, 0xBB];
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_al_data_ind(&sndcp_sdu, 0));
+    take_data_ind_al(&mut queue).expect("delivery");
+    drain_queue(&mut queue);
+    assert!(llc.al_links.get(&test_key()).unwrap().sndcp_bound,
+        "precondition: sndcp_bound must be set after SNDCP delivery");
+
+    // Re-SETUP with report=Reset bypasses H47 cached-echo fast path (H48
+    // guard) and forces the full accept flow, which calls reset_transfer_state.
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu(SetupReport::Reset));
+    drain_queue(&mut queue);
+    assert!(!llc.al_links.get(&test_key()).unwrap().sndcp_bound,
+        "H53: reset_transfer_state (via re-SETUP with Reset) must clear sndcp_bound");
+}
+
+/// PD-5c-H53: non-SNDCP MLE protocol discriminators (MM=1, CMCE=2, MLE=5)
+/// must NOT set sndcp_bound. Ensures WSP-over-AL (which is not tagged with
+/// PD=SNDCP at the MLE layer above LLC) keeps H46's retry benefit under the
+/// default config.
+#[test]
+fn h53_non_sndcp_pd_does_not_set_sndcp_bound() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    establish_link(&mut llc, &mut queue);
+    drain_queue(&mut queue);
+
+    // Top 3 bits = 010 = 2 (CMCE) — typical WSP-adjacent path.
+    let cmce_sdu = vec![0x44u8, 0x00, 0x11];
+    one_tick(&mut llc, &mut queue, TdmaTime::default(), make_al_data_ind(&cmce_sdu, 0));
+    take_data_ind_al(&mut queue).expect("delivery");
+    drain_queue(&mut queue);
+    assert!(!llc.al_links.get(&test_key()).unwrap().sndcp_bound,
+        "H53: non-SNDCP PD (CMCE=2 here) must NOT set sndcp_bound");
+}
