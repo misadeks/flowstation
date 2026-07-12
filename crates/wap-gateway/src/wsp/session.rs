@@ -268,7 +268,18 @@ impl WspHandler {
         let pdu = match WspPdu::decode(&payload) {
             Ok(p) => p,
             Err(e) => {
-                warn!(error = %e, "wsp: failed to decode PDU, replying 400");
+                // PD-11-H3: hex-dump the raw payload so hardware traces can
+                // identify what the MS actually sent when we fail to decode.
+                // Without this the 400-and-Awt-retry loop is undiagnosable
+                // from just the log — you have to reach for tcpdump every
+                // time.
+                let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                warn!(
+                    error = %e,
+                    payload_len = payload.len(),
+                    payload_hex = %hex,
+                    "wsp: failed to decode PDU, replying 400"
+                );
                 return build_status_reply(STATUS_BAD_REQUEST).encode();
             }
         };

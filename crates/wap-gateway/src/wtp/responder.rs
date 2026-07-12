@@ -339,7 +339,20 @@ impl Responder {
         payload: Vec<u8>,
         _tid_new: bool,
     ) -> WapResult<()> {
-        info!(%peer, tid, ?class, len = payload.len(), ttr = flags.ttr, "invoke");
+        // PD-11-H3: log a hex snippet of the incoming Invoke payload
+        // (capped at 32 bytes) so we can correlate WTP-layer view with
+        // the WSP handler's view when decode fails downstream.
+        let hex_preview: String = payload.iter().take(32).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+        let suffix = if payload.len() > 32 { "..." } else { "" };
+        info!(
+            %peer,
+            tid,
+            ?class,
+            len = payload.len(),
+            ttr = flags.ttr,
+            payload_hex = %format!("{hex_preview}{suffix}"),
+            "invoke"
+        );
 
         // Class 0 = unconfirmed, no Ack, no Result. Just deliver.
         if class == TransactionClass::Class0 {
