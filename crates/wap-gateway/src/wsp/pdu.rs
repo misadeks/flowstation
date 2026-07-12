@@ -184,6 +184,13 @@ impl WspPdu {
             }
             pdu_type::SUSPEND => {
                 // WAP-230 §8.2.2.6: single uintvar server_session_id.
+                // PD-11-H3: some MS firmwares send Suspend with no sid at
+                // all (just the type byte). Tolerate that by defaulting sid
+                // to 0 — session dispatcher handles "unknown session"
+                // gracefully anyway.
+                if rest.is_empty() {
+                    return Ok(Self::Suspend { server_session_id: 0 });
+                }
                 let (sid, n) = uintvar::decode(rest)?;
                 if n != rest.len() {
                     return Err(WapError::WspDecode(format!("Suspend has {} trailing bytes", rest.len() - n)));
@@ -352,6 +359,16 @@ fn decode_connect_reply(rest: &[u8]) -> WapResult<WspPdu> {
 /// only and both length prefixes absent — we tolerate that by treating a
 /// short PDU as "sid only, empty caps and headers".
 fn decode_resume(rest: &[u8]) -> WapResult<WspPdu> {
+    // PD-11-H3: some MS firmwares send Resume with no sid at all (just the
+    // type byte). Tolerate that with sid=0; session dispatcher then replies
+    // Disconnect for the unknown session and MS reconnects fresh.
+    if rest.is_empty() {
+        return Ok(WspPdu::Resume {
+            server_session_id: 0,
+            capabilities: Vec::new(),
+            headers: HeaderBlock::empty(),
+        });
+    }
     let (sid, n) = uintvar::decode(rest)?;
     let mut cursor = n;
     // Minimal form: sid was the entire payload. Real MSs do this.
