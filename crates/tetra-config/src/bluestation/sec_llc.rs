@@ -153,11 +153,113 @@ impl Default for CfgAdvancedLink {
     }
 }
 
-/// Top-level LLC config (currently only carries `advanced_link`; reserved for
-/// future basic-link knobs).
+/// Top-level LLC config.
+///
+/// `interop_profile` selects a named bundle of interop-quirk gates for known
+/// MS models. Individual knobs on `[llc.advanced_link]` set explicitly in
+/// the TOML always win over the profile's default for that knob (see
+/// `Docs/interop-knobs.md`). This lets operators use a named profile as a
+/// starting point and override specific gates when needed.
 #[derive(Debug, Clone, Default)]
 pub struct CfgLlc {
+    /// Interop profile selection. See [`InteropProfile`].
+    pub interop_profile: InteropProfile,
     pub advanced_link: CfgAdvancedLink,
+}
+
+/// PD-REWRITE C6: named bundles of LLC interop-quirk gates.
+///
+/// A profile sets *defaults* for the gates it names. Explicit knobs in
+/// `[llc.advanced_link]` still win — profile-set values are only used when
+/// the corresponding knob is absent from the TOML.
+///
+/// Precedence: **explicit knob > profile default > spec default**.
+///
+/// See `Docs/interop-knobs.md` for the operator-facing catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteropProfile {
+    /// Spec-compliant defaults everywhere. All interop gates start off
+    /// unless individually enabled.
+    Standard,
+    /// Enable the LLC-side gates known to help MTP3550 handset interop
+    /// (currently H49 dedupe + H50 cached-echo RX-clear, both already
+    /// default-on; the profile names the group so operators can reason
+    /// about it and so future evolution — WTP-side gates from Commit 6b,
+    /// or default-flip changes — doesn't silently alter semantics).
+    ///
+    /// Not a functional change relative to Commit-1 defaults today; the
+    /// profile is a stable operator surface.
+    Mtp3550Interop,
+    /// Enable the H46 quirk (`n273_zero_ack_uses_seg_cap = true`) needed
+    /// by the MTP6550 WSP portal. Spec-noncompliant per §22.3.3.2 + Annex
+    /// A; the startup WARN log names it.
+    Mtp6550Interop,
+    /// No profile-driven overrides. Every knob comes from either an
+    /// explicit TOML value or the spec-compliant default.
+    Custom,
+}
+
+impl Default for InteropProfile {
+    fn default() -> Self { InteropProfile::Standard }
+}
+
+impl std::str::FromStr for InteropProfile {
+    type Err = ConfigError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "standard" => Ok(InteropProfile::Standard),
+            "mtp3550_interop" => Ok(InteropProfile::Mtp3550Interop),
+            "mtp6550_interop" => Ok(InteropProfile::Mtp6550Interop),
+            "custom" => Ok(InteropProfile::Custom),
+            other => Err(ConfigError {
+                field: "llc.interop_profile",
+                message: format!(
+                    "must be one of \"standard\", \"mtp3550_interop\", \"mtp6550_interop\", \"custom\"; got {:?}",
+                    other
+                ),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for InteropProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            InteropProfile::Standard => "standard",
+            InteropProfile::Mtp3550Interop => "mtp3550_interop",
+            InteropProfile::Mtp6550Interop => "mtp6550_interop",
+            InteropProfile::Custom => "custom",
+        })
+    }
+}
+
+impl InteropProfile {
+    /// Returns this profile's default for `n273_zero_ack_uses_seg_cap` (H46),
+    /// or `None` if the profile does not touch this knob (spec default applies).
+    pub fn n273_zero_ack_uses_seg_cap(&self) -> Option<bool> {
+        match self {
+            InteropProfile::Mtp6550Interop => Some(true),
+            InteropProfile::Standard | InteropProfile::Mtp3550Interop | InteropProfile::Custom => None,
+        }
+    }
+
+    /// Returns this profile's default for `dedupe_completed_ns` (H49), or
+    /// `None` if the profile does not touch this knob.
+    pub fn dedupe_completed_ns(&self) -> Option<bool> {
+        match self {
+            InteropProfile::Mtp3550Interop => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Returns this profile's default for `h47_cached_echo_clears_rx` (H50),
+    /// or `None` if the profile does not touch this knob.
+    pub fn h47_cached_echo_clears_rx(&self) -> Option<bool> {
+        match self {
+            InteropProfile::Mtp3550Interop => Some(true),
+            _ => None,
+        }
+    }
 }
 
 // ─── Serde DTOs ───────────────────────────────────────────────────────────────
@@ -191,12 +293,16 @@ pub struct AdvancedLinkDto {
     pub proactive_disc_on_retx_exhaust: Option<bool>,
     #[serde(default = "default_cache_setup_echo")]
     pub cache_setup_echo: bool,
-    #[serde(default = "default_dedupe_completed_ns")]
-    pub dedupe_completed_ns: bool,
-    #[serde(default = "default_h47_cached_echo_clears_rx")]
-    pub h47_cached_echo_clears_rx: bool,
-    #[serde(default = "default_n273_zero_ack_uses_seg_cap")]
-    pub n273_zero_ack_uses_seg_cap: bool,
+    /// H49 gate. `None` = use profile default (or spec default if profile
+    /// doesn't touch); `Some(x)` = explicit override from operator TOML.
+    #[serde(default)]
+    pub dedupe_completed_ns: Option<bool>,
+    /// H50 gate. `None` = profile / spec default; `Some(x)` = explicit override.
+    #[serde(default)]
+    pub h47_cached_echo_clears_rx: Option<bool>,
+    /// H46 gate. `None` = profile / spec default; `Some(x)` = explicit override.
+    #[serde(default)]
+    pub n273_zero_ack_uses_seg_cap: Option<bool>,
 
     /// Unknown-field detector — parsing.rs rejects any entry present here.
     #[serde(flatten)]
@@ -216,9 +322,9 @@ impl Default for AdvancedLinkDto {
             max_tl_sdu_octets: default_max_tl_sdu_octets(),
             proactive_disc_on_retx_exhaust: None,
             cache_setup_echo: default_cache_setup_echo(),
-            dedupe_completed_ns: default_dedupe_completed_ns(),
-            h47_cached_echo_clears_rx: default_h47_cached_echo_clears_rx(),
-            n273_zero_ack_uses_seg_cap: default_n273_zero_ack_uses_seg_cap(),
+            dedupe_completed_ns: None,
+            h47_cached_echo_clears_rx: None,
+            n273_zero_ack_uses_seg_cap: None,
             extra: HashMap::new(),
         }
     }
@@ -233,11 +339,16 @@ fn default_max_disc_retries() -> u8 { 3 }
 fn default_max_reconnect_retries() -> u8 { 3 }
 fn default_max_tl_sdu_octets() -> u16 { 4096 }
 fn default_cache_setup_echo() -> bool { true }
-fn default_dedupe_completed_ns() -> bool { true }
-fn default_h47_cached_echo_clears_rx() -> bool { true }
-/// PD-REWRITE C1 (P3 Fork 3): flipped from `true` to `false`. See
-/// `CfgAdvancedLink::default` for the interop-implications note.
-fn default_n273_zero_ack_uses_seg_cap() -> bool { false }
+/// Spec-default for `dedupe_completed_ns` (H49) when neither the profile nor
+/// an explicit TOML knob provides a value. Kept true because §22.3.3.2.7
+/// NOTE 6 permits the send-ACK-then-discard strategy and it prevents an
+/// upward-visible WSP replay cascade for common peers.
+pub(crate) fn spec_default_dedupe_completed_ns() -> bool { true }
+/// Spec-default for `h47_cached_echo_clears_rx` (H50). See sec_llc.rs docs.
+pub(crate) fn spec_default_h47_cached_echo_clears_rx() -> bool { true }
+/// PD-REWRITE C1 (P3 Fork 3): spec-compliant default is `false` (fire-and-
+/// forget when N.273=0 on ACK link per Annex A range 0..=7).
+pub(crate) fn spec_default_n273_zero_ack_uses_seg_cap() -> bool { false }
 
 /// Serde DTO for `[llc]`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -247,6 +358,10 @@ pub struct CfgLlcDto {
     #[serde(default)]
     pub advanced_link: Option<AdvancedLinkDto>,
 
+    /// PD-REWRITE C6: interop-profile selection. Absent or missing = Standard.
+    #[serde(default)]
+    pub interop_profile: Option<String>,
+
     /// Unknown-field detector — parsing.rs rejects any entry present here.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -254,12 +369,25 @@ pub struct CfgLlcDto {
 
 // ─── Validation & conversion ─────────────────────────────────────────────────
 
+/// Convenience wrapper: validate + convert an `AdvancedLinkDto` using the
+/// default (`Standard`) interop profile. Preferred entry point for tests and
+/// code paths that don't care about profiles.
+pub fn validate_advanced_link_config(
+    dto: AdvancedLinkDto,
+) -> Result<CfgAdvancedLink, ConfigError> {
+    validate_advanced_link_config_with_profile(dto, InteropProfile::Standard)
+}
+
 /// Validate an `AdvancedLinkDto` against spec ranges and convert it to the
-/// compiled [`CfgAdvancedLink`].
+/// compiled [`CfgAdvancedLink`], resolving the three profile-affected gates
+/// via `profile`.
 ///
 /// Returns [`ConfigError`] on the first failing field, with the full dotted
 /// TOML path and a human-readable bound description.
-pub fn validate_advanced_link_config(dto: AdvancedLinkDto) -> Result<CfgAdvancedLink, ConfigError> {
+pub fn validate_advanced_link_config_with_profile(
+    dto: AdvancedLinkDto,
+    profile: InteropProfile,
+) -> Result<CfgAdvancedLink, ConfigError> {
     if dto.segment_payload_octets < 1 || dto.segment_payload_octets > 512 {
         return Err(ConfigError {
             field: "llc.advanced_link.segment_payload_octets",
@@ -354,6 +482,22 @@ pub fn validate_advanced_link_config(dto: AdvancedLinkDto) -> Result<CfgAdvanced
         );
     }
 
+    // PD-REWRITE C6: resolve the three profile-affected gates. Precedence
+    // is explicit knob > profile default > spec default; the
+    // `dto.*` fields are `Option<bool>` so `Some(x)` means an explicit knob.
+    let n273_zero_ack_uses_seg_cap = dto
+        .n273_zero_ack_uses_seg_cap
+        .or_else(|| profile.n273_zero_ack_uses_seg_cap())
+        .unwrap_or_else(spec_default_n273_zero_ack_uses_seg_cap);
+    let dedupe_completed_ns = dto
+        .dedupe_completed_ns
+        .or_else(|| profile.dedupe_completed_ns())
+        .unwrap_or_else(spec_default_dedupe_completed_ns);
+    let h47_cached_echo_clears_rx = dto
+        .h47_cached_echo_clears_rx
+        .or_else(|| profile.h47_cached_echo_clears_rx())
+        .unwrap_or_else(spec_default_h47_cached_echo_clears_rx);
+
     Ok(CfgAdvancedLink {
         segment_payload_octets: dto.segment_payload_octets,
         tx_window: dto.tx_window,
@@ -364,19 +508,23 @@ pub fn validate_advanced_link_config(dto: AdvancedLinkDto) -> Result<CfgAdvanced
         max_reconnect_retries: dto.max_reconnect_retries,
         max_tl_sdu_octets: dto.max_tl_sdu_octets,
         cache_setup_echo: dto.cache_setup_echo,
-        dedupe_completed_ns: dto.dedupe_completed_ns,
-        h47_cached_echo_clears_rx: dto.h47_cached_echo_clears_rx,
-        n273_zero_ack_uses_seg_cap: dto.n273_zero_ack_uses_seg_cap,
+        dedupe_completed_ns,
+        h47_cached_echo_clears_rx,
+        n273_zero_ack_uses_seg_cap,
     })
 }
 
 /// Convert a `CfgLlcDto` to the compiled [`CfgLlc`].
 pub fn apply_llc_patch(dto: CfgLlcDto) -> Result<CfgLlc, ConfigError> {
-    let advanced_link = match dto.advanced_link {
-        Some(al_dto) => validate_advanced_link_config(al_dto)?,
-        None => CfgAdvancedLink::default(),
+    let profile = match dto.interop_profile.as_deref() {
+        Some(s) => s.parse::<InteropProfile>()?,
+        None => InteropProfile::default(),
     };
-    Ok(CfgLlc { advanced_link })
+    let advanced_link = match dto.advanced_link {
+        Some(al_dto) => validate_advanced_link_config_with_profile(al_dto, profile)?,
+        None => validate_advanced_link_config_with_profile(AdvancedLinkDto::default(), profile)?,
+    };
+    Ok(CfgLlc { interop_profile: profile, advanced_link })
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -489,8 +637,8 @@ mod tests {
         let cfg = CfgAdvancedLink::default();
         assert!(!cfg.n273_zero_ack_uses_seg_cap,
             "PD-REWRITE C1 (P3 Fork 3): default must be false for spec compliance");
-        assert!(!default_n273_zero_ack_uses_seg_cap(),
-            "the DTO default function must return false");
+        assert!(!spec_default_n273_zero_ack_uses_seg_cap(),
+            "PD-REWRITE C6: the spec-default function must return false");
     }
 
     /// T5: deprecated `proactive_disc_on_retx_exhaust` field in TOML must be
@@ -536,6 +684,110 @@ mod tests {
     fn pd_rewrite_c1_no_other_h47_aliases_in_operator_surface() {
         // Sentinel test: this passes as long as the alias-sweep audit records
         // above remain accurate. It carries no runtime assertion.
+    }
+
+    // ── PD-REWRITE C6 tests ────────────────────────────────────────────────
+
+    /// C6-T1: profile string parsing round-trip.
+    #[test]
+    fn pd_rewrite_c6_interop_profile_parses_all_variants() {
+        use std::str::FromStr;
+        assert_eq!(InteropProfile::from_str("standard").unwrap(), InteropProfile::Standard);
+        assert_eq!(InteropProfile::from_str("mtp3550_interop").unwrap(), InteropProfile::Mtp3550Interop);
+        assert_eq!(InteropProfile::from_str("mtp6550_interop").unwrap(), InteropProfile::Mtp6550Interop);
+        assert_eq!(InteropProfile::from_str("custom").unwrap(), InteropProfile::Custom);
+        let err = InteropProfile::from_str("mtp1234_bogus").unwrap_err();
+        assert_eq!(err.field, "llc.interop_profile");
+    }
+
+    /// C6-T2: default profile is `Standard`.
+    #[test]
+    fn pd_rewrite_c6_default_profile_is_standard() {
+        let cfg = CfgLlc::default();
+        assert_eq!(cfg.interop_profile, InteropProfile::Standard);
+    }
+
+    /// C6-T3: `Mtp6550Interop` profile turns H46 (n273_zero_ack_uses_seg_cap) on.
+    #[test]
+    fn pd_rewrite_c6_mtp6550_profile_enables_h46() {
+        let cfg = validate_advanced_link_config_with_profile(
+            AdvancedLinkDto::default(),
+            InteropProfile::Mtp6550Interop,
+        ).unwrap();
+        assert!(cfg.n273_zero_ack_uses_seg_cap,
+            "mtp6550_interop profile must enable H46");
+        // Other gates unchanged.
+        assert!(cfg.dedupe_completed_ns);
+        assert!(cfg.h47_cached_echo_clears_rx);
+    }
+
+    /// C6-T4: `Mtp3550Interop` profile explicitly sets H49/H50 (already spec-legal
+    /// defaults, but the profile names the intent so future default-flips don't
+    /// silently change semantics).
+    #[test]
+    fn pd_rewrite_c6_mtp3550_profile_names_h49_h50_group() {
+        let cfg = validate_advanced_link_config_with_profile(
+            AdvancedLinkDto::default(),
+            InteropProfile::Mtp3550Interop,
+        ).unwrap();
+        assert!(cfg.dedupe_completed_ns, "mtp3550 profile names H49 explicitly");
+        assert!(cfg.h47_cached_echo_clears_rx, "mtp3550 profile names H50 explicitly");
+        // H46 stays off — profile doesn't touch it.
+        assert!(!cfg.n273_zero_ack_uses_seg_cap);
+    }
+
+    /// C6-T5: `Standard` profile = spec defaults everywhere. H46 off; H49/H50
+    /// default (currently true; may flip in a future commit).
+    #[test]
+    fn pd_rewrite_c6_standard_profile_uses_spec_defaults() {
+        let cfg = validate_advanced_link_config_with_profile(
+            AdvancedLinkDto::default(),
+            InteropProfile::Standard,
+        ).unwrap();
+        assert!(!cfg.n273_zero_ack_uses_seg_cap, "Standard: H46 off (spec-compliant)");
+        assert_eq!(cfg.dedupe_completed_ns, spec_default_dedupe_completed_ns());
+        assert_eq!(cfg.h47_cached_echo_clears_rx, spec_default_h47_cached_echo_clears_rx());
+    }
+
+    /// C6-T6: **precedence** — explicit knob wins over profile default.
+    /// `Mtp6550Interop` would enable H46, but the DTO explicitly sets it false.
+    #[test]
+    fn pd_rewrite_c6_explicit_knob_overrides_profile_default() {
+        let dto = AdvancedLinkDto {
+            n273_zero_ack_uses_seg_cap: Some(false),
+            ..AdvancedLinkDto::default()
+        };
+        let cfg = validate_advanced_link_config_with_profile(
+            dto,
+            InteropProfile::Mtp6550Interop,
+        ).unwrap();
+        assert!(!cfg.n273_zero_ack_uses_seg_cap,
+            "explicit `Some(false)` in DTO must override the Mtp6550Interop profile's `Some(true)` default");
+    }
+
+    /// C6-T7: full TOML → profile applied, explicit knob overrides profile.
+    #[test]
+    fn pd_rewrite_c6_full_toml_profile_and_override() {
+        let toml_str = r#"
+            interop_profile = "mtp6550_interop"
+
+            [advanced_link]
+            n273_zero_ack_uses_seg_cap = false
+        "#;
+        let dto: CfgLlcDto = toml::from_str(toml_str).expect("TOML must parse");
+        let cfg = apply_llc_patch(dto).expect("apply must succeed");
+        assert_eq!(cfg.interop_profile, InteropProfile::Mtp6550Interop);
+        assert!(!cfg.advanced_link.n273_zero_ack_uses_seg_cap,
+            "explicit knob in TOML must override profile choice");
+    }
+
+    /// C6-T8: bogus profile string in TOML produces a clear ConfigError.
+    #[test]
+    fn pd_rewrite_c6_bogus_profile_string_rejected() {
+        let toml_str = r#"interop_profile = "mtp9999_bogus""#;
+        let dto: CfgLlcDto = toml::from_str(toml_str).expect("TOML parses");
+        let err = apply_llc_patch(dto).unwrap_err();
+        assert_eq!(err.field, "llc.interop_profile");
     }
 
 
