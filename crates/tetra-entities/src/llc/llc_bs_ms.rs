@@ -198,10 +198,20 @@ pub struct AlLink {
     /// a larger window.  For `connection_width == 1` (Extended AL) we honor
     /// the negotiated window.  See PD-5c-H15.
     pub effective_tx_sdu_window: u8,
-    /// N.273 — max SDU retransmissions.
+    /// N.273 — max SDU retransmissions (for acknowledged service) OR
+    /// N.282 — number of TL-SDU repetitions (for unacknowledged service).
+    /// Same 3-bit field in AL-SETUP; semantic depends on `service` bit per
+    /// ETSI TS 100 392-2 §21.2.3.5 Table 21.23 NOTE 5.
     pub max_sdu_retx: u8,
-    /// N.274 — max per-segment retransmissions.
+    /// N.274 — max per-segment retransmissions. Ack-service only; ignored
+    /// on unack links (which have no ACK mechanism).
     pub max_segment_retx: u8,
+    /// PD-REWRITE C2: N.282 repetition-count tracking for unack service.
+    /// Keyed by peer N(S); value is repetitions performed so far. Empty on
+    /// ack-service links. Field is scaffolding for Commit 4d (unack data
+    /// flow wire-up); no code reads it yet. Do not remove.
+    #[allow(dead_code)]
+    pub unack_repetition_state: HashMap<u8, u8>,
     // ── TX window ─────────────────────────────────────────────────────────────
     /// Next N(S) value to assign when segmenting a new SDU; wraps mod (tx_window+1).
     pub next_n_s: u8,
@@ -1736,6 +1746,7 @@ impl Llc {
             effective_tx_sdu_window,
             max_sdu_retx: pdu.max_retx_n273_or_repetition_n282,
             max_segment_retx: pdu.max_segment_retx_n274,
+            unack_repetition_state: HashMap::new(),
             next_n_s: 0,
             outstanding_sdus: VecDeque::new(),
             reassemblers: HashMap::new(),
@@ -1794,10 +1805,16 @@ impl Llc {
     /// NOTE: spec ambiguous — V1 supports only Ack service and original AL
     /// (window 1..3).  Extended-AL (tl_sdu_window_size == 0 with Extended type)
     /// is rejected.
+    /// PD-REWRITE C2: accept both acknowledged AND unacknowledged AL service
+    /// negotiations. Previously rejected any AL-SETUP with `service != Ack`
+    /// (see git history for llc_bs_ms.rs:1667 pre-C2). ETSI TS 100 392-2
+    /// §28.3.2 mandates SNDCP support the low-delay (unack) reliability class
+    /// — this method's rejection was blocking that path even though the
+    /// unack RX/TX plumbing exists (see `on_al_udata` line 2122+ and
+    /// `x_tla_tlunitdata_req_al` line 839+). The SETUP-accept path is now
+    /// unblocked; the full unack data-flow wiring (SNDCP → AL-SETUP with
+    /// unack bit → SN-UNITDATA on AL-UDATA/AL-UFINAL) lands in Commit 4d.
     fn is_setup_supported(pdu: &AlSetup) -> bool {
-        if pdu.advanced_link_service != AdvancedLinkService::Ack {
-            return false;
-        }
         if pdu.tl_sdu_window_size_n272_n281 == 0 {
             if let Some(AdvancedLinkType::Extended) = pdu.advanced_link_type {
                 return false;
@@ -2385,6 +2402,7 @@ impl Llc {
                         effective_tx_sdu_window: al_cfg.tx_window,
                         max_sdu_retx: al_cfg.max_sdu_retx,
                         max_segment_retx: al_cfg.max_segment_retx,
+                        unack_repetition_state: HashMap::new(),
                         next_n_s: 0,
                         outstanding_sdus: VecDeque::new(),
                         reassemblers: HashMap::new(),

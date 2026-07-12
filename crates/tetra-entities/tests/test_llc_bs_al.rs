@@ -2989,3 +2989,43 @@ fn h53_non_sndcp_pd_does_not_set_sndcp_bound() {
     assert!(!llc.al_links.get(&test_key()).unwrap().sndcp_bound,
         "H53: non-SNDCP PD (CMCE=2 here) must NOT set sndcp_bound");
 }
+
+
+// ── PD-REWRITE C2 tests ────────────────────────────────────────────────
+
+/// Build an unacknowledged-service AL-SETUP PDU.
+fn make_unack_setup_pdu(report: SetupReport) -> AlSetup {
+    AlSetup {
+        advanced_link_service: AdvancedLinkService::Unack,
+        // Unack service uses N.281 (window size), N.282 (repetitions) — same PDU fields.
+        n_s: Some(0), // NOTE 6 §21.2.3.5: N(S) is mandatory for unack service.
+        ..make_setup_pdu(report)
+    }
+}
+
+/// C2: unack AL-SETUP is now accepted (was rejected before Commit 2a per
+/// `llc_bs_ms.rs:1667`). Verify the BS emits a spec-compliant CON echo and
+/// creates the AlLink with `service = Unack`. Data-flow wire-up is Commit 4d.
+#[test]
+fn c2_unack_al_setup_is_accepted() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+
+    let out = send_setup_to_llc(&mut llc, &mut queue,
+        make_unack_setup_pdu(SetupReport::ServiceDefinition));
+
+    // Some outbound TmaUnitdataReq (the CON echo) must have been queued.
+    assert!(
+        out.iter().any(|m| matches!(&m.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "C2: unack AL-SETUP must produce a CON echo on the wire (not rejected)"
+    );
+
+    // Link created with unack service.
+    let link = llc.al_links.get(&test_key())
+        .expect("C2: unack AL-SETUP must create the AlLink");
+    assert_eq!(link.service, AdvancedLinkService::Unack,
+        "C2: link.service must reflect the negotiated unack service");
+    // N.281/N.282 plumbing landed but is scaffolding until Commit 4d.
+    assert!(link.unack_repetition_state.is_empty(),
+        "C2: unack_repetition_state should start empty");
+}
