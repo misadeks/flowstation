@@ -30,6 +30,9 @@ async fn run_serves_wsp_connect_and_shuts_down_on_cancel() {
         upstream_url: "http://127.0.0.1:8081".to_owned(),
         portal: None,
         al_feedback: None,
+        // Explicit Sanitize mode so the legacy integration test still
+        // asserts Kannel-parity output. Library default is now VerbatimEcho.
+        wsp_capability_mode: wap_gateway::wsp::WspCapabilityMode::Sanitize,
     };
     let shutdown = CancellationToken::new();
 

@@ -35,6 +35,49 @@ chances to land on air before SNDCP is notified of failure.
 (§22.3.3.2.6)`.  Grep `escalating to full-SDU retx` in the boot log to
 inventory active escalations.
 
+## WAP gateway WSP capability handling (PD-11-H1)
+
+The WAP gateway's WSP ConnectReply builder can echo the MS-proposed
+capability list in two modes. The choice is genuinely MS-firmware
+dependent — some UP.Browser builds accept verbatim echo, others need
+Kannel-style stripping. Neither is universally correct.
+
+Set via `wsp_capability_mode` in the `[wap_gateway]` TOML section:
+
+```toml
+[wap_gateway]
+wsp_capability_mode = "verbatim_echo"   # default
+# wsp_capability_mode = "sanitize"      # legacy Kannel-parity behaviour
+```
+
+**`verbatim_echo` (default, PD-11-H1):** Every capability the MS proposed
+comes back byte-for-byte in the ConnectReply, including Openwave's
+`Protocol-Options: 0xF0` (Confirmed-Push + Push + Suspend/Resume +
+Ack-Headers) and the `x-up-1` Extended-Method. Documented as
+tested-working for UP.Browser 6.3 on Motorola MTP3550 in
+`crates/wap-gateway/src/wsp/caps.rs` and `crates/wap-gateway/src/lib.rs`
+module-level docs.
+
+**`sanitize` (opt-in, legacy PD-10b-H5):** Kannel `sanitize_capabilities()`
+parity. Clears top 4 bits of `Protocol-Options` (`0xF0 → 0x00`) and
+refuses Extended-Methods / Header-Code-Pages with a zero-length
+payload (wire bytes `01 86`). Some MS firmware revisions want this.
+
+**Symptom to look for when the mode is wrong:** MS re-Invokes the same
+tid every ~4–8 s despite the WTP layer confirming AL-ACK delivery. The
+gateway log shows repeated `H33: re-Invoke on ResultSent txn — replaying
+cached Result` entries and `H36: LLC AL-ACK observed` on the same tid —
+meaning the Result reaches MS at LLC level but MS's WSP rejects the
+ConnectReply content. Flip the mode and rerun.
+
+Both modes always emit `Encoding-Version: 1.3` in the headers block
+(wire bytes `C3 93`) because absence defaults MS to WSP 1.2 encoding
+per WAP-230 §8.4.2.70 and every tested browser accepts 1.3.
+
+**Startup log signal:** the gateway emits an INFO log naming the active
+mode: `wap-gateway WSP ConnectReply capability mode selected
+wsp_capability_mode=verbatim_echo`.
+
 ## Configuration profiles
 
 **Landed in Commit 6.** Set via `interop_profile` in the `[llc]` TOML section:

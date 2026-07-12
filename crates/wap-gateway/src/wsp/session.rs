@@ -51,6 +51,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{WapError, WapResult};
 use crate::portal::WapPortal;
+use crate::wsp::WspCapabilityMode;
 use crate::wsp::pdu::{
     ContentType, HeaderBlock, STATUS_BAD_GATEWAY, STATUS_BAD_REQUEST, STATUS_INTERNAL_ERROR, STATUS_METHOD_NOT_ALLOWED, STATUS_NOT_FOUND,
     STATUS_NOT_IMPLEMENTED, STATUS_OK, WspPdu, build_connect_reply, build_get_reply, build_status_reply, pdu_type,
@@ -109,6 +110,13 @@ pub struct WspGatewayState {
     /// intercepts URIs whose path starts with the portal's `path_prefix`
     /// and serves WMLC locally, bypassing `upstream_base` entirely.
     portal: Option<WapPortal>,
+    /// PD-11-H1: how [`build_connect_reply`] handles the MS-proposed
+    /// capability list. Default [`WspCapabilityMode::VerbatimEcho`] matches
+    /// what `caps.rs` / `lib.rs` document as tested-working for UP.Browser
+    /// 6.3 on Motorola MTP3550; operators can flip to
+    /// [`WspCapabilityMode::Sanitize`] for firmware revisions that need
+    /// Kannel-style stripping.
+    capability_mode: WspCapabilityMode,
 }
 
 impl Default for WspGatewayState {
@@ -137,6 +145,17 @@ impl WspGatewayState {
     /// Same as [`Self::with_upstream`] but also attaches an optional
     /// [`WapPortal`] that intercepts GETs to its configured path prefix.
     pub fn with_upstream_and_portal(upstream_base: String, portal: Option<WapPortal>) -> Self {
+        Self::with_upstream_portal_and_capability_mode(upstream_base, portal, WspCapabilityMode::default())
+    }
+
+    /// Full-fat constructor that also lets the caller pin the
+    /// [`WspCapabilityMode`] used by [`build_connect_reply`]. All other
+    /// constructors delegate here with the default mode.
+    pub fn with_upstream_portal_and_capability_mode(
+        upstream_base: String,
+        portal: Option<WapPortal>,
+        capability_mode: WspCapabilityMode,
+    ) -> Self {
         // Build the client with conservative timeouts. Redirect following
         // is disabled so we return 3xx status codes straight to the MS —
         // WSP browsers re-issue a fresh Get on 3xx (WAP-230 §7.2), and
@@ -160,6 +179,7 @@ impl WspGatewayState {
             http,
             upstream_base: Arc::new(upstream_base),
             portal,
+            capability_mode,
         }
     }
 
@@ -288,7 +308,7 @@ impl WspHandler {
             _ => Vec::new(),
         };
 
-        let reply = match build_connect_reply(&connect, sid, HeaderBlock::empty()) {
+        let reply = match build_connect_reply(&connect, sid, HeaderBlock::empty(), self.state.capability_mode) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "wsp: build_connect_reply failed, replying 400");
@@ -488,7 +508,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_establishes_session_and_sanitizes_caps() {
+    async fn connect_verbatim_echo_default_preserves_protocol_options() {
+        // PD-11-H1: default mode is VerbatimEcho — Protocol-Options 0xF0
+        // comes back untouched.
         let state = WspGatewayState::new();
         let h = WspHandler::new(state.clone());
         let reply_bytes = h.handle(loopback_peer(), synthetic_connect_bytes()).await;
@@ -503,10 +525,22 @@ mod tests {
             panic!("expected ConnectReply, got {reply:?}");
         };
         assert!(server_session_id >= 1);
-        // build_connect_reply clears the top nibble of Protocol-Options
-        // (0xF0 → 0x00) to match Kannel's sanitize_capabilities().
-        assert_eq!(capabilities, vec![Capability::ProtocolOptions(0x00)]);
+        assert_eq!(capabilities, vec![Capability::ProtocolOptions(0xF0)]);
         assert_eq!(state.session_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_sanitize_mode_clears_protocol_options_top_nibble() {
+        // Opt-in Sanitize mode keeps the legacy Kannel-parity behaviour.
+        let state = WspGatewayState::with_upstream_portal_and_capability_mode(String::new(), None, WspCapabilityMode::Sanitize);
+        let h = WspHandler::new(state.clone());
+        let reply_bytes = h.handle(loopback_peer(), synthetic_connect_bytes()).await;
+
+        let reply = WspPdu::decode(&reply_bytes).unwrap();
+        let WspPdu::ConnectReply { capabilities, .. } = reply else {
+            panic!("expected ConnectReply");
+        };
+        assert_eq!(capabilities, vec![Capability::ProtocolOptions(0x00)]);
     }
 
     #[tokio::test]
