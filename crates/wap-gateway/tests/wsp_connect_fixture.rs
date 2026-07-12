@@ -10,17 +10,16 @@
 //! capability block to bytes byte-identical to what the MS proposed. That
 //! is exactly the property Kannel violates with `sanitize_capabilities()`.
 
+use wap_gateway::wsp::WspCapabilityMode;
 use wap_gateway::wsp::caps::Capability;
 use wap_gateway::wsp::pdu::{HeaderBlock, WspPdu, build_connect_reply, pdu_type};
 
 /// Load the fixture as raw bytes. `include_bytes!` keeps it a pure static.
 const FIXTURE: &[u8] = include_bytes!("fixtures/mtp3550_connect.bin");
 
-/// The 21-byte SANITIZED capability block we now emit in our ConnectReply,
-/// matching Kannel's `sanitize_capabilities()` behaviour. This is the byte
-/// pattern UP.Browser expects to see back from the gateway. Hardware
-/// testing 2026-07-10 confirmed that echoing MS's original 29-byte block
-/// verbatim got past WTP but was silently discarded at the WSP layer.
+/// The 21-byte SANITIZED capability block that PD-10b-H5 emitted in ConnectReply
+/// (Kannel `sanitize_capabilities()` parity). Kept as a fixture for the
+/// opt-in `WspCapabilityMode::Sanitize` regression test.
 const SANITIZED_CAPS_BLOCK: &[u8] = &[
     0x04, 0x80, 0x94, 0x80, 0x00, // Client-SDU-Size (echoed)
     0x04, 0x81, 0x94, 0x80, 0x00, // Server-SDU-Size (echoed)
@@ -102,20 +101,14 @@ fn decodes_connect_pdu_with_expected_capabilities() {
 }
 
 #[test]
-fn connect_reply_cap_block_matches_kannel_sanitized() {
-    // Round-trip: decode fixture → build ConnectReply → re-encode → decode
-    // again → assert cap wire bytes equal the KANNEL sanitized block.
-    // (We used to assert byte-identical-to-MS but hardware testing showed
-    // MS silently drops replies that dishonestly echo caps we don't
-    // implement — Kannel's sanitizer is correct.)
+fn connect_reply_cap_block_verbatim_echo_default() {
+    // PD-11-H1: default mode is VerbatimEcho — ConnectReply cap block
+    // must be byte-identical to what the MS proposed (the original
+    // 29-byte hardware block).
     let connect = WspPdu::decode(FIXTURE).unwrap();
-    let reply = build_connect_reply(&connect, /* server session id */ 1, HeaderBlock::empty()).unwrap();
+    let reply = build_connect_reply(&connect, 1, HeaderBlock::empty(), WspCapabilityMode::VerbatimEcho).unwrap();
     let bytes = reply.encode();
-
-    // Type=CONNECT_REPLY, then uintvar session-id.
     assert_eq!(bytes[0], pdu_type::CONNECT_REPLY);
-
-    // Decode our own ConnectReply and pull the cap block back out.
     let decoded = WspPdu::decode(&bytes).unwrap();
     let WspPdu::ConnectReply {
         server_session_id,
@@ -123,16 +116,39 @@ fn connect_reply_cap_block_matches_kannel_sanitized() {
         headers,
     } = decoded
     else {
-        panic!("re-decoded ConnectReply is not a ConnectReply: {decoded:?}");
+        panic!("re-decoded ConnectReply is not a ConnectReply");
     };
     assert_eq!(server_session_id, 1);
-    // Headers block MUST carry Encoding-Version: 1.3 → wire bytes `C3 93`.
-    assert_eq!(headers.raw, vec![0xC3, 0x93]);
+    assert_eq!(headers.raw, vec![0xC3, 0x93], "Encoding-Version: 1.3 header preserved in verbatim mode");
+    let cap_bytes = wap_gateway::wsp::caps::encode_list(&capabilities);
+    assert_eq!(
+        cap_bytes, HW_ORIGINAL_CAPS_BLOCK,
+        "VerbatimEcho ConnectReply cap block must match MS-proposed block byte-for-byte"
+    );
+}
 
-    // Re-encode just the caps and compare to the Kannel-sanitized block.
+#[test]
+fn connect_reply_cap_block_sanitize_mode_matches_kannel() {
+    // Opt-in Sanitize mode reproduces the legacy PD-10b-H5 behaviour for
+    // firmware revisions that need Kannel-style stripping.
+    let connect = WspPdu::decode(FIXTURE).unwrap();
+    let reply = build_connect_reply(&connect, 1, HeaderBlock::empty(), WspCapabilityMode::Sanitize).unwrap();
+    let bytes = reply.encode();
+    assert_eq!(bytes[0], pdu_type::CONNECT_REPLY);
+    let decoded = WspPdu::decode(&bytes).unwrap();
+    let WspPdu::ConnectReply {
+        server_session_id,
+        capabilities,
+        headers,
+    } = decoded
+    else {
+        panic!("re-decoded ConnectReply is not a ConnectReply");
+    };
+    assert_eq!(server_session_id, 1);
+    assert_eq!(headers.raw, vec![0xC3, 0x93]);
     let cap_bytes = wap_gateway::wsp::caps::encode_list(&capabilities);
     assert_eq!(
         cap_bytes, SANITIZED_CAPS_BLOCK,
-        "ConnectReply cap block must match Kannel sanitize_capabilities() output"
+        "Sanitize ConnectReply cap block must match Kannel sanitize_capabilities() output"
     );
 }

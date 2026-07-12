@@ -32,6 +32,11 @@ async fn end_to_end_mtp3550_connect_gets_openwave_connect_reply() {
         upstream_url: "http://127.0.0.1:8081".to_owned(),
         portal: None,
         al_feedback: None,
+        // Explicitly pin Sanitize mode to keep this legacy integration
+        // test asserting Kannel-parity capability stripping. The library
+        // default is now VerbatimEcho (PD-11-H1); the fixture unit test
+        // covers that path in `wsp_connect_fixture.rs`.
+        wsp_capability_mode: wap_gateway::wsp::WspCapabilityMode::Sanitize,
     };
     let shutdown = CancellationToken::new();
     let task = tokio::spawn({

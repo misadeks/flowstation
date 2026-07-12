@@ -45,6 +45,9 @@ pub const DEFAULT_WAP_PORTAL_METAR_REFRESH_SECONDS: u32 = 1800;
 /// Default number of radio rows on the radios page (kept small to fit ~350 B budget).
 pub const DEFAULT_WAP_PORTAL_RADIOS_MAX: u8 = 5;
 
+/// Default WSP capability-echo mode. String form of `wap_gateway::wsp::WspCapabilityMode::default()`.
+pub const DEFAULT_WSP_CAPABILITY_MODE: &str = "verbatim_echo";
+
 // ─── Compiled config ─────────────────────────────────────────────────────────
 
 /// Fully-validated `[wap_gateway]` runtime config.
@@ -63,6 +66,12 @@ pub struct CfgWapGateway {
     pub log_level: String,
     /// Built-in status portal (served by `wap-gateway` directly, no upstream).
     pub portal: CfgWapGatewayPortal,
+    /// PD-11-H1: WSP ConnectReply capability handling mode. Stored as a
+    /// validated string (`"verbatim_echo"` or `"sanitize"`) so this crate
+    /// does not need to depend on `wap-gateway`. `bluestation-bs` parses
+    /// this into `wap_gateway::wsp::WspCapabilityMode` when wiring
+    /// `RunConfig`.
+    pub wsp_capability_mode: String,
 }
 
 /// Validated `[wap_gateway.portal]` sub-section.
@@ -103,6 +112,7 @@ impl CfgWapGateway {
             upstream_url: DEFAULT_WAP_UPSTREAM_URL.to_owned(),
             log_level: DEFAULT_WAP_LOG_LEVEL.to_owned(),
             portal: CfgWapGatewayPortal::disabled(),
+            wsp_capability_mode: DEFAULT_WSP_CAPABILITY_MODE.to_owned(),
         }
     }
 
@@ -145,6 +155,11 @@ pub struct CfgWapGatewayDto {
 
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// PD-11-H1: WSP ConnectReply capability handling mode. String form:
+    /// `"verbatim_echo"` (default) or `"sanitize"`.
+    #[serde(default = "default_wsp_capability_mode")]
+    pub wsp_capability_mode: String,
 
     /// Optional `[wap_gateway.portal]` sub-table.
     #[serde(default)]
@@ -197,6 +212,7 @@ impl Default for CfgWapGatewayDto {
             listen_port: default_listen_port(),
             upstream_url: default_upstream_url(),
             log_level: default_log_level(),
+            wsp_capability_mode: default_wsp_capability_mode(),
             portal: None,
             extra: HashMap::new(),
         }
@@ -214,6 +230,9 @@ fn default_upstream_url() -> String {
 }
 fn default_log_level() -> String {
     DEFAULT_WAP_LOG_LEVEL.to_owned()
+}
+fn default_wsp_capability_mode() -> String {
+    DEFAULT_WSP_CAPABILITY_MODE.to_owned()
 }
 fn default_portal_enabled() -> bool {
     false
@@ -263,6 +282,25 @@ pub fn apply_wap_gateway_patch(dto: CfgWapGatewayDto, packet_data_tun_addr: Ipv4
         });
     }
 
+    // PD-11-H1: validate the wsp_capability_mode string. Accepted values are
+    // `"verbatim_echo"` (default), `"verbatim"` (alias), `"sanitize"`, and
+    // `"kannel"` (alias). Kept as a string in the compiled config so this
+    // crate does not need to depend on `wap-gateway`; `bluestation-bs`
+    // parses it into the enum when constructing `RunConfig`.
+    let mode_normalized = dto.wsp_capability_mode.trim();
+    match mode_normalized {
+        "verbatim_echo" | "verbatim" | "sanitize" | "kannel" => {}
+        _ => {
+            return Err(ConfigError {
+                field: "wap_gateway.wsp_capability_mode",
+                message: format!(
+                    "unknown value {:?}: expected 'verbatim_echo' or 'sanitize'",
+                    dto.wsp_capability_mode
+                ),
+            });
+        }
+    }
+
     let portal = apply_wap_gateway_portal_patch(dto.portal.unwrap_or_default())?;
 
     Ok(CfgWapGateway {
@@ -272,6 +310,7 @@ pub fn apply_wap_gateway_patch(dto: CfgWapGatewayDto, packet_data_tun_addr: Ipv4
         upstream_url: dto.upstream_url,
         log_level: dto.log_level,
         portal,
+        wsp_capability_mode: mode_normalized.to_owned(),
     })
 }
 
@@ -433,6 +472,55 @@ mod tests {
         let mut cfg = CfgWapGateway::disabled(TUN);
         cfg.listen_addr = Ipv4Addr::UNSPECIFIED;
         assert_eq!(cfg.resolved_listen_addr(TUN), TUN);
+    }
+
+    // ── PD-11-H1: wsp_capability_mode config knob ────────────────────────
+
+    #[test]
+    fn wsp_capability_mode_defaults_to_verbatim_echo() {
+        let cfg = CfgWapGateway::disabled(TUN);
+        assert_eq!(cfg.wsp_capability_mode, "verbatim_echo");
+        let dto = CfgWapGatewayDto {
+            enabled: true,
+            ..Default::default()
+        };
+        let cfg = apply_wap_gateway_patch(dto, TUN).unwrap();
+        assert_eq!(cfg.wsp_capability_mode, "verbatim_echo");
+    }
+
+    #[test]
+    fn wsp_capability_mode_accepts_sanitize() {
+        let dto = CfgWapGatewayDto {
+            enabled: true,
+            wsp_capability_mode: "sanitize".into(),
+            ..Default::default()
+        };
+        let cfg = apply_wap_gateway_patch(dto, TUN).unwrap();
+        assert_eq!(cfg.wsp_capability_mode, "sanitize");
+    }
+
+    #[test]
+    fn wsp_capability_mode_accepts_aliases() {
+        for alias in ["verbatim", "kannel"] {
+            let dto = CfgWapGatewayDto {
+                enabled: true,
+                wsp_capability_mode: alias.into(),
+                ..Default::default()
+            };
+            let cfg = apply_wap_gateway_patch(dto, TUN).unwrap();
+            assert_eq!(cfg.wsp_capability_mode, alias);
+        }
+    }
+
+    #[test]
+    fn wsp_capability_mode_rejects_unknown() {
+        let dto = CfgWapGatewayDto {
+            enabled: true,
+            wsp_capability_mode: "bogus".into(),
+            ..Default::default()
+        };
+        let err = apply_wap_gateway_patch(dto, TUN).unwrap_err();
+        assert_eq!(err.field, "wap_gateway.wsp_capability_mode");
     }
 
     #[test]

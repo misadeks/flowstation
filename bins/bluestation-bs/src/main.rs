@@ -300,6 +300,14 @@ fn wire_wap_gateway(
         upstream_url: wg.upstream_url.clone(),
         portal,
         al_feedback,
+        // PD-11-H1: parse the validated string from config into the enum.
+        // `apply_wap_gateway_patch` already rejected unknown values, so
+        // this only fails on internal bugs — fall back to the enum default
+        // rather than panicking at boot.
+        wsp_capability_mode: wg
+            .wsp_capability_mode
+            .parse::<wap_gateway::wsp::WspCapabilityMode>()
+            .unwrap_or_default(),
     };
 
     // Fire-and-forget: process shutdown drops the runtime which cancels the

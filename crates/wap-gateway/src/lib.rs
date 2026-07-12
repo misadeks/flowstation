@@ -87,6 +87,14 @@ pub struct RunConfig {
     /// already delivered. Both `None` (the default) keeps behaviour
     /// identical to PD-10c-H35.
     pub al_feedback: Option<AlFeedbackWiring>,
+    /// PD-11-H1: how the WSP ConnectReply builder handles the MS-proposed
+    /// capability list. Defaults to [`WspCapabilityMode::VerbatimEcho`],
+    /// which mirrors what `wap-gateway/src/wsp/caps.rs` and this crate's
+    /// module-level `# Motivation` block explicitly document as
+    /// tested-working for UP.Browser 6.3 on Motorola MTP3550. Flip to
+    /// [`WspCapabilityMode::Sanitize`] for firmware revisions that need
+    /// Kannel-style capability stripping (the legacy PD-10b-H5 behaviour).
+    pub wsp_capability_mode: crate::wsp::WspCapabilityMode,
 }
 
 /// PD-10c-H36 wiring bundle. Held separately so `RunConfig` stays `Clone`
@@ -160,7 +168,12 @@ pub async fn run(cfg: RunConfig, shutdown: CancellationToken) -> WapResult<()> {
         WapPortal::new(p.config, p.data, cache)
     });
 
-    let wsp_state = WspGatewayState::with_upstream_and_portal(cfg.upstream_url.clone(), portal);
+    let wsp_state =
+        WspGatewayState::with_upstream_portal_and_capability_mode(cfg.upstream_url.clone(), portal, cfg.wsp_capability_mode);
+    info!(
+        wsp_capability_mode = %cfg.wsp_capability_mode,
+        "wap-gateway WSP ConnectReply capability mode selected"
+    );
     let handler = {
         let wsp = WspHandler::new(wsp_state);
         handler_fn(move |peer, payload| {
