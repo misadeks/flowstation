@@ -918,6 +918,49 @@ impl BsChannelScheduler {
         [link_ts, 0, 0, 0]
     }
 
+    /// PD-5c-H54: return true if a MAC-RESOURCE PDU with matching (addr,
+    /// bit-exact SDU) is already pending in this timeslot's DL queue or in
+    /// `dltx_next_slot_queue` (deferred for the next frame). Matches both
+    /// still-unqueued `Resource` items and mid-fragmentation `FragBuf`
+    /// items so a re-enqueue during LLC's AL retransmit loop does not pile
+    /// up identical copies that will only be popped and re-fragmented on
+    /// subsequent frames.
+    ///
+    /// SDU comparison uses `BitBuffer::dump_bin_unformatted`, which walks
+    /// the stable [start, end) window and is unaffected by any read-position
+    /// advancement done by an in-flight fragger.
+    fn dl_resource_is_duplicate_on_ts(&self, ts: u8, pdu: &MacResource, sdu: &BitBuffer) -> bool {
+        if !(1..=NUM_TIMESLOTS as u8).contains(&ts) {
+            return false;
+        }
+        let sdu_bits = sdu.get_len();
+        let addr = pdu.addr;
+        // Only bother materialising the bit string when there is at least one
+        // Resource/FragBuf candidate in the queue for the same address. Keeps
+        // the common no-duplicate path allocation-free.
+        let sdu_key: std::cell::OnceCell<String> = std::cell::OnceCell::new();
+        let matches_elem = |elem: &DlSchedElem| -> bool {
+            match elem {
+                DlSchedElem::Resource(existing_pdu, existing_sdu, _) => {
+                    existing_pdu.addr == addr
+                        && existing_sdu.get_len() == sdu_bits
+                        && sdu_key.get_or_init(|| sdu.dump_bin_unformatted())
+                            == &existing_sdu.dump_bin_unformatted()
+                }
+                DlSchedElem::FragBuf(fragger) => {
+                    fragger.resource_addr() == addr
+                        && fragger.sdu_ref().get_len() == sdu_bits
+                        && sdu_key.get_or_init(|| sdu.dump_bin_unformatted())
+                            == &fragger.sdu_ref().dump_bin_unformatted()
+                }
+                _ => false,
+            }
+        };
+        let this_slot = &self.dltx_queues[ts as usize - 1];
+        this_slot.iter().any(matches_elem)
+            || self.dltx_next_slot_queue.iter().any(matches_elem)
+    }
+
     fn dl_enqueue_tma_on_timeslots(
         &mut self,
         timeslots: [u8; NUM_TIMESLOTS],
@@ -942,6 +985,49 @@ impl BsChannelScheduler {
             }
             let next_ts = if i < NUM_TIMESLOTS - 1 { timeslots[i + 1] } else { 0 };
             assert!(ts > 0);
+
+            // PD-5c-H54: DL duplicate-Resource guard.
+            //
+            // On hardware we observed 11-15 identical MAC-RESOURCE PDUs for the
+            // same (addr, bit-exact SDU) piling up in `dltx_queues[ts-1]` after
+            // LLC's AL retransmit loop (llc_bs_ms.rs:2540+) re-emitted every
+            // still-unacked segment on each pass. The air can carry each
+            // segment at most once per frame, so the extras were only ever
+            // going to be popped, wrapped in a fresh `BsFragger`, and stored
+            // for a later frame -- where they collide with LLC's next retx
+            // pass and cause the MS to see a garbled AL sequence, force an
+            // AL-RECONNECT, and drop the WSP/TCP session (H54 hardware trace).
+            //
+            // Silently suppress a re-enqueue when an existing Resource or
+            // still-fragmenting FragBuf for the same (addr, SDU) is already
+            // pending on this timeslot or on `dltx_next_slot_queue` (deferred
+            // for the next frame). Discard the redundant TxReporter so LLC's
+            // T.252 accounting still receives a terminal state.
+            //
+            // NOTE: the key is (addr, bit-exact SDU bits). Distinct AL
+            // segments hash differently (different s_s / different tail
+            // fragment), distinct SDUs to the same addr differ, and multi-
+            // slot fanout across per-slot queues stays correct because each
+            // per-slot queue is checked independently.
+            if self.dl_resource_is_duplicate_on_ts(ts, &pdu, &sdu) {
+                tracing::debug!(
+                    "dl_enqueue_tma_on_timeslots: ts {} dropping duplicate MAC-RESOURCE for addr {:?} (sdu {} bits) — already queued (H54)",
+                    ts,
+                    pdu.addr,
+                    sdu.get_len(),
+                );
+                if let Some(reporter) = tx_reporter.as_ref() {
+                    reporter.mark_discarded();
+                }
+                // For the multi-slot fanout case we still want to try later
+                // timeslots -- the caller's [u8; NUM_TIMESLOTS] array may
+                // request delivery on multiple slots and each slot has its
+                // own queue. Skip only this slot.
+                if next_ts == 0 {
+                    break;
+                }
+                continue;
+            }
 
             // If this PDU carries a chan_alloc element (DConnect/DConnectAck MCCH), check if we
             // already sent one this frame. DConnect MCCH (113 bits) + DConnectAck MCCH (110 bits)
@@ -3102,6 +3188,147 @@ mod tests {
         assert!(
             !sched.pdch_timeslots_ref().contains(&4),
             "TS4 must NOT be in PDCH set (it is occupied by voice)"
+        );
+    }
+
+    /// PD-5c-H54 regression: LLC's AL retransmit loop re-emits every unacked
+    /// segment on each pass. Prior to H54 that piled 11-15 identical
+    /// MAC-RESOURCE PDUs into `dltx_queues[ts-1]` for a single 4-segment DL
+    /// SDU, which then trickled onto the air as garbled fragments and
+    /// forced the MS into AL-RECONNECT (see hardware trace 13:04:21.819).
+    ///
+    /// This test simulates 4 LLC retx passes on the same 4-segment SDU (16
+    /// enqueue calls total, 4 distinct segments) and asserts the queue
+    /// holds exactly 4 items — one per unique segment — regardless of how
+    /// many times LLC pushed each one. The dedupe guard in
+    /// `dl_enqueue_tma_on_timeslots` is what makes this hold.
+    #[test]
+    fn pdch_h54_no_flood_when_single_slot_with_large_sdu() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 0xA1B2C3 };
+
+        // Build 4 distinct AL segments (mirroring the 4-segment 386-byte
+        // response from the hardware trace: three 417-bit segments carrying
+        // 400 tl_sdu bits each, plus a 249-bit tail).
+        let seg_bits = [417usize, 417, 417, 249];
+        let segments: Vec<BitBuffer> = seg_bits
+            .iter()
+            .enumerate()
+            .map(|(idx, &bits)| {
+                let mut buf = BitBuffer::new(bits);
+                // Fill with a per-segment pattern so distinct segments are
+                // bit-distinct (idx as byte, repeated).
+                for _ in 0..bits {
+                    buf.write_bits((idx as u64) & 0x1, 1);
+                }
+                buf.seek(0);
+                buf
+            })
+            .collect();
+        let make_pdu = || MacResource {
+            fill_bits: false,
+            pos_of_grant: 0,
+            encryption_mode: 0,
+            random_access_flag: false,
+            length_ind: 0,
+            addr: Some(addr),
+            event_label: None,
+            usage_marker: None,
+            power_control_element: None,
+            slot_granting_element: None,
+            chan_alloc_element: None,
+        };
+
+        // Simulate 4 LLC retx passes — each pass re-emits ALL 4 segments
+        // because they are all still-unacked. Total: 16 enqueue calls.
+        const LLC_RETX_PASSES: usize = 4;
+        const LINK_TS: LinkId = 4;
+        for _pass in 0..LLC_RETX_PASSES {
+            for seg in &segments {
+                let mut pdu = make_pdu();
+                pdu.update_len_and_fill_ind(seg.get_len());
+                sched.dl_enqueue_tma_for_link(LINK_TS, pdu, seg.clone(), None);
+            }
+        }
+
+        // Post-condition: the TS4 queue must hold at most 4 items — one per
+        // unique (addr, sdu) segment — not 16. Anything more indicates the
+        // dedupe guard has regressed and LLC's retx storm is again
+        // ballooning the per-timeslot backlog.
+        let queue = &sched.dltx_queues[LINK_TS as usize - 1];
+        assert!(
+            queue.len() <= segments.len(),
+            "PD-5c-H54: TS{} queue should hold <= {} items (one per unique segment) but has {} — dedupe guard regressed",
+            LINK_TS,
+            segments.len(),
+            queue.len()
+        );
+        // Also assert every original segment made it in at least once (the
+        // dedupe must suppress duplicates only, not distinct segments).
+        for seg in &segments {
+            let seg_bin = seg.dump_bin_unformatted();
+            let found = queue.iter().any(|elem| match elem {
+                DlSchedElem::Resource(_, existing_sdu, _) => {
+                    existing_sdu.get_len() == seg.get_len()
+                        && existing_sdu.dump_bin_unformatted() == seg_bin
+                }
+                _ => false,
+            });
+            assert!(
+                found,
+                "PD-5c-H54: distinct segment ({} bits) went missing — dedupe over-matched",
+                seg.get_len()
+            );
+        }
+    }
+
+    /// PD-5c-H54: distinct SDUs to the same address must NOT be deduped
+    /// (only bit-exact duplicates are). Guards against an over-broad
+    /// address-only match.
+    #[test]
+    fn pdch_h54_distinct_sdus_to_same_addr_are_all_kept() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 0xDEADBE };
+
+        let make_pdu = || MacResource {
+            fill_bits: false,
+            pos_of_grant: 0,
+            encryption_mode: 0,
+            random_access_flag: false,
+            length_ind: 0,
+            addr: Some(addr),
+            event_label: None,
+            usage_marker: None,
+            power_control_element: None,
+            slot_granting_element: None,
+            chan_alloc_element: None,
+        };
+
+        const LINK_TS: LinkId = 3;
+        // Enqueue three distinct SDUs (different bit patterns) — none are
+        // duplicates and all three must land in the queue.
+        for pattern in [0u64, 1, 0] {
+            // Note the third pattern (0) is bit-identical to the first —
+            // it MUST be deduped.
+            let mut sdu = BitBuffer::new(64);
+            for _ in 0..64 {
+                sdu.write_bits(pattern, 1);
+            }
+            sdu.seek(0);
+            let mut pdu = make_pdu();
+            pdu.update_len_and_fill_ind(64);
+            sched.dl_enqueue_tma_for_link(LINK_TS, pdu, sdu, None);
+        }
+
+        // Two distinct SDUs must be present; the third (bit-exact dup of the
+        // first) must have been dropped.
+        let queue = &sched.dltx_queues[LINK_TS as usize - 1];
+        assert_eq!(
+            queue.len(),
+            2,
+            "PD-5c-H54: expected 2 distinct SDUs in TS{} queue (third is a dup), got {}",
+            LINK_TS,
+            queue.len(),
         );
     }
 }

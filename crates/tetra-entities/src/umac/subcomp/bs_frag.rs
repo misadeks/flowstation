@@ -264,6 +264,21 @@ impl BsFragger {
         }
     }
 
+    /// Address on the wrapped MAC-RESOURCE, used by the DL scheduler's
+    /// duplicate-Resource dedupe path (PD-5c-H54).
+    pub(super) fn resource_addr(&self) -> Option<tetra_core::TetraAddress> {
+        self.resource.addr
+    }
+
+    /// Original SDU bits owned by this fragger. Used by the DL scheduler's
+    /// duplicate-Resource dedupe (PD-5c-H54) to identify a re-enqueued copy
+    /// of a segment that is already mid-fragmentation. The [start, end)
+    /// window returned by `BitBuffer::dump_bin_unformatted` is stable even
+    /// as the fragger advances its internal read position.
+    pub(super) fn sdu_ref(&self) -> &BitBuffer {
+        &self.sdu
+    }
+
     /// Writes the next chunk to the bitbuffer, if there is space.
     /// First chunk is the provided resource, possibly changed to indicate fragmentation.
     /// Subsequent chunks are MAC-FRAG or MAC-END.
