@@ -2450,12 +2450,11 @@ impl Llc {
         let dltime = self.dltime;
         // Extract config-driven retry limits before the loop to avoid borrow conflicts
         // with the mutable borrow of self.al_links inside the loop.
-        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect, cfg_proactive_disc,
+        let (cfg_max_setup, cfg_max_disc, cfg_max_reconnect,
              cfg_n273_zero_ack_uses_seg_cap) = {
             let cfg = self.config.config();
             let al = &cfg.llc.advanced_link;
             (al.max_setup_retries, al.max_disc_retries, al.max_reconnect_retries,
-             al.proactive_disc_on_retx_exhaust,
              al.n273_zero_ack_uses_seg_cap)
         };
         let mut msgs: Vec<SapMsg> = Vec::new();
@@ -2464,9 +2463,12 @@ impl Llc {
         // PD-10c-H36: collect drop events for post-loop emission (can't call
         // &self.emit_delivery while self.al_links is mutably borrowed).
         let mut drops: Vec<(AlLinkKey, u8, AlDeliveryOutcome)> = Vec::new();
-        // PD-5c-H47: collect links that hit retx-exhaustion so we can emit
-        // AL-DISC + TmaPurgeByAddressReq after the al_links borrow ends.
-        let mut retx_exhausted_links: Vec<AlLinkKey> = Vec::new();
+        // PD-REWRITE C1: `retx_exhausted_links` collection removed with H47.
+        // Retx exhaustion now surfaces upward exclusively via the
+        // `AlDeliveryOutcome::DroppedRetxExhausted` event (see `drops` above).
+        // The service user (SNDCP, once Commit 4b lands) decides reset /
+        // disconnect / reconnect / release. LLC never spontaneously emits
+        // AL-DISC — see ETSI TS 100 392-2 §22.3.3.2.6 NOTE 1.
 
         for (key, link) in self.al_links.iter_mut() {
             // 0. T.272 — RNR receiver-not-ready expiry (must run before step 1 so that
@@ -2664,13 +2666,8 @@ impl Llc {
                                     key, sdu.n_s, sdu.retx_count, effective_max_retx
                                 );
                                 drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
-                                // PD-5c-H47: mark this link for proactive
-                                // AL-DISC + UMAC purge so the peer can tear
-                                // down its side immediately instead of
-                                // waiting for its own SDU-lifetime timer.
-                                if cfg_proactive_disc && !retx_exhausted_links.contains(key) {
-                                    retx_exhausted_links.push(*key);
-                                }
+                                // PD-REWRITE C1: H47 proactive AL-DISC removed. Service
+                                // user decides teardown; LLC only reports the drop.
                             }
                             sdus_to_remove.push(sdu.n_s);
                             continue;
@@ -2683,9 +2680,7 @@ impl Llc {
                                 key, sdu.n_s
                             );
                             drops.push((*key, sdu.n_s, AlDeliveryOutcome::DroppedRetxExhausted));
-                            if cfg_proactive_disc && !retx_exhausted_links.contains(key) {
-                                retx_exhausted_links.push(*key);
-                            }
+                            // PD-REWRITE C1: H47 proactive AL-DISC removed here too.
                             sdus_to_remove.push(sdu.n_s);
                             continue;
                         }
@@ -2914,44 +2909,17 @@ impl Llc {
             self.al_links.remove(&key);
         }
 
-        // PD-5c-H47: proactive AL-DISC + UMAC purge for links that hit
-        // retx-exhaustion. Emitted after `drops` are queued but before
-        // `emit_delivery` fires, so H36 subscribers still see the
-        // `DroppedRetxExhausted` event first when the drops loop runs
-        // below. Mirrors DIMETRA `dlai_cancel_pd_transmission_on_user_removal`
-        // (BRC @ 0x0021ad6c) — the same purge helper the H39 DISC path
-        // already targets — and matches the standard normal-teardown
-        // AlDiscCause used on every clean session end.
-        for key in retx_exhausted_links {
-            let (service, carrier_num, main_address) =
-                match self.al_links.get(&key) {
-                    Some(link) => (link.service, link.carrier_num, link.main_address),
-                    None => continue, // already gone (e.g. duplicate hit above)
-                };
-            let disc_pdu = AlDisc {
-                advanced_link_service: service,
-                advanced_link_number_n261: key.n261,
-                report: AlDiscCause::Success,
-            };
-            msgs.push(Self::make_al_sap_msg_disc(
-                disc_pdu,
-                carrier_num,
-                main_address,
-                key.link_id,
-                key.endpoint_id,
-            ));
-            msgs.push(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Llc,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::TmaPurgeByAddressReq { issi: key.ssi },
-            });
-            self.al_links.remove(&key);
-            tracing::warn!(
-                "AL link {:?} retx-exhausted — emitted proactive AL-DISC(Success) + TmaPurgeByAddressReq (H47)",
-                key
-            );
-        }
+        // PD-REWRITE C1: H47 (proactive AL-DISC + TmaPurgeByAddressReq on
+        // retx-exhaustion) removed as a spec violation. Per ETSI TS 100 392-2
+        // §22.3.3.2.6 NOTE 1, "the service user should immediately either
+        // reset or disconnect the advanced link" — that is the SERVICE USER's
+        // decision, not LLC's. Retx exhaustion surfaces upward exclusively
+        // via the `AlDeliveryOutcome::DroppedRetxExhausted` event on the
+        // al_events hook (see `drops`/`emit_delivery` below). Once Commit 5
+        // lands, that path becomes the formal `TlReportInd(RetxExhausted)`
+        // primitive on the TLA SAP; SNDCP (Commit 4b) then decides reset /
+        // disconnect / reconnect / release / deactivate per the policy in
+        // §28.3.2.
 
         let pending_to_send: Vec<(AlLinkKey, Vec<u8>)> = {
             let mut to_send = Vec::new();

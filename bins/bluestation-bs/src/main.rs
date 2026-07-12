@@ -698,6 +698,12 @@ fn main() {
 
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
 
+    // PD-REWRITE C1: emit WARN logs naming every enabled interop gate at
+    // startup so operators can grep the boot log for `interop gate` to
+    // inventory active spec-noncompliant behaviors. See
+    // `crates/tetra-entities/src/llc/interop.rs` and `Docs/interop-knobs.md`.
+    let _ = tetra_entities::llc::interop::log_enabled_interop_gates(&cfg.config().llc);
+
     // Apply explicit systemd service name from config, if provided.
     // Used by SDS command control (restart/shutdown) and dashboard OTA.
     // Auto-detection from /proc/self/cgroup is still the fallback.
