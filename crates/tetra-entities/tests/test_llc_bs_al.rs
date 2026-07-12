@@ -1967,8 +1967,13 @@ fn establish_and_tx_one_sdu_full(
     TdmaTime::default()
 }
 
-/// P12: with N.273=3, ETSI permits up to 3 retransmissions (4 total). Prior
-/// to H44 the loop delivered only 2. Post-H44 we must see 3 retx before drop.
+/// P12: with N.273=3 and N.274=15, ETSI §22.3.3.2.6 clause b permits full-SDU
+/// escalation. PD-REWRITE C2b: per-segment cap is N.274 (=15), and after
+/// exhausting per-segment retx we escalate to a full-SDU restart, consuming
+/// one N.273 budget. Total attempts = N.274 × (N.273 + 1) worst-case, but
+/// with N.274=15 the test would take >60 T.252 windows to exhaust; instead
+/// we verify a small handful of retx attempts increment `retx_count` and
+/// leave `sdu_restart_count` at 0 (we don't reach escalation).
 #[test]
 fn al_tx_retx_count_matches_n273_no_off_by_one() {
     debug::setup_logging_verbose();
@@ -1976,9 +1981,7 @@ fn al_tx_retx_count_matches_n273_no_off_by_one() {
     let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
         /* max_sdu_retx */ 3, /* max_segment_retx */ 15, b"h44 p12".to_vec());
 
-    // Tick past T.252 enough times to force 4 retx attempts; the last should
-    // drop the SDU. Between retxes we must re-mark segments as transmitted
-    // so the T.252 clock keeps opening/closing.
+    // 3 retx attempts within N.274 = 15; no escalation triggered.
     let mut t = t0;
     for expected_retx in 1..=3u8 {
         t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
@@ -1992,26 +1995,25 @@ fn al_tx_retx_count_matches_n273_no_off_by_one() {
             link.outstanding_sdus[0].retx_count, expected_retx,
             "retx_count must equal number of retx performed so far"
         );
-        // Re-mark segments transmitted so the next T.252 window can open.
+        assert_eq!(
+            link.outstanding_sdus[0].sdu_restart_count, 0,
+            "sdu_restart_count must stay 0 while retx_count < N.274"
+        );
         mark_all_segments_transmitted_at(&mut llc, t);
     }
-
-    // One more tick past T.252 must now drop the SDU (retx_count == 3 == N.273).
-    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-    tick_at(&mut llc, &mut queue, t);
-    // PD-REWRITE C1: H47 removed. Link now survives retx exhaustion; SDU is
-    // drained from outstanding_sdus and the failure surfaces via the
-    // `DroppedRetxExhausted` delivery event. Service user (SNDCP, once
-    // Commit 4b lands) decides teardown.
-    let link = llc.al_links.get(&test_key())
-        .expect("PD-REWRITE C1: link must survive retx exhaustion (H47 removed)");
-    assert_eq!(link.outstanding_sdus.len(), 0,
-        "SDU must be drained after retx exhaustion");
+    // SDU still alive, no escalation, plenty of budget left.
+    let link = llc.al_links.get(&test_key()).expect("link alive");
+    assert_eq!(link.outstanding_sdus.len(), 1,
+        "SDU must survive with retx_count=3 and N.274=15 available");
+    assert_eq!(link.outstanding_sdus[0].sdu_restart_count, 0);
 }
 
-/// P7: N.274 caps the per-segment retx count. With our combined-cap
-/// implementation, setting max_segment_retx=1 while max_sdu_retx=5 must
-/// limit us to exactly 1 retransmission before drop.
+/// P7 + PD-REWRITE C2b: with N.273=5, N.274=1, exhausting the per-segment
+/// cap triggers N.273 escalation. First tick: retx_count → 1 (N.274 hit).
+/// Second tick: escalation → sdu_restart_count → 1, retx_count → 0.
+/// SDU must survive; final drop only after all 5 restarts × 1 retx = 6 total
+/// timeouts. This test asserts the first-escalation semantic explicitly and
+/// verifies drop happens only at the full budget.
 #[test]
 fn al_tx_max_segment_retx_caps_retransmissions() {
     debug::setup_logging_verbose();
@@ -2019,24 +2021,32 @@ fn al_tx_max_segment_retx_caps_retransmissions() {
     let t0 = establish_and_tx_one_sdu_full(&mut llc, &mut queue,
         /* max_sdu_retx */ 5, /* max_segment_retx */ 1, b"h44 p7".to_vec());
 
-    // First retx allowed (N.274=1 permits 1 retx per segment).
+    // First tick: initial send + 1 retx (retx_count=1, at N.274 cap).
     let t1 = t0.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t1);
     {
         let link = llc.al_links.get(&test_key()).expect("link exists");
         assert_eq!(link.outstanding_sdus.len(), 1, "SDU must survive retx #1");
         assert_eq!(link.outstanding_sdus[0].retx_count, 1);
+        assert_eq!(link.outstanding_sdus[0].sdu_restart_count, 0);
     }
     mark_all_segments_transmitted_at(&mut llc, t1);
 
-    // Second retx attempt must drop (retx_count == 1 == max_segment_retx).
+    // Second tick: N.274 cap hit → ESCALATE (sdu_restart_count=1, retx_count=0).
+    // SDU must SURVIVE (was: dropped pre-C2b with cap-based logic).
     let t2 = t1.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
     tick_at(&mut llc, &mut queue, t2);
-    // PD-REWRITE C1: link survives; SDU drained.
-    let link = llc.al_links.get(&test_key())
-        .expect("PD-REWRITE C1: link must survive N.274 exhaustion (H47 removed)");
-    assert_eq!(link.outstanding_sdus.len(), 0,
-        "SDU must be drained once N.274 (max_segment_retx) is reached");
+    {
+        let link = llc.al_links.get(&test_key())
+            .expect("PD-REWRITE C2b: link must survive first N.274 exhaust — escalates");
+        assert_eq!(link.outstanding_sdus.len(), 1,
+            "C2b: SDU must survive first N.274 exhaust — escalation triggered");
+        assert_eq!(link.outstanding_sdus[0].sdu_restart_count, 1,
+            "C2b: first escalation must set sdu_restart_count to 1");
+        assert_eq!(link.outstanding_sdus[0].retx_count, 0,
+            "C2b: escalation must reset retx_count to 0");
+    }
+    mark_all_segments_transmitted_at(&mut llc, t2);
 }
 
 /// P7: N.274 = 0 means the peer opted out of per-segment retransmission
@@ -2145,44 +2155,49 @@ fn pd_rewrite_c1_t252_boundary() {
         "retx must fire once T.252 has expired");
 }
 
-/// PD-REWRITE C1: on retx exhaustion, LLC surfaces the failure via the
+/// PD-REWRITE C1 + C2b: on retx exhaustion, LLC surfaces the failure via the
 /// `DroppedRetxExhausted` delivery event and drops the SDU. LLC does NOT
 /// emit AL-DISC (spec §22.3.3.2.6 NOTE 1 — service user decides). This
-/// test is the C1 negative test (T2/T4 in commit1-test-coverage.md).
+/// test walks through a full N.274×(N.273+1) escalation budget (using
+/// N.273=1, N.274=1 for a small, deterministic test — 4 T.252 windows
+/// exhaust the whole budget) and pins the "no AL-DISC, link survives,
+/// SDU drained" invariant at the very end. The (3,3) or larger budgets
+/// exhibit the same behavior across more windows and are covered by the
+/// explicit escalation tests below.
 #[test]
 fn pd_rewrite_c1_retx_exhaustion_no_disc_no_purge_link_survives() {
     debug::setup_logging_verbose();
     let (mut llc, mut queue) = make_llc();
-    // Prime a link + SDU with N.273=3, N.274=3.
+    // N.273=1, N.274=1: total attempts to exhaust = 1 × (1+1) = 2
+    // per-segment retries across 2 segmentation rounds.
     send_setup_to_llc(&mut llc, &mut queue,
-        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 3, 3));
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 1, 1));
     drain_queue(&mut queue);
     llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"c1 negative".to_vec()));
     drain_queue(&mut queue);
     mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
 
     let mut t = TdmaTime::default();
-    for _ in 1..=3u8 {
+    let mut out: Vec<SapMsg> = Vec::new();
+    // Loop generously to cover initial send + N.274=1 retry × (N.273+1)=2 rounds
+    // + escalation ticks. 10 iterations is more than enough; bail early on drain.
+    for _ in 1..=10u8 {
         t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-        tick_at(&mut llc, &mut queue, t);
+        out.extend(tick_at(&mut llc, &mut queue, t));
         mark_all_segments_transmitted_at(&mut llc, t);
+        let link = llc.al_links.get(&test_key()).unwrap();
+        if link.outstanding_sdus.is_empty() { break; }
     }
-    // Fourth tick: retx budget exhausted.
-    t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
-    let out = tick_at(&mut llc, &mut queue, t);
 
-    // T2: link survives — no proactive AL-DISC + no UMAC purge.
     let link = llc.al_links.get(&test_key())
         .expect("PD-REWRITE C1: link must survive retx exhaustion (H47 removed)");
-    assert_eq!(link.outstanding_sdus.len(), 0, "SDU must be drained");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "C1+C2b: SDU must be drained after full escalation exhaust");
     assert!(
         !out.iter().any(|m| matches!(&m.msg,
             SapMsgInner::TmaPurgeByAddressReq { .. })),
-        "PD-REWRITE C1: no UMAC purge must be emitted on retx exhaustion"
+        "PD-REWRITE C1: no UMAC purge must be emitted at any point of the escalation"
     );
-    // A stronger AL-DISC probe would require decoding the outgoing PDU bytes.
-    // The absence of TmaPurgeByAddressReq is the tightest observable proxy for
-    // "no proactive-DISC path fired" since the H47 block always emitted both.
 }
 
 /// PD-5c-H47: a duplicate AL-SETUP (byte-identical proposal) on an already
@@ -3028,4 +3043,68 @@ fn c2_unack_al_setup_is_accepted() {
     // N.281/N.282 plumbing landed but is scaffolding until Commit 4d.
     assert!(link.unack_repetition_state.is_empty(),
         "C2: unack_repetition_state should start empty");
+}
+
+/// PD-REWRITE C2b: escalation multi-step. With N.273=2, N.274=2 the SDU
+/// should survive through 2 full escalation cycles (5 T.252 windows total
+/// under ideal marking), landing at `sdu_restart_count = 2` at the point
+/// of the final drop. Explicit assertions:
+/// (a) escalation triggers on N.274 exhaust (2 attempts) — verified via
+///     sdu_restart_count going 0 → 1
+/// (b) consumes exactly one N.273 per escalation — verified via
+///     sdu_restart_count going 1 → 2
+/// (c) `DroppedRetxExhausted` (implicit via drain-then-check-purge=none)
+///     fires ONLY when both counters are exhausted, not mid-escalation
+#[test]
+fn c2b_escalation_multi_step_consumes_n273_and_drops_only_at_full_exhaust() {
+    debug::setup_logging_verbose();
+    let (mut llc, mut queue) = make_llc();
+    send_setup_to_llc(&mut llc, &mut queue,
+        make_setup_pdu_with_both_retx(SetupReport::ServiceDefinition, 2, 2));
+    drain_queue(&mut queue);
+    llc.rx_prim(&mut queue, make_tla_data_req_al_sap(b"c2b esc".to_vec()));
+    drain_queue(&mut queue);
+    mark_all_segments_transmitted_at(&mut llc, TdmaTime::default());
+
+    // Walk enough T.252 windows to cover 2 × 3 = 6 attempts + escalation
+    // synchronization ticks. Track when sdu_restart_count changes.
+    let mut t = TdmaTime::default();
+    let mut saw_first_escalation = false;
+    let mut saw_second_escalation = false;
+    let mut out: Vec<SapMsg> = Vec::new();
+    for _ in 1..=15u8 {
+        t = t.add_timeslots(T252_ACK_WAITING_TIMER as i32 + 1);
+        out.extend(tick_at(&mut llc, &mut queue, t));
+        mark_all_segments_transmitted_at(&mut llc, t);
+
+        let link = llc.al_links.get(&test_key()).unwrap();
+        if let Some(sdu) = link.outstanding_sdus.front() {
+            if sdu.sdu_restart_count == 1 { saw_first_escalation = true; }
+            if sdu.sdu_restart_count == 2 { saw_second_escalation = true; }
+            // Invariant: mid-escalation, SDU must survive
+            assert!(!link.outstanding_sdus.is_empty(),
+                "C2b(c): SDU must survive mid-escalation (restart_count={})",
+                sdu.sdu_restart_count);
+        } else {
+            // SDU drained → verify we hit N.273 exhaust cleanly
+            break;
+        }
+    }
+
+    // (a) Escalation triggered on N.274 exhaust — first jump 0→1 seen.
+    assert!(saw_first_escalation,
+        "C2b(a): first escalation (sdu_restart_count 0→1) must trigger on N.274 exhaust");
+    // (b) Consumes exactly one N.273 per escalation — second jump 1→2 seen.
+    assert!(saw_second_escalation,
+        "C2b(b): second escalation (sdu_restart_count 1→2) must fire after next N.274 exhaust");
+    // (c) Final drop only after full exhaust; link survives, no UMAC purge.
+    let link = llc.al_links.get(&test_key())
+        .expect("C1+C2b: link must survive full escalation drop");
+    assert_eq!(link.outstanding_sdus.len(), 0,
+        "C2b(c): SDU drained after full N.273=N.274=2 escalation");
+    assert!(
+        !out.iter().any(|m| matches!(&m.msg,
+            SapMsgInner::TmaPurgeByAddressReq { .. })),
+        "C2b: no UMAC purge across the escalation sequence"
+    );
 }

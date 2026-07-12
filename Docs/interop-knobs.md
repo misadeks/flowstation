@@ -4,6 +4,37 @@ flowstation supports several non-default behaviors intended for interoperability
 with specific MS-firmware quirks. Each is documented below with its spec
 noncompliance reasoning, the interop failure symptom, and how to enable.
 
+## Behavioral note: retransmission budget change (PD-REWRITE Commit 2b)
+
+Prior to Commit 2b, the LLC AL retx machine used a **cap-based** logic:
+`effective_max_retx = min(N.273, N.274)` — total attempts per SDU capped at
+`min(N.273, N.274)`.  Commit 2b implements the spec-mandated
+**N.274→N.273 escalation** per ETSI TS 100 392-2 §22.3.3.2.6 clause b: on
+per-segment N.274 exhaust, the LLC restarts the SDU from segment 0 using
+the original segmentation, consuming one N.273 budget.  Drop with
+`DroppedRetxExhausted` only when **both** N.274 and N.273 are exhausted.
+
+**Airtime impact:** total attempts per SDU now scale as
+`N.274 × (N.273 + 1)` in the general case — a substantial increase over
+the old `min(N.273, N.274)` cap.  Example: with the common (N.273=3,
+N.274=3) negotiation, the old logic drops after 3 attempts; the new logic
+drops after up to 12 attempts (3 per-segment attempts × 4 segmentation
+rounds).  This is spec-compliant and expected — it gives the SDU more
+chances to land on air before SNDCP is notified of failure.
+
+**Short-circuits (behavior unchanged):**
+* `N.274 == 0`: fire-and-forget; escalation never fires; drop after 0 retx.
+* `N.273 == 0` (without H46 gate): min-based logic yields per-segment cap
+  of 0; drop after 0 retx.
+* `N.273 == 0` (with H46 gate = `n273_zero_ack_uses_seg_cap = true`):
+  per-segment cap becomes N.274, but no N.273 budget exists to escalate
+  against — drop after N.274 attempts.  MTP6550 behavior preserved.
+
+**Operator-visible log signal:** each escalation emits an INFO log:
+`AL link {:?} N(S)={} N.274 exhausted — escalating to full-SDU retx {}/{}
+(§22.3.3.2.6)`.  Grep `escalating to full-SDU retx` in the boot log to
+inventory active escalations.
+
 ## Configuration profiles
 
 **Landed in Commit 6.** Set via `interop_profile` in the `[llc]` TOML section:
